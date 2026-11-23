@@ -1,0 +1,10 @@
+# Machine-local task data, model login state, and generated artifacts.
+/agy-profile/
+/runs/
+/node_modules/
+.env
+.env.*
+*.log
+*.pem
+*.key
+.DS_Store
