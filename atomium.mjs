@@ -319,7 +319,13 @@ async function runDemo(mode, rejectionTest, dualTest) {
 }
 
 const [cmd,...args]=process.argv.slice(2);
-if (cmd==='verify-agent-egress' && !args.length) {
+if (cmd==='verify-dual-worker' && (args.length===0||args.length===1&&args[0]==='--protocol-only')) {
+  try{
+    const {runDualWorkerDemo,runDualWorkerProtocolOnly}=await import('./dual-worker-demo.mjs');
+    const report=await (args.length?runDualWorkerProtocolOnly():runDualWorkerDemo());
+    if(report.status!=='passed')process.exitCode=report.status==='blocked'?2:1;
+  }catch{console.error('Dual worker fixture could not finish.');process.exitCode=1;}
+} else if (cmd==='verify-agent-egress' && !args.length) {
   try {
     const {runAgentEgressAudit}=await import('./agent-egress-audit.mjs');
     if(!await runAgentEgressAudit())process.exitCode=1;
@@ -329,6 +335,16 @@ if (cmd==='verify-agent-egress' && !args.length) {
     const {runBoundaryAudit}=await import('./boundary.mjs');
     if(!await runBoundaryAudit())process.exitCode=1;
   } catch(e) { console.error('Boundary audit stopped: '+e.message);process.exitCode=1; }
+} else if (cmd==='verify-native-network' && !args.length) {
+  try {
+    const {runNativeNetworkAudit}=await import('./native-network-audit.mjs');
+    await runNativeNetworkAudit();
+  } catch {console.error('Native network fixture could not finish.');process.exitCode=1;}
+} else if (cmd==='verify-gemini-adapter' && !args.length) {
+  try {
+    const {runGeminiContractAudit}=await import('./gemini-model-verify.mjs');
+    if(!await runGeminiContractAudit())process.exitCode=1;
+  } catch {console.error('Gemini offline contract could not finish.');process.exitCode=1;}
 } else if (['native-live','verify-native','replay','native-app'].includes(cmd)) {
   try {
     const {nativeMain}=await import('./native-replay.mjs');
@@ -402,6 +418,6 @@ if (cmd==='verify-agent-egress' && !args.length) {
   try { await runDemo(cmd); }
   catch(e) { console.error('Atomium fixture stopped: '+e.message);process.exitCode=1; }
 } else {
-  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary | verify-agent-egress');
+  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary | verify-agent-egress | verify-dual-worker [--protocol-only] | verify-native-network | verify-gemini-adapter');
   if (cmd && cmd!=='--help') process.exitCode=2;
 }

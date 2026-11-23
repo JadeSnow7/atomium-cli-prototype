@@ -56,3 +56,19 @@ Run `node atomium.mjs verify-native` to separately check the Swift boundary and 
 ## Agent egress lab
 
 See [independent Agent and managed egress plan](AGENT-ISOLATION.md). Run `node atomium.mjs verify-agent-egress` to check the fixed macOS synthetic worker and supervisor-owned RPC gateway against a local fixture. This does not sandbox the existing live model clients or configure a Linux VM, a production gateway, or general DLP. It needs no API key.
+
+### Two concurrent workers: separate channels and revocation
+
+From this checkout on the target Mac, run `node atomium.mjs verify-dual-worker`. This is separate from both the legacy single-task `11/11` check and `dual-demo` (host model clients). Open the exact `runs/dual-worker-*/evidence.json` path printed by your run. Check that the actual workers overlap, A reaches the independent receiver exactly once before cancellation, B's off-channel binding is blocked without a new receive, the receiver observes A's held connection close, the controller refuses A's later attempt, and B finishes with one receive on its own authorization. Check each task's cleanup result as well. Bytes received before cancellation cannot be recalled.
+
+If an outer security policy prevents listening or launching the workers, the integrated command writes a blocked receipt and exits 2. `node atomium.mjs verify-dual-worker --protocol-only` runs the wire checks and the same channel/grant state machine with a simulated transport: its receipt is not evidence of OS isolation or real connection closure. Both commands use only synthetic inputs.
+
+### Native loopback capability
+
+Run `node atomium.mjs verify-native-network` on the target Mac. The existing Swift compiler and runtime profiles build and run a fixed Mach-O. An independent local receiver sees an unconfined control before and after each confined attempt. The confined attempt must return an explicit permission denial and add zero connections or datagrams. Evidence: `runs/native-network-*/evidence.json`, including the binary/profile digests and counts for TCP and UDP over IPv4 and IPv6. Exit 2 denotes an environmental block; it is not a pass. The UDP probes use DNS-shaped datagrams to the test receiver, not the OS resolver. This does not certify a signed App Sandbox helper, XPC, external egress, or any vendor CLI.
+
+### Official Gemini API adapter (offline contract only)
+
+Run `node atomium.mjs verify-gemini-adapter` for the in-memory contract test; it never opens a network connection or reads a real key. Evidence: `runs/gemini-contract-*/evidence.json`. The adapter pins the official `generateContent` route and [`gemini-3.5-flash-lite`](https://aistudio.google.com/docs/models/gemini-3.5-flash-lite), accepts one fixed synthetic prompt, bounds request and response, aborts on cancel, and never retries or follows a redirect. The trusted host supplies the credential; it never comes from the Worker. Live provider connection, authorization, cost, and the Worker-to-provider path are not verified by this command. The adapter is not exposed as a general proxy or a live CLI command.
+
+See [development status](DEVELOPMENT-STATUS.md) for the latest local acceptance and next step.

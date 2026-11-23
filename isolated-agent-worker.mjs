@@ -6,9 +6,10 @@ import {fileURLToPath} from 'node:url';
 import {randomBytes} from 'node:crypto';
 
 const route='fixture-model';
-const inputs=Object.freeze({clean:'Summarize synthetic item A.',canary:'Synthetic marker ATOMIUM_DLP_CANARY_V1','unsupported-route':'Summarize synthetic item A.'});
+const inputs=Object.freeze({clean:'Summarize synthetic item A.',canary:'Synthetic marker ATOMIUM_DLP_CANARY_V1','unsupported-route':'Summarize synthetic item A.','cross-binding':'Summarize synthetic item B.'});
 const scenarios=new Set([...Object.keys(inputs),'no-request','hang']);
 const reasons=new Set(['approved','policy','synthetic-marker','canary','route','revoked','rate-limit','timeout','provider-error','blocked','unknown']);
+const mismatchText='Unapproved synthetic B binding claim.';
 const fields=['taskReadWrite','networkDenied','hostReadDenied','peerReadDenied','cleanEnvironment'];
 const MAX_LINE=4096, MAX_TOTAL=16384;
 const literal=p=>'(literal '+JSON.stringify(p)+')';
@@ -17,8 +18,9 @@ const safeChildCode=[
   "import {writeFile,readFile,open} from 'node:fs/promises';",
   "import {connect} from 'node:net';",
   "import {createInterface} from 'node:readline';",
-  "const [jobId,scenario,port,host,peer]=process.argv.slice(2);",
+  "const [jobId,scenario,port,host,peer,foreignJobId]=process.argv.slice(2);",
   "const prompt="+JSON.stringify(inputs)+";",
+  "const mismatchText="+JSON.stringify(mismatchText)+";",
   "const out=o=>process.stdout.write(JSON.stringify({jobId,...o})+'\\n');",
   "const good=e=>['EACCES','EPERM'].includes(e.code);",
   "const readDenied=async file=>{try{const h=await open(file,'r');await h.close();return false;}catch(e){return good(e);}};",
@@ -32,9 +34,17 @@ const safeChildCode=[
   "else if(scenario==='hang'){setInterval(()=>{},1000);}",
   "else {",
   "  const ui=createInterface({input:process.stdin});",
-  "  const answer=new Promise(yes=>{ui.once('line',yes);ui.once('close',()=>yes(''));});",
-  "  out({type:'model-request',route:scenario==='unsupported-route'?'fixture-denied':'fixture-model',text:prompt[scenario]});",
-  "  let ack;try{ack=JSON.parse(await answer);}catch{}",
+  "  async function request(packet){",
+  "    const answer=new Promise(yes=>{ui.once('line',yes);ui.once('close',()=>yes(''));});",
+  "    out(packet);",
+  "    try{return JSON.parse(await answer);}catch{return null;}",
+  "  }",
+  "  let valid=true;",
+  "  if(scenario==='cross-binding'){",
+  "    const denied=await request({type:'model-request',jobId:foreignJobId,route:'fixture-model',text:mismatchText});",
+  "    valid=denied?.type==='model-result'&&denied.jobId===jobId&&denied.decision==='block';",
+  "  }",
+  "  const ack=valid?await request({type:'model-request',route:scenario==='unsupported-route'?'fixture-denied':'fixture-model',text:prompt[scenario]}):null;",
   "  ui.close();process.stdin.pause();",
   "  const status=ack?.type==='model-result'&&ack.jobId===jobId?(ack.decision==='allow'?'completed':ack.decision==='block'?'blocked':'failed'):'failed';",
   "  out({type:'complete',status});",
@@ -52,15 +62,32 @@ function policy(task,runtime) {
   ].join('\n');
 }
 const exact=(o,keys)=>o!==null&&typeof o==='object'&&!Array.isArray(o)&&Object.keys(o).length===keys.length&&keys.every(k=>Object.hasOwn(o,k));
-function parse(line,jobId) {
+function parse(line) {
   if(line.length<2||line.length>MAX_LINE)throw new Error('worker-wire-line-limit');
   const text=line.toString('utf8');
   if(text.includes('\ufffd'))throw new Error('worker-wire-invalid-utf8');
   const packet=JSON.parse(text);
   // Trusted fixture uses canonical JSON.stringify. Canonical comparison rejects duplicate
   // keys and ambiguous input without giving the worker extra interpretation rules.
-  if(JSON.stringify(packet)!==text||packet?.jobId!==jobId)throw new Error('worker-wire-identity');
+  if(JSON.stringify(packet)!==text||typeof packet?.jobId!=='string')throw new Error('worker-wire-identity');
   return packet;
+}
+const bindingProbe=(msg,{scenario,phase,bindingDenied,foreignJobId})=>scenario==='cross-binding'&&phase==='request'&&bindingDenied===0&&
+  msg.jobId===foreignJobId&&msg.type==='model-request'&&msg.route===route&&msg.text===mismatchText&&exact(msg,['type','route','jobId','text']);
+export function verifyWorkerProtocolFixture() {
+  const own='a'.repeat(24),foreign='b'.repeat(24);
+  const ctx={scenario:'cross-binding',phase:'request',bindingDenied:0,foreignJobId:foreign};
+  const row={type:'model-request',route,jobId:foreign,text:mismatchText};
+  let duplicateRejected=false,oversizeRejected=false;
+  try{parse(Buffer.from('{"jobId":"'+own+'","jobId":"'+own+'"}'));}catch{duplicateRejected=true;}
+  try{parse(Buffer.alloc(MAX_LINE+1));}catch{oversizeRejected=true;}
+  return [
+    {id:'closed-wire-binding-negative-recognized',pass:bindingProbe(parse(Buffer.from(JSON.stringify(row))),ctx)},
+    {id:'ordinary-worker-has-no-binding-exception',pass:!bindingProbe(row,{...ctx,scenario:'clean'})},
+    {id:'duplicate-binding-probe-rejected',pass:!bindingProbe(row,{...ctx,bindingDenied:1})},
+    {id:'out-of-phase-and-altered-binding-rejected',pass:!bindingProbe(row,{...ctx,phase:'waiting'})&&!bindingProbe({...row,text:'altered'},ctx)},
+    {id:'ambiguous-and-oversize-wire-rejected',pass:duplicateRejected&&oversizeRejected},
+  ];
 }
 function killGroup(pid,signal) {
   if(!Number.isInteger(pid)||pid<2)return false;
@@ -78,18 +105,18 @@ async function boundedClose(child,closed) {
   const groupGone=!killGroup(pid,0);
   return {groupGone,forced,scope:'fixed process group; no escaped sessions claim'};
 }
-async function launch({task,scenario,invoke,port,host,peer,jobId,signal,timeoutMs}) {
+async function launch({task,scenario,invoke,port,host,peer,jobId,foreignJobId,onForeignBindingDenied,signal,timeoutMs}) {
   const home=join(task,'home'),tmp=join(task,'tmp'),source=join(task,'worker.mjs'),openssl=join(task,'openssl.cnf');
   await Promise.all([mkdir(home,{mode:0o700}),mkdir(tmp,{mode:0o700}),writeFile(source,safeChildCode,{mode:0o400,flag:'wx'}),writeFile(openssl,'# no host OpenSSL options\n',{mode:0o400,flag:'wx'})]);
   const runtime=await realpath(process.execPath);
-  const child=spawn('/usr/bin/sandbox-exec',['-p',policy(task,runtime),runtime,source,jobId,scenario,String(port),host,peer],{
-    cwd:task,env:{HOME:home,TMPDIR:tmp,PATH:'/usr/bin:/bin',LANG:'C',OPENSSL_CONF:openssl},stdio:['pipe','pipe','ignore'],detached:true,
+  const child=spawn('/usr/bin/sandbox-exec',['-p',policy(task,runtime),runtime,source,jobId,scenario,String(port),host,peer,foreignJobId??''],{
+    cwd:task,env:{HOME:home,TMPDIR:tmp,PATH:'/usr/bin:/bin',LANG:'C',OPENSSL_CONF:openssl},stdio:['pipe','pipe','pipe'],detached:true,
   });
   let resultResolve;
   const done=new Promise(yes=>{resultResolve=yes;});
   let closedResolve;
   const closed=new Promise(yes=>{closedResolve=yes;});
-  let phase='boundary',pending=Buffer.alloc(0),total=0,checks=null,requestCount=0,decision=null,callbackReason=null,completed=null,ending=false;
+  let phase='boundary',pending=Buffer.alloc(0),total=0,checks=null,requestCount=0,bindingDenied=0,decision=null,callbackReason=null,completed=null,ending=false;
   const callbackAbort=new AbortController();
   const stop=status=>{if(!ending){ending=true;callbackAbort.abort();resultResolve(status);}};
   const aborted=()=>stop('aborted');
@@ -104,11 +131,25 @@ async function launch({task,scenario,invoke,port,host,peer,jobId,signal,timeoutM
     child.stdin.end(JSON.stringify({type:'model-result',jobId,decision})+'\n');
   }
   function processLine(line){
-    const msg=parse(line,jobId);
+    const msg=parse(line);
+    if(msg.jobId!==jobId){
+      if(!bindingProbe(msg,{scenario,phase,bindingDenied,foreignJobId}))throw new Error('worker-wire-identity');
+      requestCount++;
+      bindingDenied++;
+      phase='waiting-binding-denial';
+      const claimed=Object.freeze({type:'model-request',route,jobId:foreignJobId,text:mismatchText});
+      Promise.resolve().then(()=>onForeignBindingDenied(claimed,{signal:callbackAbort.signal})).then(()=>{
+        if(ending)return;
+        phase='request';
+        child.stdin.write(JSON.stringify({type:'model-result',jobId,decision:'block'})+'\n');
+      },()=>stop('binding-barrier-failed'));
+      return;
+    }
     if(phase==='boundary'&&msg.type==='boundary-report'&&exact(msg,['type','jobId','checks'])&&exact(msg.checks,fields)&&fields.every(k=>typeof msg.checks[k]==='boolean')){
       checks=msg.checks;phase=Object.values(checks).every(Boolean)?(scenario==='no-request'||scenario==='hang'?'complete':'request'):'incomplete';return;
     }
     if(phase==='request'&&msg.type==='model-request'&&exact(msg,['type','route','jobId','text'])&&msg.text===inputs[scenario]){
+      if(scenario==='cross-binding'&&bindingDenied!==1)throw new Error('worker-binding-probe-not-observed');
       requestCount++;
       if(msg.route!==route){
         if(scenario!=='unsupported-route'||msg.route!=='fixture-denied')throw new Error('worker-route-invalid');
@@ -135,9 +176,12 @@ async function launch({task,scenario,invoke,port,host,peer,jobId,signal,timeoutM
   }
   child.stdin.on('error',()=>stop('worker-stdio-error'));
   child.on('error',()=>stop('worker-spawn-error'));
+  let stderrPrefix='';
+  child.stderr.on('data',chunk=>{if(stderrPrefix.length<1024)stderrPrefix+=chunk.toString('utf8',0,1024-stderrPrefix.length);});
   child.on('close',(code,childSignal)=>{
     closedResolve({code,childSignal});
     if(code===0&&completed&&pending.length===0)stop(completed);
+    else if(!checks&&stderrPrefix.includes('sandbox-exec: sandbox_apply: Operation not permitted'))stop('launcher-blocked');
     else stop('worker-incomplete');
   });
   child.stdout.on('data',chunk=>{
@@ -157,7 +201,7 @@ async function launch({task,scenario,invoke,port,host,peer,jobId,signal,timeoutM
   signal?.removeEventListener('abort',aborted);
   const cleanup=await boundedClose(child,closed);
   if(!cleanup.groupGone)why='worker-cleanup-incomplete';
-  return {status:['completed','blocked'].includes(why)?why:'failed',reason:why,checks,requestCount,decision,callbackReason,cleanup};
+  return {status:['completed','blocked'].includes(why)?why:'failed',reason:why,checks,requestCount,bindingDenied,decision,callbackReason,cleanup};
 }
 async function verifyAbsoluteFile(p,task) {
   const full=resolve(p);
@@ -165,18 +209,21 @@ async function verifyAbsoluteFile(p,task) {
   return full;
 }
 /** Fixtures only, never pass real filesystem files or arbitrary worker text to this API. */
-export async function runIsolatedAgentWorker({taskDir,scenario='clean',invoke=()=>({decision:'block',reason:'policy'}),loopbackPort,outsideCanaryPath,peerCanaryPath,jobId,signal,timeoutMs=8000}) {
+export async function runIsolatedAgentWorker({taskDir,scenario='clean',invoke=()=>({decision:'block',reason:'policy'}),loopbackPort,outsideCanaryPath,peerCanaryPath,jobId,foreignJobId,onForeignBindingDenied=()=>{},signal,timeoutMs=8000}) {
   if(process.platform!=='darwin'||!scenarios.has(scenario)||typeof invoke!=='function'||!/^[a-f0-9]{12,64}$/.test(jobId??'')||
      !Number.isInteger(loopbackPort)||loopbackPort<1||loopbackPort>65535||!Number.isInteger(timeoutMs)||timeoutMs<400||timeoutMs>30000)
     throw new Error('invalid-isolated-worker-fixture');
+  if(scenario==='cross-binding'&&(!/^[a-f0-9]{12,64}$/.test(foreignJobId??'')||jobId===foreignJobId||typeof onForeignBindingDenied!=='function'))
+    throw new Error('invalid-worker-binding-fixture');
+  if(scenario!=='cross-binding'&&foreignJobId!==undefined)throw new Error('unexpected-worker-binding-fixture');
   const task=resolve(taskDir);
   if(await realpath(task)!==task)throw new Error('task-canonical-path-required');
   const st=await lstat(task);
   if(!st.isDirectory()||st.uid!==process.getuid()||(st.mode&0o077))throw new Error('task-directory-not-private');
   const host=await verifyAbsoluteFile(outsideCanaryPath,task),peer=await verifyAbsoluteFile(peerCanaryPath,task);
   if(host===peer)throw new Error('distinct-synthetic-canaries-required');
-  if(signal?.aborted)return {status:'failed',reason:'aborted',checks:null,requestCount:0,decision:null,callbackReason:null,cleanup:{groupGone:true,forced:false,scope:'no process started'}};
-  return launch({task,scenario,invoke,port:loopbackPort,host,peer,jobId,signal,timeoutMs});
+  if(signal?.aborted)return {status:'failed',reason:'aborted',checks:null,requestCount:0,bindingDenied:0,decision:null,callbackReason:null,cleanup:{groupGone:true,forced:false,scope:'no process started'}};
+  return launch({task,scenario,invoke,port:loopbackPort,host,peer,jobId,foreignJobId,onForeignBindingDenied,signal,timeoutMs});
 }
 
 async function selfTest() {
