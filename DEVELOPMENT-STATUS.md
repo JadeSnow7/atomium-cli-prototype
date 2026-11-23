@@ -15,10 +15,11 @@
 | Gemini 官方 API 适配器及真实接入 | 离线契约重验 18/18：`runs/gemini-contract-UAnIgB/evidence.json`。固定端点和模型、输入上限、取消、拒绝和不重试。真实 API、TLS、鉴权与费用仍未验证；没有读取真实密钥或访问供应商。 | `node atomium.mjs verify-gemini-adapter` |
 | 真实隔离 Worker 经受管出口连接 Gemini 协议替身 | Mac 实跑 8/8：`runs/gemini-managed-nOWe5L/evidence.json`。接收器最终 2 个连接、2 个有效请求（A=1、B=1、拒收=0）；B 错绑及 A 撤销后重试未增加计数。A 请求在撤销前已送达但未获应答，撤销关闭在途 socket；B 经同一 Gemini 响应解析器获得一次应答，两组进程清理成功。仅 127.0.0.1 和随机合成凭据；默认执行器因嵌套沙盒退出 2、零到达，见 `runs/gemini-managed-EK1i8y/evidence.json`，不是端到端通过。 | `node atomium.mjs verify-gemini-managed`；环境阻断时可独立运行 `node atomium.mjs verify-gemini-adapter` |
 | 真实 agy 无凭据冷启动 | Mac 沙盒实跑 7/7：`runs/agy-offline-O3YmLE/evidence.json`。同一款 agy 1.5.14 的两个进程同时完成 ACP v1 初始化；A 停止后 B 仍存活，最后两组进程均已清理。独立 HOME/TMP/cwd、配置日志的创建仅据路径与元数据核对，随后移除临时目录。未启动登录、会话、模型，未验证认证命名空间。默认嵌套执行器阻断退出 2：`runs/agy-offline-8p0nRr/evidence.json`。 | `node atomium.mjs verify-agy-offline` |
+| 双 Profile 的会话路由与撤销 | Mac 合成验收 7/7：`runs/profile-dispatch-BFKoVP/evidence.json`。两实际 Node 进程经独立 stdio 持有任务；两个别名指向同一会话时只能取得一份活跃租约。错配或不可用停止，不写入任一通道。A 回应取消并清理后 B 才完成。无供应商调用、无凭据读取、无真实已登录 Profile 或 OS 强制隔离。 | `node atomium.mjs verify-profile-dispatch` |
 | 真实 Agent CLI 已认证隔离 | 未验证。已有 agy 提议与 Codex 审阅为宿主合成演示，不能充当带真实凭据的沙盒认证。 | 不对真实项目启用 |
 
 受影响回归：旧双任务出口 8/8（`runs/dual-worker-mM4cna/evidence.json`）；旧单任务出口 11/11（`runs/agent-egress-HYVm44/evidence.json`）；Worker 自检 6 个场景通过（`runs/isolated-agent-gltbjm/evidence.json`）；`verify-boundary` 6/6，`verify-native` 正确构建与离线回放各 9/9、故意错误候选被拦截；`verify-dual`、`verify-acp`、`verify-proposal` 均退出 0。早期已有宿主侧同快照审阅演示；尚未验证隔离实现者与审阅者的同一候选交付链。
 
-**下一条动作：** 先核对 agy 官方支持的凭据绑定方式，区分同一 macOS 用户的共享槽位与可独立验证的用户会话。冷启动通过只证明无凭据的 ACP 初始化和清理；在证实账户来源与隔离边界前，不启用第二个已认证 Profile、真实项目或模型请求，不假定 HOME 与路径参数能隔离 Keychain。Gemini 真实 API 另行处理，仅在取得官方 API 认证及潜在费用授权后，测试一次由受信任组件注入凭据的固定合成调用，不复用 agy/Pro 登录状态。
+**下一条动作：** 独立核对 agy 官方可证明的凭据绑定方式，再决定是否能把合成路由接到真实 Profile。现有冷启动验证无凭据的 ACP 初始化与清理；合成验收验证显式绑定、同会话租约和独立取消。二者都不能把同一 macOS 用户的 HOME 路径当作 Keychain 隔离。在能通过官方方式验证账户来源、权限范围和互不改写之前，不启用真实双账户、真实项目或模型请求。
 
 未完：真实 Gemini API、真实 Agent CLI 认证与隔离、签名 App Sandbox helper/XPC、系统 DNS、隔离角色同快照审阅、最小 Panel。Linux 后端及外部网页另行验收。

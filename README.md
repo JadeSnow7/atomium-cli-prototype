@@ -122,6 +122,12 @@ Without the final flag Atomium records `billing-mode-unverified` without contact
 
 Run `node atomium.mjs verify-native-network` on the target Mac. The existing Swift compiler and runtime profiles build and run a fixed Mach-O. An independent local receiver sees an unconfined control before and after each confined attempt. The confined attempt must return an explicit permission denial and add zero connections or datagrams. Evidence: `runs/native-network-*/evidence.json`, including the binary/profile digests and counts for TCP and UDP over IPv4 and IPv6. Exit 2 denotes an environmental block; it is not a pass. The UDP probes use DNS-shaped datagrams to the test receiver, not the OS resolver. This does not certify a signed App Sandbox helper, XPC, external egress, or any vendor CLI.
 
+### Offline Profile routing semantics
+
+Run `node atomium.mjs verify-profile-dispatch`. The controller launches two fixed synthetic Node helpers on separate private stdio channels, explicitly binds two Profile selections to two synthetic sessions, and waits until both jobs acknowledge the held state. A second name for an active session cannot acquire another lease. Wrong bindings or an unavailable selected helper are refused before writing to either channel: no silent fallback. A acknowledges cancellation and is reaped before B completes. The fixture removes its temporary directories and records decisions, order, and cleanup in `runs/profile-dispatch-*/evidence.json`.
+
+This is an offline routing and lifecycle check under one macOS user, not OS-enforced isolation, vendor authentication, separate Keychains, or concurrent use of real accounts. No stored login Profile, credentials, OAuth, model, or network service is used.
+
 ### Real agy cold start (offline)
 
 Run `node atomium.mjs verify-agy-offline` on the Mac. The fixed probe launches two instances of the same installed agy executable under deny-default Seatbelt policies, with clean, disjoint temporary HOME, TMPDIR and cwd outside the repository. It sends only ACP v1 `initialize`, checks that both processes are live, cancels A while B remains live, then closes both process groups. The test records the executable/policy hashes and only task directory and log metadata before deleting temporary state. The independent synthetic network/file control is not a trace of agy traffic. Exit 2 means the environment refused the sandbox or loopback control; it is not a pass.

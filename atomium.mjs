@@ -443,6 +443,15 @@ if (cmd==='profile') {
     const {nativeMain}=await import('./native-replay.mjs');
     await nativeMain(cmd,args,{askCodex,proposeAgy:prompt=>dedicatedAgy(join(root,'agy-profile'),prompt)});
   } catch(e) {console.error('Native fixture stopped: '+e.message);process.exitCode=1;}
+} else if (cmd==='verify-profile-dispatch' && !args.length) {
+  const controller=new AbortController(),cancel=()=>controller.abort();
+  process.on('SIGINT',cancel);process.on('SIGTERM',cancel);
+  try{
+    const {verifyProfileDispatch}=await import('./profile-dispatch-audit.mjs');
+    const report=await verifyProfileDispatch({signal:controller.signal});
+    if(report.status!=='passed')process.exitCode=report.status==='cancelled'?130:1;
+  }catch{console.error('Synthetic profile dispatch fixture could not finish.');process.exitCode=1;}
+  finally{process.removeListener('SIGINT',cancel);process.removeListener('SIGTERM',cancel);}
 } else if (cmd==='verify-agy-offline' && !args.length) {
   const controller=new AbortController(),cancel=()=>controller.abort();
   process.on('SIGINT',cancel);process.on('SIGTERM',cancel);
@@ -520,6 +529,6 @@ if (cmd==='profile') {
   try { await runDemo(cmd); }
   catch(e) { console.error('Atomium fixture stopped: '+e.message);process.exitCode=1; }
 } else {
-  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | verify-agy-offline | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary | verify-agent-egress | verify-dual-worker [--protocol-only] | verify-native-network | verify-gemini-adapter | verify-gemini-managed | profile | task | verify-profiles [--store-only] | verify-profile-login | verify-harness-config | verify-named-proposal');
+  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | verify-agy-offline | verify-profile-dispatch | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary | verify-agent-egress | verify-dual-worker [--protocol-only] | verify-native-network | verify-gemini-adapter | verify-gemini-managed | profile | task | verify-profiles [--store-only] | verify-profile-login | verify-harness-config | verify-named-proposal');
   if (cmd && cmd!=='--help') process.exitCode=2;
 }
