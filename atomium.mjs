@@ -319,7 +319,12 @@ async function runDemo(mode, rejectionTest, dualTest) {
 }
 
 const [cmd,...args]=process.argv.slice(2);
-if (['native-live','verify-native','replay','native-app'].includes(cmd)) {
+if (cmd==='verify-boundary' && !args.length) {
+  try {
+    const {runBoundaryAudit}=await import('./boundary.mjs');
+    if(!await runBoundaryAudit())process.exitCode=1;
+  } catch(e) { console.error('Boundary audit stopped: '+e.message);process.exitCode=1; }
+} else if (['native-live','verify-native','replay','native-app'].includes(cmd)) {
   try {
     const {nativeMain}=await import('./native-replay.mjs');
     await nativeMain(cmd,args,{askCodex,proposeAgy:prompt=>dedicatedAgy(join(root,'agy-profile'),prompt)});
@@ -392,6 +397,6 @@ if (['native-live','verify-native','replay','native-app'].includes(cmd)) {
   try { await runDemo(cmd); }
   catch(e) { console.error('Atomium fixture stopped: '+e.message);process.exitCode=1; }
 } else {
-  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app');
+  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary');
   if (cmd && cmd!=='--help') process.exitCode=2;
 }

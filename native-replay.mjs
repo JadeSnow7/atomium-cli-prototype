@@ -1,6 +1,7 @@
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {mkdir,mkdtemp,readFile,writeFile,realpath,lstat} from 'node:fs/promises';
+import {mkdir,mkdtemp,open,writeFile,realpath,lstat,symlink} from 'node:fs/promises';
+import {constants as fsFlags} from 'node:fs';
 import {join,dirname,basename,resolve} from 'node:path';
 import {createHash} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
@@ -9,6 +10,32 @@ import {createInterface} from 'node:readline/promises';
 const execute=promisify(execFile);
 const sha=x=>createHash('sha256').update(x).digest('hex');
 const stable=x=>JSON.stringify(x);
+const limits=Object.freeze({receipt:32768,source:65536,binary:16*1024*1024,compiler:256*1024*1024});
+const boundary=Object.freeze({
+  policy:'macos-native-p0-v1',frozenInput:'exact source, read-only in compiler',
+  compiler:'fixed toolchain, writes only to scratch plus /dev/null, no allowed network',
+  runtime:'exact executable, no allowed file writes or network',
+  stdout:'closed fixture tokens; unexpected output suppressed',
+  notCovered:['managed model egress/DLP','browser isolation','provider descendants','same-account hostile artifact issuer'],
+});
+async function readFixed(path,limit) {
+  if(await realpath(path)!==path)throw new Error('unsafe-replay-input');
+  const handle=await open(path,fsFlags.O_RDONLY|fsFlags.O_NOFOLLOW|fsFlags.O_NONBLOCK);
+  try{
+    const st=await handle.stat();
+    if(!st.isFile()||st.size<1||st.size>limit||st.nlink!==1)throw new Error('bounded-input-invalid');
+    const bytes=Buffer.alloc(st.size+1);
+    let count=0;
+    while(count<bytes.length){
+      const {bytesRead}=await handle.read(bytes,count,bytes.length-count,count);
+      if(!bytesRead)break;
+      count+=bytesRead;
+    }
+    const after=await handle.stat();
+    if(count!==st.size||after.size!==st.size||after.mtimeMs!==st.mtimeMs||after.ctimeMs!==st.ctimeMs)throw new Error('bounded-input-changed');
+    return bytes.subarray(0,count);
+  }finally{await handle.close();}
+}
 const root=resolve(fileURLToPath(new URL('.',import.meta.url)));
 const runs=join(root,'runs');
 const spec={
@@ -84,39 +111,101 @@ async function toolchain() {
   const sdk=join(developer,'Platforms','MacOSX.platform','Developer','SDKs','MacOSX.sdk');
   const bin=dirname(compiler);
   const commands=['swiftc','swift-driver','swift-frontend','clang','ld','ld-classic'].map(name=>join(bin,name));
-  const compilerSha=sha(await readFile(compiler));
+  const compilerSha=sha(await readFixed(await realpath(compiler),limits.compiler));
   return {developer,compiler,version,sdk,bin,commands,compilerSha};
 }
-function restricted(task,binary,tools) {
+function restricted({binary,tools,source,scratch}) {
   const system=['/System/Library','/usr/lib'];
   const readonly=tools?[...system,tools.developer,join(dirname(tools.developer),'SharedFrameworks')]:system;
+  const allowed=tools?[sub(scratch),literal(source)]:[literal(binary)];
+  const maps=tools?[sub(scratch)]:[literal(binary)];
   const commands=tools?tools.commands:[binary];
   return [
-    '(version 1)(deny default)(allow process-fork)(allow signal (target self))(allow ipc-posix-sem*)(allow sysctl-read)(allow file-read-metadata)',
-    '(allow file-read-data '+[sub(task),...readonly.map(sub),...['/','/dev/null','/dev/urandom'].map(literal)].join(' ')+')',
-    '(allow file-map-executable '+[sub(task),...readonly.map(sub)].join(' ')+')',
+    '(version 1)(deny default)(allow signal (target self))(allow ipc-posix-sem*)(allow sysctl-read)(allow file-read-metadata)',
+    ...(tools?['(allow process-fork)']:[]),
+    '(allow file-read-data '+[...allowed,...readonly.map(sub),...['/','/dev/null','/dev/urandom'].map(literal)].join(' ')+')',
+    '(allow file-map-executable '+[...maps,...readonly.map(sub)].join(' ')+')',
     '(allow process-exec '+commands.map(literal).join(' ')+')',
-    '(allow file-write* '+sub(task)+' '+literal('/dev/null')+')',
+    ...(tools?['(allow file-write* '+sub(scratch)+' '+literal('/dev/null')+')']:[]),
   ].join('\n');
 }
-async function inSandbox(task,profile,command,args,timeout=8000,toolPath='') {
+const safeLines=new Set(t.flatMap(([, ,expected])=>expected).concat([
+  'not-allowed:unsaved','not-allowed:draft','not-allowed:submitted','usage',
+]));
+function cleanFixtureOutput(raw) {
+  if(typeof raw!=='string'||raw.length>1024||!raw.endsWith('\n'))return null;
+  const lines=raw.slice(0,-1).split('\n');
+  return lines.length<=24&&lines.every(line=>safeLines.has(line))?lines:null;
+}
+async function inSandbox(task,profile,command,args,timeout=8000,toolPath='',expectedWriteDenial) {
   const env={HOME:task,TMPDIR:task,PATH:toolPath?toolPath+':/usr/bin:/bin':'/usr/bin:/bin',LANG:'C'};
   try {
     const result=await execute('/usr/bin/sandbox-exec',['-p',profile,command,...args],{cwd:task,env,timeout,maxBuffer:65536});
-    return {ok:true,stdout:result.stdout.trimEnd()};
+    return {ok:true,stdout:result.stdout};
   } catch(e) {
     const why=String(e.stderr??'');
-    return {ok:false,error:why.includes('sandbox_apply')?'nested-sandbox-denied':why.includes('Operation not permitted')?'sandbox-operation-denied':'sandboxed-command-failed',exitCode:Number.isInteger(e.code)?e.code:null,signal:e.signal??null};
+    if(expectedWriteDenial&&why.split('\n').includes("ld: can't write output file: "+expectedWriteDenial))
+      return {ok:false,error:'expected-linker-output-write-denial',exitCode:Number.isInteger(e.code)?e.code:null};
+    return {ok:false,error:why.includes('sandbox_apply')?'nested-sandbox-denied':/Operation not permitted|Permission denied|errno=1\b/.test(why)?'sandbox-operation-denied':'sandboxed-command-failed',exitCode:Number.isInteger(e.code)?e.code:null,signal:e.signal??null};
   }
 }
+async function probeNativePolicies() {
+  const run=await fresh('native-boundary-'), task=join(run,'task'), scratch=join(task,'compiler-scratch'), cache=join(scratch,'cache');
+  await mkdir(cache,{recursive:true,mode:0o700});
+  const tools=await toolchain();
+  const source=join(task,'probe.swift'), staged=join(scratch,'probe'), binary=join(task,'probe');
+  const sentinel=join(run,'synthetic-sibling');
+  await writeFile(sentinel,'SYNTHETIC_ONLY',{mode:0o600,flag:'wx'});
+  const before=sha(await readFixed(sentinel,limits.source));
+  await writeFile(source,[
+    'import Darwin',
+    'let path = CommandLine.arguments[1]',
+    'func probe(_ flags: Int32) -> Bool {',
+    '    let fd = open(path, flags)',
+    '    if fd >= 0 { close(fd); return false }',
+    '    return errno == EPERM || errno == EACCES',
+    '}',
+    'print(probe(O_RDONLY) ? "READ_DENIED" : "READ_NOT_DENIED")',
+    'print(probe(O_WRONLY) ? "WRITE_DENIED" : "WRITE_NOT_DENIED")',
+    'print(getenv("ATOMIUM_SYNTHETIC_FAKE_ENV") == nil ? "ENV_ABSENT" : "ENV_PRESENT")',
+  ].join('\n')+'\n',{mode:0o400,flag:'wx'});
+  const cprof=restricted({binary,source,scratch,tools});
+  const compile=(output,expectedDenial)=>inSandbox(scratch,cprof,tools.compiler,['-sdk',tools.sdk,'-module-cache-path',cache,source,'-o',output],35000,tools.bin,expectedDenial);
+  // Both destinations start as regular 0600 sentinel files with identical bytes.
+  await writeFile(staged,'SYNTHETIC_ONLY',{mode:0o600,flag:'wx'});
+  const scratchInitiallySame=sha(await readFixed(staged,limits.source))===before;
+  const allowed=await compile(staged);
+  if(!allowed.ok)throw new Error('native-policy-probe-control-build-failed:'+allowed.error);
+  const denied=await compile(sentinel,sentinel);
+  await writeFile(binary,await readFixed(staged,limits.binary),{mode:0o500,flag:'wx'});
+  const runtime=restricted({binary});
+  const previous=process.env.ATOMIUM_SYNTHETIC_FAKE_ENV;
+  process.env.ATOMIUM_SYNTHETIC_FAKE_ENV='SYNTHETIC_VALUE_ONLY';
+  let result;
+  try{result=await inSandbox(task,runtime,binary,[sentinel]);}
+  finally{if(previous===undefined)delete process.env.ATOMIUM_SYNTHETIC_FAKE_ENV;else process.env.ATOMIUM_SYNTHETIC_FAKE_ENV=previous;}
+  const labels=result.ok?result.stdout.split('\n'):[];
+  const unchanged=sha(await readFixed(sentinel,limits.source))===before;
+  const checks={
+    compilerScratchControl:allowed.ok&&scratchInitiallySame&&sha(await readFixed(staged,limits.binary))!==before,
+    compilerSiblingWriteDenied:!denied.ok&&denied.error==='expected-linker-output-write-denial',
+    siblingUnchanged:unchanged,
+    runtimeSiblingReadDenied:labels[0]==='READ_DENIED',
+    runtimeSiblingWriteDenied:labels[1]==='WRITE_DENIED',
+    syntheticParentEnvAbsent:labels[2]==='ENV_ABSENT',
+  };
+  await outputAt(run,{version:1,mode:'trusted-native-boundary-probe',boundary,checks,compilerResult:denied.ok?'unexpected-allowed':denied.error,runtimeResult:result.ok?'executed':result.error});
+  if(!Object.values(checks).every(Boolean))throw new Error('native-policy-probe-failed');
+  console.log('PASS fixed-native-compiler-runtime-policy-probe');
+}
 async function appSuite(task,binary) {
-  const profile=restricted(task,binary);
+  const profile=restricted({binary});
   const checks=[];
   for(const [id,args,expected] of t){
     const observation=await inSandbox(task,profile,binary,args);
-    const actual=observation.ok?observation.stdout.split('\n'):null;
-    const pass=observation.ok&&stable(actual)===stable(expected);
-    checks.push({id,pass,expected,actual,...(!observation.ok?{error:observation.error}:{})});
+    const actual=observation.ok?cleanFixtureOutput(observation.stdout):null;
+    const pass=actual!==null&&stable(actual)===stable(expected);
+    checks.push({id,pass,expected,actual,...(actual===null?{error:observation.ok?'unexpected-stdout-suppressed':observation.error}:{})});
     console.log((pass?'PASS ':'FAIL ')+id);
   }
   return {runtimeProfileSha:sha(profile),checks};
@@ -147,7 +236,7 @@ async function buildPair(mode,ask,propose) {
   let review=null;
   const fail=async(status,more={})=>{
     console.error('STOP '+status+'; no approved delivery.');
-    await outputAt(run,{version:1,mode,status,specSha,suiteSha,proposal,review,approval:null,exported:false,...more});
+    await outputAt(run,{version:1,boundary,mode,status,specSha,suiteSha,proposal,review,approval:null,exported:false,...more});
     return {run,status};
   };
   if(mode==='native-live'){
@@ -169,21 +258,24 @@ async function buildPair(mode,ask,propose) {
   const task=join(run,'task');
   await mkdir(task,{mode:0o700});
   const source=join(task,'main.swift'),binary=join(task,'app');
-  await writeFile(source,c.proposed,{mode:0o600,flag:'wx'});
-  if(sha(await readFile(source))!==c.sourceSha)return fail('source-binding-mismatch');
+  await writeFile(source,c.proposed,{mode:0o400,flag:'wx'});
+  if(sha(await readFixed(source,limits.source))!==c.sourceSha)return fail('source-binding-mismatch');
   const tools=await toolchain();
-  const cache=join(task,'cache');
+  const scratch=join(task,'compiler-scratch'),cache=join(scratch,'cache'),staged=join(scratch,'app');
+  await mkdir(scratch,{mode:0o700});
   await mkdir(cache,{mode:0o700});
-  const profile=restricted(task,binary,tools);
-  const result=await inSandbox(task,profile,tools.compiler,['-sdk',tools.sdk,'-module-cache-path',cache,source,'-o',binary],35000,tools.bin);
+  const profile=restricted({binary,source,scratch,tools});
+  const result=await inSandbox(scratch,profile,tools.compiler,['-sdk',tools.sdk,'-module-cache-path',cache,source,'-o',staged],35000,tools.bin);
   if(!result.ok)return fail('swift-compile-failed',{build:result});
-  if(sha(await readFile(source))!==c.sourceSha)return fail('post-build-source-binding-mismatch');
-  const buildSha=sha(await readFile(binary));
+  const artifact=await readFixed(staged,limits.binary);
+  await writeFile(binary,artifact,{mode:0o500,flag:'wx'});
+  if(sha(await readFixed(source,limits.source))!==c.sourceSha)return fail('post-build-source-binding-mismatch');
+  const buildSha=sha(await readFixed(binary,limits.binary));
   const build={sourceSha:c.sourceSha,buildSha,profileSha:sha(profile),toolchain:tools.version,compilerSha:tools.compilerSha};
   const {runtimeProfileSha,checks}=await appSuite(task,binary);
   const green=checks.every(c=>c.pass);
   if(!green)return fail('behavior-rejected',{build,checks,runtimeProfileSha,manifestSha:c.manifestSha,sourceSha:c.sourceSha});
-  if(sha(await readFile(binary))!==buildSha||sha(await readFile(source))!==c.sourceSha)return fail('post-test-build-binding-mismatch');
+  if(sha(await readFixed(binary,limits.binary))!==buildSha||sha(await readFixed(source,limits.source))!==c.sourceSha)return fail('post-test-build-binding-mismatch');
   let kind=null;
   const binding={fixtureId:spec.id,specSha,suiteSha,rule:c.rule,sourceSha:c.sourceSha,buildSha,manifestSha:c.manifestSha};
   if(mode==='native-self-test')kind='self-test-only';
@@ -195,7 +287,7 @@ async function buildPair(mode,ask,propose) {
   }
   const approval=kind?{kind,binding,receiptSha:sha(stable({kind,binding}))}:null;
   const status=approval?'replay-authorized':'verified-not-approved';
-  await outputAt(run,{version:1,mode,status,specSha,suiteSha,proposal,review,manifestSha:c.manifestSha,sourceSha:c.sourceSha,build,checks,runtimeProfileSha,approval,exported:false});
+  await outputAt(run,{version:1,boundary,mode,status,specSha,suiteSha,proposal,review,manifestSha:c.manifestSha,sourceSha:c.sourceSha,build,checks,runtimeProfileSha,approval,exported:false});
   console.log(status+' build '+buildSha);
   return {run,status};
 }
@@ -205,9 +297,7 @@ async function verifiedReceipt(raw,allowTest) {
   const path=resolve(raw);
   const run=dirname(path);
   if(basename(path)!=='evidence.json'||dirname(run)!==runs||!/^native-[a-zA-Z0-9]+$/.test(basename(run))||await realpath(path)!==path)throw new Error('receipt-is-not-an-Atomium-native-run');
-  const st=await lstat(path);
-  if(!st.isFile()||st.size>30000)throw new Error('receipt-invalid');
-  const r=JSON.parse(await readFile(path,'utf8'));
+  const r=JSON.parse((await readFixed(path,limits.receipt)).toString('utf8'));
   const kind=r.approval?.kind;
   if(kind!=='interactive'&&!(allowTest&&kind==='self-test-only'))throw new Error('exact-candidate-not-approved');
   if(r.version!==1||r.status!=='replay-authorized'||r.specSha!==specSha||r.suiteSha!==suiteSha||r.proposal?.rule!=='exact-raw-name'||r.checks?.length!==t.length||r.checks.some((check,i)=>!check.pass||check.id!==t[i][0]))throw new Error('receipt-contract-mismatch');
@@ -216,9 +306,8 @@ async function verifiedReceipt(raw,allowTest) {
     || (kind==='self-test-only'&&r.mode==='native-self-test'&&r.proposal.source==='trusted-self-test');
   if(!boundApproval)throw new Error('approval-mode-binding-mismatch');
   const manifestPath=join(run,'review-manifest.json'),src=join(run,'task','main.swift'),bin=join(run,'task','app');
-  for(const item of [manifestPath,src,bin])if(!(await lstat(item)).isFile()||await realpath(item)!==item)throw new Error('unsafe-replay-input');
-  if(sha(await readFile(manifestPath))!==c.manifestSha||sha(await readFile(src))!==c.sourceSha)throw new Error('frozen-candidate-tampered');
-  const bytes=await readFile(bin);
+  if(sha(await readFixed(manifestPath,limits.source))!==c.manifestSha||sha(await readFixed(src,limits.source))!==c.sourceSha)throw new Error('frozen-candidate-tampered');
+  const bytes=await readFixed(bin,limits.binary);
   const buildSha=sha(bytes);
   const binding={fixtureId:spec.id,specSha,suiteSha,rule:c.rule,sourceSha:c.sourceSha,buildSha,manifestSha:c.manifestSha};
   if(r.build?.buildSha!==buildSha||r.build.sourceSha!==c.sourceSha||stable(r.approval.binding)!==stable(binding)||r.approval.receiptSha!==sha(stable({kind,binding})))throw new Error('replay-binary-or-approval-mismatch');
@@ -229,24 +318,32 @@ async function replayRun(receipt,allowTest,appArgs) {
   const run=await fresh('replay-');
   const task=join(run,'task'),binary=join(task,'app');
   await mkdir(task,{mode:0o700});
-  await writeFile(binary,reviewed.bytes,{mode:0o700,flag:'wx'});
-  if(sha(await readFile(binary))!==reviewed.binding.buildSha)throw new Error('replay-copy-binding-mismatch');
+  await writeFile(binary,reviewed.bytes,{mode:0o500,flag:'wx'});
+  if(sha(await readFixed(binary,limits.binary))!==reviewed.binding.buildSha)throw new Error('replay-copy-binding-mismatch');
   if(appArgs){
     const okay=appArgs.length===1&&appArgs[0]==='version'||appArgs.length>=3&&appArgs.length<=24&&appArgs.every(x=>x.length<=64&&!/[\x00-\x1f\x7f]/.test(x))&&appArgs.slice(2).every(x=>['show','save','submit','reset'].includes(x)||/^rename:.{1,50}$/.test(x));
     if(!okay)throw new Error('fixture-input-invalid; use version or occupiedName draftName actions: show save submit rename:NAME reset');
-    const result=await inSandbox(task,restricted(task,binary),binary,appArgs);
+    const result=await inSandbox(task,restricted({binary}),binary,appArgs);
     if(!result.ok)throw new Error(result.error);
-    console.log(result.stdout);
+    const parsed=cleanFixtureOutput(result.stdout);
+    if(parsed===null)throw new Error('unexpected-stdout-suppressed');
+    console.log(parsed.join('\n'));
     return;
   }
   const {runtimeProfileSha,checks}=await appSuite(task,binary);
-  const passed=checks.every(x=>x.pass)&&sha(await readFile(binary))===reviewed.binding.buildSha;
-  await outputAt(run,{version:1,mode:'replay',sourceApproval:reviewed.kind,binding:reviewed.binding,runtimeProfileSha,checks,passed,usedModel:false});
+  const passed=checks.every(x=>x.pass)&&sha(await readFixed(binary,limits.binary))===reviewed.binding.buildSha;
+  await outputAt(run,{version:1,boundary,mode:'replay',sourceApproval:reviewed.kind,binding:reviewed.binding,runtimeProfileSha,checks,passed,usedModel:false});
   if(!passed)process.exitCode=1;
 }
 export async function nativeMain(cmd,args,{askCodex,proposeAgy}) {
   if(cmd==='native-live'&&args.length===0){const r=await buildPair(cmd,askCodex,proposeAgy);if(!['verified-not-approved','replay-authorized'].includes(r.status))process.exitCode=1;return;}
   if(cmd==='verify-native'&&args.length===0){
+    for(const bad of ['synthetic-secret-not-a-fixture-token\n','saved:draft\nsynthetic-secret\n','saved:draft\x1b\n','saved:draft\n\n']){
+      if(cleanFixtureOutput(bad)!==null)throw new Error('unknown-stdout-was-allowed');
+    }
+    if(stable(cleanFixtureOutput('saved:draft\nstate:draft\n'))!==stable(['saved:draft','state:draft']))throw new Error('known-stdout-was-blocked');
+    console.log('PASS native-stdout-closed-token-gate');
+    await probeNativePolicies();
     const yes=await buildPair('native-self-test');
     if(yes.status!=='replay-authorized')throw new Error('correct fixture failed');
     const no=await buildPair('native-wrong');
@@ -259,13 +356,20 @@ export async function nativeMain(cmd,args,{askCodex,proposeAgy}) {
     const tamper=await fresh('native-');
     await mkdir(join(tamper,'task'),{mode:0o700});
     for(const name of ['evidence.json','review-manifest.json','task/main.swift'])
-      await writeFile(join(tamper,name),await readFile(join(yes.run,name)),{mode:0o600,flag:'wx'});
-    const altered=await readFile(join(yes.run,'task','app'));
+      await writeFile(join(tamper,name),await readFixed(join(yes.run,name),limits.source),{mode:0o600,flag:'wx'});
+    const altered=await readFixed(join(yes.run,'task','app'),limits.binary);
     altered[altered.length-1]^=1;
     await writeFile(join(tamper,'task','app'),altered,{mode:0o700,flag:'wx'});
     try{await verifiedReceipt(join(tamper,'evidence.json'),true);throw new Error('modified-build-accepted');}
     catch(e){if(e.message!=='replay-binary-or-approval-mismatch')throw e;}
-    console.log('PASS replay-denies-wrong-unapproved-and-altered-builds');
+    const loose=await fresh('native-');
+    await mkdir(join(loose,'task'),{mode:0o700});
+    for(const name of ['evidence.json','review-manifest.json','task/main.swift'])
+      await writeFile(join(loose,name),await readFixed(join(yes.run,name),limits.source),{mode:0o600,flag:'wx'});
+    await symlink(join(yes.run,'task','app'),join(loose,'task','app'));
+    try{await verifiedReceipt(join(loose,'evidence.json'),true);throw new Error('linked-build-accepted');}
+    catch(e){if(e.message!=='unsafe-replay-input')throw e;}
+    console.log('PASS replay-denies-wrong-unapproved-altered-and-linked-builds');
     await replayRun(join(yes.run,'evidence.json'),true);return;
   }
   if(['replay','native-app'].includes(cmd)){
