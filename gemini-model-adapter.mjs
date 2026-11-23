@@ -3,13 +3,16 @@
 // Contract: https://ai.google.dev/api/generate-content
 // Stable model: https://aistudio.google.com/docs/models/gemini-3.5-flash-lite
 import { request } from 'node:https';
+import { request as requestHttp } from 'node:http';
+import { connect } from 'node:net';
 import { Readable } from 'node:stream';
 
 export const GEMINI_ROUTE = 'gemini-fixture';
 export const GEMINI_MODEL = 'gemini-3.5-flash-lite';
 export const GEMINI_FIXTURE_INPUT = 'Reply with the single uppercase word OK. Do not add punctuation.';
 const host = 'generativelanguage.googleapis.com';
-const path = `/v1beta/models/${GEMINI_MODEL}:generateContent`;
+export const GEMINI_FIXTURE_PATH = `/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const path = GEMINI_FIXTURE_PATH;
 const limits = Object.freeze({ requestBytes: 512, responseBytes: 8192, outputTokens: 32, timeoutMs: 8000 });
 const allow = () => ({ decision: 'allow', reason: 'gemini-fixture-ack' });
 const deny = reason => ({ decision: 'block', reason });
@@ -92,7 +95,7 @@ async function readResponse(reply, signal) {
   return allow();
 }
 
-// Only the test in this module can swap the trusted HTTP transport.
+// Only host-controlled fixture constructors can select a transport.
 function buildAdapter(apiKey, transport, timeoutMs) {
   let key = typeof apiKey === 'string' && /^[A-Za-z0-9_.-]{16,256}$/.test(apiKey) ? apiKey : null;
   let consumed = false;
@@ -148,6 +151,21 @@ function buildAdapter(apiKey, transport, timeoutMs) {
 // request and supply the key via a trusted credential source, not worker data.
 export function createGeminiFixtureAdapter({ apiKey } = {}) {
   return buildAdapter(apiKey, openHttps, limits.timeoutMs);
+}
+
+// This deliberately uses HTTP to an in-process observer on IPv4 loopback,
+// never the official host. Only freshly generated fixture keys are accepted.
+export function createGeminiLoopbackFixtureAdapter({ fixtureKey, port } = {}) {
+  if (typeof fixtureKey !== 'string' || !/^ATOMIUM_FAKE_GEMINI_[a-f0-9]{32}$/.test(fixtureKey) ||
+      !Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('invalid-local-gemini-fixture-config');
+  return buildAdapter(fixtureKey, ({ signal, method, path, headers, maxHeaderSize }, body) => new Promise((resolve, reject) => {
+    const req = requestHttp({
+      host: '127.0.0.1', port, path, method, headers, maxHeaderSize, signal, agent: false,
+      createConnection: () => connect({ host: '127.0.0.1', family: 4, port }),
+    }, resolve);
+    req.on('error', reject);
+    req.end(body);
+  }), limits.timeoutMs);
 }
 
 export async function verifyGeminiFixtureContract() {

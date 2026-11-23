@@ -12,6 +12,12 @@ const jobPattern=/^[a-f0-9]{24}$/;
 export function createFixtureGateway({port,timeoutMs=1200}) {
   return fixtureGateway({port,timeoutMs,post:postFixture});
 }
+// The controller may install its own fixed synthetic transport. This is a host
+// seam, never supplied by a worker. Route, channel and lease checks remain here.
+export function createManagedFixtureGateway({port,timeoutMs=4500,post}) {
+  if(typeof post!=='function')throw new Error('invalid-managed-fixture-transport');
+  return fixtureGateway({port,timeoutMs,post});
+}
 function fixtureGateway({port,timeoutMs,post}) {
   if(!Number.isInteger(port)||port<1024||port>65535||!Number.isInteger(timeoutMs)||timeoutMs<20||timeoutMs>5000)throw new Error('invalid-gateway-config');
   const jobs=new Map();
@@ -58,7 +64,7 @@ function fixtureGateway({port,timeoutMs,post}) {
     if(waited<=0){entry.controller=null;return record('block','grant-unavailable');}
     const timer=setTimeout(()=>controller.abort(),waited);
     try {
-      const ok=await post(port,data,controller.signal);
+      const ok=await post(port,data,controller.signal,msg.jobId);
       if(entry.state==='revoked'||closed)return record('block','grant-unavailable');
       return ok?record('allow','fixture-upstream-ack'):record('block','upstream-failed');
     }catch{

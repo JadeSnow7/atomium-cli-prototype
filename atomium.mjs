@@ -402,6 +402,12 @@ if (cmd==='profile') {
     const {runNativeNetworkAudit}=await import('./native-network-audit.mjs');
     await runNativeNetworkAudit();
   } catch {console.error('Native network fixture could not finish.');process.exitCode=1;}
+} else if (cmd==='verify-gemini-managed' && !args.length) {
+  try {
+    const {runManagedGeminiFixtureAudit}=await import('./gemini-model-managed-audit.mjs');
+    const {status}=await runManagedGeminiFixtureAudit();
+    if(status!=='passed')process.exitCode=['blocked','environment-blocked'].includes(status)?2:1;
+  } catch {console.error('Managed Gemini loopback fixture could not finish.');process.exitCode=1;}
 } else if (cmd==='verify-gemini-adapter' && !args.length) {
   try {
     const {runGeminiContractAudit}=await import('./gemini-model-verify.mjs');
@@ -480,6 +486,6 @@ if (cmd==='profile') {
   try { await runDemo(cmd); }
   catch(e) { console.error('Atomium fixture stopped: '+e.message);process.exitCode=1; }
 } else {
-  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary | verify-agent-egress | verify-dual-worker [--protocol-only] | verify-native-network | verify-gemini-adapter | profile | task | verify-profiles [--store-only] | verify-profile-login | verify-harness-config | verify-named-proposal');
+  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary | verify-agent-egress | verify-dual-worker [--protocol-only] | verify-native-network | verify-gemini-adapter | verify-gemini-managed | profile | task | verify-profiles [--store-only] | verify-profile-login | verify-harness-config | verify-named-proposal');
   if (cmd && cmd!=='--help') process.exitCode=2;
 }
