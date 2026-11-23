@@ -321,10 +321,14 @@ async function runDemo(mode, rejectionTest, dualTest) {
 const [cmd,...args]=process.argv.slice(2);
 if (cmd==='profile') {
   try {
-    const {addProfile,defaultProfileRoot,listProfiles,loadProfile,publicProfile,registerHarnessLogin}=await import('./agent-profiles.mjs');
+    const {addProfile,addHarnessConfig,defaultProfileRoot,listProfiles,loadProfile,publicProfile,registerHarnessLogin}=await import('./agent-profiles.mjs');
     const [op,arg,id]=args;
     if(op==='list'&&args.length===1)console.log(JSON.stringify((await listProfiles(defaultProfileRoot)).map(publicProfile),null,2));
     else if(op==='create'&&args.length===2)console.log(JSON.stringify(publicProfile(await addProfile(defaultProfileRoot,arg)),null,2));
+    else if(op==='configure'&&arg==='--harness'&&args[3]==='--profile'&&(args.length===5||args.length===7&&args[5]==='--timeout-ms')){
+      const timeoutMs=args.length===7?(/^\d{4,5}$/.test(args[6])?Number(args[6]):NaN):undefined;
+      console.log(JSON.stringify(publicProfile(await addHarnessConfig(defaultProfileRoot,{harness:id,id:args[4],timeoutMs})),null,2));
+    }
     else if(op==='login'&&args.length===5&&arg==='--harness'&&args[3]==='--profile'){
       const cancellation=new AbortController();
       const stop=()=>cancellation.abort();
@@ -350,11 +354,30 @@ if (cmd==='profile') {
         const {status}=await runSelectedProfile(config);
         if(status!=='passed')process.exitCode=status==='blocked'?2:1;
       }
-    }else {console.error('Usage: node atomium.mjs profile list | profile create <id> | profile show --profile <id> | profile run --profile <id> | profile login --harness agy --profile <id>');process.exitCode=64;}
+    }else {console.error('Usage: node atomium.mjs profile list | profile create <id> | profile show --profile <id> | profile run --profile <id> | profile configure --harness <agy|codex> --profile <id> [--timeout-ms <ms>] | profile login --harness agy --profile <id>');process.exitCode=64;}
   }catch(e){
-    const reason=['invalid-profile-id','unsafe-profile-store','profile-already-exists','unsafe-profile-file','profile-file-changed','profile-schema-rejected','profile-not-found','unsupported-login-harness','login-requires-terminal','agy-login-busy','agy-single-login-slot','profile-isolated-execution-unavailable'].includes(e.message)?e.message:'profile-operation-failed';
+    const reason=['invalid-profile-id','unsafe-profile-store','profile-already-exists','unsafe-profile-file','profile-file-changed','profile-schema-rejected','profile-not-found','unsupported-login-harness','login-requires-terminal','agy-login-busy','agy-single-login-slot','profile-isolated-execution-unavailable','unsupported-config-harness','invalid-harness-timeout'].includes(e.message)?e.message:'profile-operation-failed';
     console.error('Profile: '+reason);process.exitCode=1;
   }
+} else if (cmd==='task') {
+  const [op,hFlag,harness,pFlag,profile,actionFlag,operation]=args;
+  if(op!=='run'||hFlag!=='--harness'||pFlag!=='--profile'||!(args.length===5||args.length===7&&actionFlag==='--operation')){
+    console.error('Usage: node atomium.mjs task run --harness <agy|codex> --profile <id> [--operation version-check]');process.exitCode=64;
+  }else try{
+    const {defaultProfileRoot}=await import('./agent-profiles.mjs');
+    const {runHarnessTask}=await import('./harness-task.mjs');
+    const result=await runHarnessTask(defaultProfileRoot,{harness,profile,operation});
+    console.log(JSON.stringify(result,null,2));
+    if(result.status!=='passed')process.exitCode=1;
+  }catch(e){
+    const reason=['unsupported-task-harness','unsupported-task-operation','harness-profile-mismatch','profile-not-found','invalid-profile-id','invalid-task-profile'].includes(e.message)?e.message:'harness-task-failed';
+    console.error('Task: '+reason);process.exitCode=1;
+  }
+} else if (cmd==='verify-harness-config' && !args.length) {
+  try{
+    const {verifyHarnessTasks}=await import('./harness-task.mjs');
+    if((await verifyHarnessTasks()).status!=='passed')process.exitCode=1;
+  }catch{console.error('Harness configuration audit could not finish.');process.exitCode=1;}
 } else if (cmd==='verify-profile-login' && !args.length) {
   try {
     const {verifyProfileLogin}=await import('./profile-login-audit.mjs');
@@ -465,6 +488,6 @@ if (cmd==='profile') {
   try { await runDemo(cmd); }
   catch(e) { console.error('Atomium fixture stopped: '+e.message);process.exitCode=1; }
 } else {
-  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary | verify-agent-egress | verify-dual-worker [--protocol-only] | verify-native-network | verify-gemini-adapter | profile | verify-profiles [--store-only] | verify-profile-login');
+  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary | verify-agent-egress | verify-dual-worker [--protocol-only] | verify-native-network | verify-gemini-adapter | profile | task | verify-profiles [--store-only] | verify-profile-login | verify-harness-config');
   if (cmd && cmd!=='--help') process.exitCode=2;
 }

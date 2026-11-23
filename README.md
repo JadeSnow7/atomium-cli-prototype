@@ -86,6 +86,18 @@ The named Profile JSON holds an opaque reference to one shared agy login slot, n
 
 Run `node atomium.mjs verify-profile-login` for offline login, cancellation, no-overwrite and Profile publication acceptance. It uses only a synthetic driver and a simulated ACP process; it does not validate real OAuth. No API key is required.
 
+### Select a Harness and Profile per task
+
+```sh
+node atomium.mjs profile configure --harness agy --profile agy-local --timeout-ms 5000
+node atomium.mjs profile configure --harness codex --profile codex-local --timeout-ms 7000
+node atomium.mjs task run --harness agy --profile agy-local
+node atomium.mjs task run --harness codex --profile codex-local
+node atomium.mjs verify-harness-config
+```
+
+A Profile belongs to one Harness. Use distinct names; creating configuration does not sign in and does not overwrite a saved Profile. At dispatch, the controller loads one matching record and applies its timeout to the selected binary. Wrong pairs, missing Profiles, and unsupported actions stop before launch without selecting a fallback. The current task operation is `version-check`: it runs the actual installed binary with `--version` and fresh HOME, TMPDIR and cwd, without providing any credentials or project. This is a dispatch preflight, not authenticated task execution or an OS sandbox. Existing named agy login Profiles can also be selected for `version-check`; their login state is neither loaded nor changed by it. A new agy configuration is not a second Google OAuth login.
+
 ### Native loopback capability
 
 Run `node atomium.mjs verify-native-network` on the target Mac. The existing Swift compiler and runtime profiles build and run a fixed Mach-O. An independent local receiver sees an unconfined control before and after each confined attempt. The confined attempt must return an explicit permission denial and add zero connections or datagrams. Evidence: `runs/native-network-*/evidence.json`, including the binary/profile digests and counts for TCP and UDP over IPv4 and IPv6. Exit 2 denotes an environmental block; it is not a pass. The UDP probes use DNS-shaped datagrams to the test receiver, not the OS resolver. This does not certify a signed App Sandbox helper, XPC, external egress, or any vendor CLI.

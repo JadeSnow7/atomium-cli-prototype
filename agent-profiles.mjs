@@ -10,6 +10,10 @@ const idPattern = /^[a-z][a-z0-9-]{0,31}$/;
 const fields = 'agent,credentialRef,id,permissions,route,schema,stateNamespace';
 const marker = 'atomium-agent-profile-v1';
 const agyMarker = 'atomium-agy-login-profile-v1';
+export const harnessConfigSchema = 'atomium-harness-config-v1';
+const harnessFields = 'agent,credentialRef,harness,id,permissions,route,schema,stateNamespace,timeoutMs';
+const harnesses = new Set(['agy','codex']);
+const validTimeout = x => Number.isInteger(x) && x >= 1000 && x <= 15000;
 const isRecord = obj => obj && typeof obj === 'object' && !Array.isArray(obj);
 const canonical = id => ({
   schema: marker, id, agent: 'synthetic-worker', permissions: 'fixed-task-only',
@@ -19,6 +23,10 @@ const canonical = id => ({
 const agyProfile = id => ({
   schema: agyMarker, id, agent: 'agy', permissions: 'host-login-only', route: null,
   stateNamespace: 'agy-host-single-slot', credentialRef: 'agy:os-keyring-single-slot',
+});
+const harnessProfile = (harness,id,timeoutMs) => ({
+  schema: harnessConfigSchema, id, agent: harness, harness, permissions: 'harness-config-only',
+  route: null, stateNamespace: 'harness-' + harness + '-' + id, credentialRef: null, timeoutMs,
 });
 function safeId(id) {
   if (typeof id !== 'string' || !idPattern.test(id)) throw new Error('invalid-profile-id');
@@ -39,15 +47,25 @@ function snapshot(config) {
   const digest = createHash('sha256').update(JSON.stringify(config)).digest('hex');
   return Object.freeze({ ...config, digest });
 }
-export function publicProfile({ id, agent, route, permissions, stateNamespace, digest }) {
+export function publicProfile({ id, schema, agent, route, permissions, stateNamespace, digest, harness, timeoutMs }) {
   return { id, agent, route, permissions, stateNamespace, digest,
-    ...(agent === 'agy' ? { authentication: 'official-login-acp-ready-at-save', identityStatus: 'identity-unavailable',
-      isolatedExecution: false } : { authentication: 'synthetic-only' }) };
+    ...(schema === harnessConfigSchema ? { schema, harness, timeoutMs, authentication: 'not-configured', isolatedExecution: false }
+      : agent === 'agy' ? { authentication: 'official-login-acp-ready-at-save', identityStatus: 'identity-unavailable',
+        isolatedExecution: false } : { authentication: 'synthetic-only' }) };
 }
 export async function addProfile(root, id) {
   safeId(id);
   await safeRoot(root, true);
   return publishProfile(root, canonical(id));
+}
+export async function addHarnessConfig(root,options) {
+  if(!isRecord(options)||Object.keys(options).some(k=>!['harness','id','timeoutMs'].includes(k)))throw new Error('invalid-harness-config');
+  const {harness,id,timeoutMs=4000}=options;
+  if(!harnesses.has(harness))throw new Error('unsupported-harness-config');
+  safeId(id);
+  if(!validTimeout(timeoutMs))throw new Error('invalid-harness-timeout');
+  await safeRoot(root,true);
+  return publishProfile(root,harnessProfile(harness,id,timeoutMs));
 }
 async function publishProfile(root, doc, signal) {
   const {id}=doc;
@@ -80,9 +98,11 @@ export async function loadProfile(root, id) {
     if (bytesRead !== st.size || after.size !== st.size || after.mtimeMs !== st.mtimeMs) throw new Error('profile-file-changed');
     const raw = bytes.subarray(0, bytesRead).toString('utf8');
     const doc = JSON.parse(raw);
-    const fixed = doc?.schema === agyMarker ? agyProfile(id) : canonical(id);
+    const isHarness = doc?.schema === harnessConfigSchema;
+    if (isHarness && (!harnesses.has(doc.harness) || !validTimeout(doc.timeoutMs))) throw new Error('profile-schema-rejected');
+    const fixed = isHarness ? harnessProfile(doc.harness,id,doc.timeoutMs) : doc?.schema === agyMarker ? agyProfile(id) : canonical(id);
     // No imported OAuth blobs, identity asserted by caller, arbitrary routes or writable paths.
-    if (!isRecord(doc) || Object.keys(doc).sort().join(',') !== fields ||
+    if (!isRecord(doc) || Object.keys(doc).sort().join(',') !== (isHarness ? harnessFields : fields) ||
         Object.keys(fixed).some(k => fixed[k] !== doc[k]) || raw !== JSON.stringify(doc) + '\n')
       throw new Error('profile-schema-rejected');
     return snapshot(fixed);
@@ -106,7 +126,7 @@ export async function registerHarnessLogin(root, {harness, id, interactive, auth
   try {
     const profiles = await listProfiles(root);
     if (profiles.some(p => p.id === id)) throw new Error('profile-already-exists');
-    if (profiles.some(p => p.agent === 'agy')) throw new Error('agy-single-login-slot');
+    if (profiles.some(p => p.schema === agyMarker)) throw new Error('agy-single-login-slot');
     if (signal?.aborted) return {status:'cancelled', saved:false};
     const flow = await authenticate(join(root, '.agy-host-state'),{signal});
     if (signal?.aborted) return {status:'cancelled', saved:false};
