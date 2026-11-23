@@ -4,7 +4,7 @@ import {homedir,tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 
 const testPrompt = 'Atomium synthetic fixture. Select a JSON view for checked-off tasks only.';
-export async function acpConversation({command,args,env,cwd,prompt,timeout=8000,authorization='clean-home-no-auth'}) {
+export async function acpConversation({command,args,env,cwd,prompt,timeout=8000,authorization='clean-home-no-auth',signal}) {
   const child=spawn(command,args,{env,cwd,stdio:['pipe','pipe','ignore']});
   const stage={protocolVersion:null,authMethods:0,newSession:false,promptSent:false,permissionsDenied:0,otherCallsDenied:0,toolUpdates:0,authorization};
   let buffer=Buffer.alloc(0), total=0, next=0, updates='', sessionId=null, fatal=null;
@@ -22,6 +22,9 @@ export async function acpConversation({command,args,env,cwd,prompt,timeout=8000,
   child.once('error',()=>fail('process-start-error'));
   child.once('exit',()=>fail('process-ended'));
   const timer=setTimeout(()=>{fail('protocol-timeout');child.kill();},timeout);
+  const cancelled=()=>{fail('provider-probe-aborted');child.kill();};
+  signal?.addEventListener('abort',cancelled,{once:true});
+  if(signal?.aborted)cancelled();
   child.stdout.on('data',chunk=>{
     if(fatal)return;
     total+=chunk.length;
@@ -86,6 +89,7 @@ export async function acpConversation({command,args,env,cwd,prompt,timeout=8000,
     return {status:e.rpc===-32000?'auth-required':e.message,phase,...(Number.isInteger(e.rpc)?{rpcCode:e.rpc}:{}),...stage};
   }finally{
     clearTimeout(timer);
+    signal?.removeEventListener('abort',cancelled);
     child.stdin.destroy();
     if(child.exitCode===null&&child.signalCode===null) await new Promise(ok=>{
       const limit=setTimeout(()=>{child.kill('SIGKILL');ok();},1000);
@@ -163,16 +167,126 @@ export async function dedicatedAgy(profile,prompt) {
   try{return await acpConversation({...agyOptions(paths),cwd,prompt,timeout:90000,authorization:'user-dedicated-profile'});}
   finally{await rm(cwd,{recursive:true,force:true});}
 }
-export async function userLogin(profile){
+async function officialLoginResult(profile,signal){
   if(!process.stdin.isTTY||!process.stdout.isTTY)throw new Error('Open your own Terminal for this step.');
+  if(signal?.aborted)return {code:null,signal:'SIGINT'};
   const paths=await profileDirs(profile,true);
   const opts=agyOptions(paths);
   await configurePolicy(paths.home,true);
-  const code=await new Promise((yes,no)=>{
+  if(signal?.aborted)return {code:null,signal:'SIGINT'};
+  return new Promise((yes,no)=>{
     const child=spawn(opts.command,[...opts.args,'--login'],{cwd:opts.cwd,env:opts.env,stdio:'inherit'});
-    child.once('error',no);child.once('exit',yes);
+    let forced;
+    const abort=()=>{
+      if(child.exitCode!==null||child.signalCode!==null||forced)return;
+      child.kill('SIGTERM');
+      forced=setTimeout(()=>child.kill('SIGKILL'),1000);
+    };
+    const cleanup=()=>{clearTimeout(forced);signal?.removeEventListener('abort',abort);};
+    child.once('error',error=>{cleanup();no(error);});
+    child.once('exit',(code,observedSignal)=>{cleanup();yes({code,signal:signal?.aborted?'SIGINT':observedSignal});});
+    signal?.addEventListener('abort',abort,{once:true});
+    if(signal?.aborted)abort();
   });
-  return code===0;
+}
+
+// Preserve agy-auth's boolean return and existing explicit TTY guard.
+export async function userLogin(profile){
+  return (await officialLoginResult(profile)).code===0;
+}
+
+const authReceipt=(status,reason,protocolVersion=null)=>Object.freeze({
+  provider:'agy',status,reason,protocolVersion,sessionReady:status==='ready',
+  identityStatus:'identity-unavailable',identity:null,promptSent:false,
+});
+function sanitizeReadiness(result){
+  const protocol=result?.protocolVersion===1?1:null;
+  if(result?.promptSent!==false) return authReceipt('probe-failed','unexpected-prompt-status',protocol);
+  if(result.status==='auth-required'&&result.rpcCode===-32000)
+    return authReceipt('auth-required','provider-auth-required',protocol);
+  if(result.status==='session-ready-prompt-not-authorized'&&protocol===1&&result.newSession===true&&
+      result.permissionsDenied===0&&result.otherCallsDenied===0&&result.toolUpdates===0)
+    return authReceipt('ready','official-acp-session-ready',protocol);
+  return authReceipt('probe-failed','provider-session-unavailable',protocol);
+}
+function classifyLoginExit({code,signal}){
+  if(code===0&&signal===null)return null;
+  if(['SIGINT','SIGTERM','SIGHUP'].includes(signal)||[129,130,143].includes(code))
+    return authReceipt('cancelled','official-login-cancelled');
+  return authReceipt('login-failed','official-login-exited-nonzero');
+}
+
+/** Existing dedicated HOME only. Never sends a model prompt or reads auth tokens.
+ * Official ACP v1 initializes and creates a session without reporting the
+ * authenticated provider account. AgentInfo is a product/version record, not user identity.
+ */
+export async function probeAgyAuthentication(profileDir,{signal}={}){
+  if(signal?.aborted)return authReceipt('cancelled','provider-probe-cancelled');
+  if(typeof profileDir!=='string'||!profileDir||resolve(profileDir)!==profileDir)
+    return authReceipt('probe-failed','profile-path-invalid');
+  let dirs;
+  try{dirs=await profileDirs(profileDir);}
+  catch(e){
+    return e.code==='ENOENT'?authReceipt('auth-required','profile-not-initialized'):
+      authReceipt('probe-failed','profile-directory-unavailable');
+  }
+  try{await configurePolicy(dirs.home);}
+  catch{return authReceipt('probe-failed','dedicated-policy-unavailable');}
+  let scratch,receipt;
+  try{
+    scratch=await mkdtemp(join(dirs.synthetic,'auth-probe-'));
+    const cwd=join(scratch,'cwd'),tmp=join(scratch,'tmp');
+    await Promise.all([mkdir(cwd,{mode:0o700}),mkdir(tmp,{mode:0o700})]);
+    receipt=sanitizeReadiness(await acpConversation({
+      ...agyOptions({...dirs,synthetic:cwd,tmp}),timeout:8000,authorization:'user-dedicated-auth-probe',signal,
+    }));
+  }catch{receipt=authReceipt('probe-failed','provider-probe-unavailable');}
+  if(scratch){
+    try{await rm(scratch,{recursive:true,force:true});}
+    catch{return authReceipt('probe-failed','probe-cleanup-incomplete');}
+  }
+  return signal?.aborted?authReceipt('cancelled','provider-probe-cancelled'):receipt;
+}
+
+/** Explicit user action from their Terminal; these tests never invoke the provider login. */
+export async function runAgyProfileLogin(profileDir,{signal}={}){
+  if(signal?.aborted)return authReceipt('cancelled','official-login-cancelled');
+  if(!process.stdin.isTTY||!process.stdout.isTTY)return authReceipt('login-failed','interactive-terminal-required');
+  if(typeof profileDir!=='string'||!profileDir||resolve(profileDir)!==profileDir)
+    return authReceipt('login-failed','profile-path-invalid');
+  let child;
+  try{child=await officialLoginResult(profileDir,signal);}
+  catch{return signal?.aborted?authReceipt('cancelled','official-login-cancelled'):authReceipt('login-failed','official-login-could-not-start');}
+  return classifyLoginExit(child)??await probeAgyAuthentication(profileDir,{signal});
+}
+
+export async function verifyAgyLoginAdapter(){
+  const raw={
+    status:'session-ready-prompt-not-authorized',protocolVersion:1,newSession:true,promptSent:false,
+    permissionsDenied:0,otherCallsDenied:0,toolUpdates:0,
+    identity:'untrusted string',text:'untrusted model text',sessionId:'untrusted opaque session id',
+  };
+  const ready=sanitizeReadiness(raw);
+  const dir=await mkdtemp(join(tmpdir(),'atomium-agy-abort-fixture-'));
+  const control=new AbortController();
+  const timer=setTimeout(()=>control.abort(),60);
+  let cancelled;
+  try{
+    cancelled=await acpConversation({
+      command:process.execPath,args:['-e','setInterval(()=>{},1000)'],env:{},cwd:dir,
+      timeout:1500,authorization:'mock',signal:control.signal,
+    });
+  }finally{clearTimeout(timer);await rm(dir,{recursive:true,force:true});}
+  return [
+    {id:'agy-acp-ready-not-identity',pass:ready.status==='ready'&&ready.sessionReady&&ready.identityStatus==='identity-unavailable'&&ready.identity===null},
+    {id:'agy-untrusted-identity-and-session-data-omitted',pass:!Object.values(ready).some(v=>typeof v==='string'&&v.startsWith('untrusted'))},
+    {id:'agy-auth-required-distinct',pass:sanitizeReadiness({status:'auth-required',rpcCode:-32000,protocolVersion:1,promptSent:false}).status==='auth-required'},
+    {id:'agy-probe-rejects-unexpected-prompt-or-tool',pass:sanitizeReadiness({...raw,promptSent:true}).status==='probe-failed'&&sanitizeReadiness({...raw,permissionsDenied:1}).status==='probe-failed'},
+    {id:'agy-login-distinguishes-cancel-from-failure',pass:classifyLoginExit({code:130,signal:null}).status==='cancelled'&&classifyLoginExit({code:null,signal:'SIGINT'}).status==='cancelled'&&classifyLoginExit({code:1,signal:null}).status==='login-failed'&&classifyLoginExit({code:0,signal:null})===null},
+    {id:'agy-probe-refuses-invalid-path-without-launch',pass:(await probeAgyAuthentication('relative-fixture')).reason==='profile-path-invalid'},
+    {id:'agy-pre-aborted-actions-do-not-launch',pass:(await probeAgyAuthentication('/fixture-offline',{signal:AbortSignal.abort()})).status==='cancelled'&&(await runAgyProfileLogin('/fixture-offline',{signal:AbortSignal.abort()})).status==='cancelled'},
+    {id:'agy-running-acp-mock-cancels-without-prompt',pass:cancelled.status==='provider-probe-aborted'&&cancelled.promptSent===false},
+  ];
 }
 
 export async function verifyAcp() {

@@ -29,6 +29,7 @@ async function save(dir, receipt) {
 const blockedExit = e => ['EPERM', 'EACCES'].includes(e?.code);
 
 export async function runSelectedProfile(config) {
+  if (config.agent !== 'synthetic-worker') throw new Error('profile-isolated-execution-unavailable');
   const dir = await fresh('profile-run-');
   const task = join(dir, 'task'), host = join(dir, 'host-marker'), peer = join(dir, 'peer-marker');
   await Promise.all([mkdir(task, { mode: 0o700 }), writeFile(host, 'SYNTHETIC_HOST', privateFile),

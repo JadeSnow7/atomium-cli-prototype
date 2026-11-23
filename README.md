@@ -74,9 +74,17 @@ node atomium.mjs profile run --profile fixture-a
 node atomium.mjs verify-profiles
 ```
 
-Use `profile run --profile fixture-b` in a second terminal for an independent launch. `create` never overwrites; profile IDs use lowercase letters, digits and hyphens, starting with a letter. The local, Git-ignored store holds fixed synthetic configuration and a synthetic credential reference, never real credentials. A controller loads only the selected record, freezes its digest and passes just the ID and digest to the Worker. The Worker gets a fresh private HOME, TMPDIR and workspace; mutable Worker state is not persisted back into the Profile. A plain `profile run` starts an offline boundary probe, not a model request.
+Use `profile run --profile fixture-b` in a second terminal for an independent launch. `create` never overwrites; profile IDs use lowercase letters, digits and hyphens, starting with a letter. The synthetic Profile JSON holds fixed configuration and a synthetic credential reference, never real credentials. A controller loads only the selected record, freezes its digest and passes just the ID and digest to the Worker. The Worker gets a fresh private HOME, TMPDIR and workspace; mutable Worker state is not persisted back into the Profile. A plain `profile run` starts an offline boundary probe, not a model request.
 
 `verify-profiles` uses its own fixture store, tests reload in a fresh controller (the previous grant is unavailable and a new grant can be issued), and exercises both selected Profiles on actual overlapping sandboxed Workers. The printed `runs/profile-audit-*/evidence.json` links the dual-worker receipt with the verified child PIDs, profile digests, receiver counts and revocation outcomes. `verify-profiles --store-only` skips the workers and receiver, and is not an OS isolation result. These commands do not access agy OAuth, macOS Keychain or any real model account.
+
+### Register an agy login Profile
+
+From your Mac Terminal, choose an unused ID and run `node atomium.mjs profile login --harness agy --profile work`. This starts [Google's official CLI sign-in](https://antigravity.google/docs/cli/acp) and may update the current macOS user's agy login cache. After exit zero, Atomium opens an ACP session without a model prompt. Only after that step succeeds is the named Profile published. Failure or cancellation before publication does not save the Profile; this is not a rollback of vendor-side login state. To inspect the saved metadata use `node atomium.mjs profile show --profile work`.
+
+The named Profile JSON holds an opaque reference to one shared agy login slot, not a token or email. Vendor-managed state and Keychain are separate from that JSON and must not be shared. ACP does not verify which Google identity is active or whether usage is available; the saved readiness is historical, and `profile run` does not enable agy. The command refuses to overwrite a Profile, start a concurrent login, add another agy Profile, or fall back to another Harness. `agy-auth` still exists as the legacy login-only command. Other login Harnesses are not supported by this entry point yet.
+
+Run `node atomium.mjs verify-profile-login` for offline login, cancellation, no-overwrite and Profile publication acceptance. It uses only a synthetic driver and a simulated ACP process; it does not validate real OAuth. No API key is required.
 
 ### Native loopback capability
 
