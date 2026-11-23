@@ -350,7 +350,14 @@ if (cmd==='profile') {
     }else {console.error('Usage: node atomium.mjs profile list | profile create <id> | profile create --harness agy --profile <id> | profile show --profile <id> | profile run --profile <id> | profile configure --harness <agy|codex> --profile <id> [--timeout-ms <ms>] | profile <login|login-check> --harness agy --profile <id>');process.exitCode=64;}
   }catch(e){
     const reason=['invalid-profile-id','unsafe-profile-store','profile-already-exists','unsafe-profile-file','profile-file-changed','profile-schema-rejected','profile-not-found','unsupported-login-harness','login-requires-terminal','agy-login-busy','agy-single-login-slot','profile-isolated-execution-unavailable','unsupported-config-harness','invalid-harness-timeout','agy-login-canonical-workspace-required','profile-not-pending-agy-login','pending-profile-changed'].includes(e.message)?e.message:'profile-operation-failed';
-    console.error('Profile: '+reason);process.exitCode=1;
+    console.error('Profile: '+reason);
+    if(reason==='profile-already-exists'){
+      console.error('Nothing was overwritten. Inspect the saved profile with: node atomium.mjs profile show --profile <id>');
+    }else if(reason==='agy-single-login-slot'){
+      console.error('Official sign-in was not started. This macOS user already has a saved agy login profile.');
+      console.error('To keep both Google accounts, create and sign in to the second profile in a separate macOS user session, using that user’s own Atomium checkout and agy installation.');
+    }
+    process.exitCode=1;
   }
 } else if (cmd==='task') {
   const [op,hFlag,harness,pFlag,profile,actionFlag,operation,billingFlag]=args;

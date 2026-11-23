@@ -92,6 +92,8 @@ node atomium.mjs profile login --harness agy --profile personal
 
 The named Profile JSON holds an opaque reference to one agy login slot, not a token or email. Multiple pending profiles may coexist, but an already occupied slot blocks the next official login before it starts. To keep a second account, use a separate macOS user login session with its own supported checkout and agy installation, then create and log in there. Do not copy the first user's vendor state or change only `HOME`. Atomium does not yet dispatch across OS sessions or verify that the users hold different Google identities. The guard is for this CLI's named-login path, not a restriction on native agy or the legacy `agy-auth` command. Other Harness login modes are not supported yet.
 
+`profile-already-exists` means creation did not overwrite anything; use `profile show` instead of creating it again in the same checkout. `agy-single-login-slot` means Atomium did not start Google's sign-in. Retrying in the same macOS session will not add a second account while the existing named login is registered.
+
 Run `node atomium.mjs verify-profile-login` for offline login, cancellation, no-overwrite and Profile publication acceptance. It uses only a synthetic driver and a simulated ACP process; it does not validate real OAuth. No API key is required.
 
 ### Select a Harness and Profile per task
