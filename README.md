@@ -63,6 +63,21 @@ From this checkout on the target Mac, run `node atomium.mjs verify-dual-worker`.
 
 If an outer security policy prevents listening or launching the workers, the integrated command writes a blocked receipt and exits 2. `node atomium.mjs verify-dual-worker --protocol-only` runs the wire checks and the same channel/grant state machine with a simulated transport: its receipt is not evidence of OS isolation or real connection closure. Both commands use only synthetic inputs.
 
+### Persistent synthetic Profiles
+
+```sh
+node atomium.mjs profile create fixture-a
+node atomium.mjs profile create fixture-b
+node atomium.mjs profile list
+node atomium.mjs profile show --profile fixture-a
+node atomium.mjs profile run --profile fixture-a
+node atomium.mjs verify-profiles
+```
+
+Use `profile run --profile fixture-b` in a second terminal for an independent launch. `create` never overwrites; profile IDs use lowercase letters, digits and hyphens, starting with a letter. The local, Git-ignored store holds fixed synthetic configuration and a synthetic credential reference, never real credentials. A controller loads only the selected record, freezes its digest and passes just the ID and digest to the Worker. The Worker gets a fresh private HOME, TMPDIR and workspace; mutable Worker state is not persisted back into the Profile. A plain `profile run` starts an offline boundary probe, not a model request.
+
+`verify-profiles` uses its own fixture store, tests reload in a fresh controller (the previous grant is unavailable and a new grant can be issued), and exercises both selected Profiles on actual overlapping sandboxed Workers. The printed `runs/profile-audit-*/evidence.json` links the dual-worker receipt with the verified child PIDs, profile digests, receiver counts and revocation outcomes. `verify-profiles --store-only` skips the workers and receiver, and is not an OS isolation result. These commands do not access agy OAuth, macOS Keychain or any real model account.
+
 ### Native loopback capability
 
 Run `node atomium.mjs verify-native-network` on the target Mac. The existing Swift compiler and runtime profiles build and run a fixed Mach-O. An independent local receiver sees an unconfined control before and after each confined attempt. The confined attempt must return an explicit permission denial and add zero connections or datagrams. Evidence: `runs/native-network-*/evidence.json`, including the binary/profile digests and counts for TCP and UDP over IPv4 and IPv6. Exit 2 denotes an environmental block; it is not a pass. The UDP probes use DNS-shaped datagrams to the test receiver, not the OS resolver. This does not certify a signed App Sandbox helper, XPC, external egress, or any vendor CLI.

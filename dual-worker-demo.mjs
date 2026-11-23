@@ -36,7 +36,33 @@ async function deadline(p,ms,label){
 const workerChecks=r=>Boolean(r?.checks)&&Object.values(r.checks).every(Boolean);
 const normalize=r=>r?{status:r.status,reason:r.reason,requestCount:r.requestCount,bindingDenied:r.bindingDenied,checks:r.checks,cleanup:r.cleanup,decision:r.decision}:null;
 
-export async function runDualWorkerDemo(){
+function selectedPair(profilePair){
+  if(profilePair===undefined)return null;
+  if(!Array.isArray(profilePair)||profilePair.length!==2)throw new Error('two-synthetic-profiles-required');
+  const picked=profilePair.map(p=>{
+    if(!p||typeof p!=='object'||Array.isArray(p)||p.agent!=='synthetic-worker'||p.route!==FIXTURE_ROUTE||
+       typeof p.id!=='string'||!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(p.id)||
+       typeof p.digest!=='string'||!/^[a-f0-9]{64}$/.test(p.digest))throw new Error('invalid-selected-synthetic-profile');
+    // Never pass profile storage, credential references, or provider options to a worker.
+    return Object.freeze({id:p.id,digest:p.digest});
+  });
+  if(picked[0].id===picked[1].id||picked[0].digest===picked[1].digest)throw new Error('distinct-synthetic-profiles-required');
+  return Object.freeze({A:picked[0],B:picked[1]});
+}
+async function retainedTask(task,relative){
+  const evidence={state:'retained-for-inspection',paths:{cwd:relative,home:relative+'/home',tmp:relative+'/tmp'},privateDirectories:false};
+  try{
+    const checks=await Promise.all([task,join(task,'home'),join(task,'tmp')].map(async path=>{
+      const stat=await lstat(path);
+      return stat.isDirectory()&&stat.uid===process.getuid()&&!(stat.mode&0o077)&&await realpath(path)===path;
+    }));
+    evidence.privateDirectories=checks.every(Boolean);
+  }catch{evidence.state='incomplete';
+  }
+  return evidence;
+}
+export async function runDualWorkerDemo({profilePair}={}){
+  const profiles=selectedPair(profilePair);
   if(process.platform!=='darwin')throw new Error('verify-dual-worker is macOS-only');
   await mkdir(runs,{recursive:true,mode:0o700});
   if(!(await lstat(runs)).isDirectory()||await realpath(runs)!==runs)throw new Error('unsafe-run-root');
@@ -97,7 +123,7 @@ export async function runDualWorkerDemo(){
     const base={loopbackPort:port,outsideCanaryPath,timeoutMs:8000};
     const launch=(name,options)=>{
       mark('controller-'+name+'-started',name);
-      return runIsolatedAgentWorker({...base,...options}).then(r=>{
+      return runIsolatedAgentWorker({...base,...options,...(profiles?{profile:profiles[name]}:{})}).then(r=>{
         mark('controller-'+name+'-finished',name,{status:r.status,groupGone:r.cleanup?.groupGone??null});
         if(r.status==='failed')stopped.done(r.reason);
         return r;
@@ -163,7 +189,24 @@ export async function runDualWorkerDemo(){
     if(b)resultB??=await b;
     if(listener.listening)await new Promise(yes=>{listener.close(yes);listener.closeAllConnections();});
   }
-  const receipt={version:1,mode:'verify-dual-worker',status,phase,checks,receiver:counts,receiverCheckpoints:{beforeBindingCheck,atOverlap,beforePeerRelease},
+  let profileAttribution=null;
+  if(profiles){
+    const entries=await Promise.all([['A',taskA,resultA],['B',taskB,resultB]].map(async ([role,task,result])=>[role,{
+      selected:profiles[role],
+      childEcho:result?.profile??null,
+      workerPid:result?.workerPid??null,
+      directoryProof:result?.directoryProof??null,
+      workspace:await retainedTask(task,'task-'+role),
+    }]));
+    profileAttribution=Object.fromEntries(entries);
+    if(status!=='blocked'&&phase==='completed'){
+      const checksByRole=entries.every(([role,field])=>field.childEcho?.id===profiles[role].id&&field.childEcho?.digest===profiles[role].digest&&field.directoryProof&&Object.values(field.directoryProof).every(Boolean));
+      checks.push({id:'selected-profiles-echoed-in-actual-workers',pass:Boolean(checksByRole)});
+      checks.push({id:'separate-processes-and-private-workspaces',pass:entries.every(([,field])=>Number.isInteger(field.workerPid)&&field.workspace.privateDirectories)&&entries[0][1].workerPid!==entries[1][1].workerPid});
+      status=checks.every(check=>check.pass)?'passed':'failed';
+    }
+  }
+  const receipt={version:1,mode:'verify-dual-worker',status,phase,checks,receiver:counts,...(profiles?{profileAttribution,profileScope:'synthetic configuration selection, not proof of distinct provider accounts'}:{}),receiverCheckpoints:{beforeBindingCheck,atOverlap,beforePeerRelease},
     workers:Object.fromEntries([['A',resultA],['B',resultB]].map(([role,result])=>[role,{
       owner:'fixture-'+role,channel:channel(role),observation:normalize(result),
       orderedDecisions:events.filter(e=>e.role===role&&(e.decision||e.kind.endsWith('-revoke'))),
@@ -175,5 +218,5 @@ export async function runDualWorkerDemo(){
   for(const row of checks)console.log((row.pass?'PASS ':'FAIL ')+row.id);
   console.log((status==='passed'?'PASS ':status==='blocked'?'BLOCKED ':'FAIL ')+phase);
   console.log('Evidence: '+join(dir,'evidence.json'));
-  return receipt;
+  return {...receipt,evidencePath:join(dir,'evidence.json')};
 }

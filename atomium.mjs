@@ -319,7 +319,32 @@ async function runDemo(mode, rejectionTest, dualTest) {
 }
 
 const [cmd,...args]=process.argv.slice(2);
-if (cmd==='verify-dual-worker' && (args.length===0||args.length===1&&args[0]==='--protocol-only')) {
+if (cmd==='profile') {
+  try {
+    const {addProfile,defaultProfileRoot,listProfiles,loadProfile,publicProfile}=await import('./agent-profiles.mjs');
+    const [op,arg,id]=args;
+    if(op==='list'&&args.length===1)console.log(JSON.stringify((await listProfiles(defaultProfileRoot)).map(publicProfile),null,2));
+    else if(op==='create'&&args.length===2)console.log(JSON.stringify(publicProfile(await addProfile(defaultProfileRoot,arg)),null,2));
+    else if(['show','run'].includes(op)&&args.length===3&&arg==='--profile'){
+      const config=await loadProfile(defaultProfileRoot,id);
+      if(op==='show')console.log(JSON.stringify(publicProfile(config),null,2));
+      else {
+        const {runSelectedProfile}=await import('./agent-profile-audit.mjs');
+        const {status}=await runSelectedProfile(config);
+        if(status!=='passed')process.exitCode=status==='blocked'?2:1;
+      }
+    }else {console.error('Usage: node atomium.mjs profile list | profile create <id> | profile show --profile <id> | profile run --profile <id>');process.exitCode=64;}
+  }catch(e){
+    const reason=['invalid-profile-id','unsafe-profile-store','profile-already-exists','unsafe-profile-file','profile-file-changed','profile-schema-rejected','profile-not-found'].includes(e.message)?e.message:'profile-operation-failed';
+    console.error('Profile: '+reason);process.exitCode=1;
+  }
+} else if (cmd==='verify-profiles' && (args.length===0||args.length===1&&args[0]==='--store-only')) {
+  try {
+    const {verifyProfiles}=await import('./agent-profile-audit.mjs');
+    const {status}=await verifyProfiles({storeOnly:args.length===1});
+    if(status!=='passed')process.exitCode=status==='blocked'?2:1;
+  }catch{console.error('Profile fixture could not finish.');process.exitCode=1;}
+} else if (cmd==='verify-dual-worker' && (args.length===0||args.length===1&&args[0]==='--protocol-only')) {
   try{
     const {runDualWorkerDemo,runDualWorkerProtocolOnly}=await import('./dual-worker-demo.mjs');
     const report=await (args.length?runDualWorkerProtocolOnly():runDualWorkerDemo());
@@ -418,6 +443,6 @@ if (cmd==='verify-dual-worker' && (args.length===0||args.length===1&&args[0]==='
   try { await runDemo(cmd); }
   catch(e) { console.error('Atomium fixture stopped: '+e.message);process.exitCode=1; }
 } else {
-  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary | verify-agent-egress | verify-dual-worker [--protocol-only] | verify-native-network | verify-gemini-adapter');
+  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary | verify-agent-egress | verify-dual-worker [--protocol-only] | verify-native-network | verify-gemini-adapter | profile | verify-profiles [--store-only]');
   if (cmd && cmd!=='--help') process.exitCode=2;
 }

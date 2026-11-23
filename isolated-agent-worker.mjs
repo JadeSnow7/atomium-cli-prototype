@@ -10,6 +10,9 @@ const inputs=Object.freeze({clean:'Summarize synthetic item A.',canary:'Syntheti
 const scenarios=new Set([...Object.keys(inputs),'no-request','hang']);
 const reasons=new Set(['approved','policy','synthetic-marker','canary','route','revoked','rate-limit','timeout','provider-error','blocked','unknown']);
 const mismatchText='Unapproved synthetic B binding claim.';
+const profileId=/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+const profileDigest=/^[a-f0-9]{64}$/;
+const scopeKeys=['cwdMatches','homeMatches','tmpMatches'];
 const fields=['taskReadWrite','networkDenied','hostReadDenied','peerReadDenied','cleanEnvironment'];
 const MAX_LINE=4096, MAX_TOTAL=16384;
 const literal=p=>'(literal '+JSON.stringify(p)+')';
@@ -17,8 +20,9 @@ const sub=p=>'(subpath '+JSON.stringify(p)+')';
 const safeChildCode=[
   "import {writeFile,readFile,open} from 'node:fs/promises';",
   "import {connect} from 'node:net';",
+  "import {dirname,join} from 'node:path';",
   "import {createInterface} from 'node:readline';",
-  "const [jobId,scenario,port,host,peer,foreignJobId]=process.argv.slice(2);",
+  "const [jobId,scenario,port,host,peer,foreignJobId,profileId,profileDigest]=process.argv.slice(2);",
   "const prompt="+JSON.stringify(inputs)+";",
   "const mismatchText="+JSON.stringify(mismatchText)+";",
   "const out=o=>process.stdout.write(JSON.stringify({jobId,...o})+'\\n');",
@@ -28,7 +32,9 @@ const safeChildCode=[
   "let taskReadWrite=false;",
   "try{await writeFile('task-proof','SYNTHETIC_CONTROL',{flag:'wx',mode:0o600});taskReadWrite=(await readFile('task-proof','utf8'))==='SYNTHETIC_CONTROL';}catch{}",
   "const checks={taskReadWrite,networkDenied,hostReadDenied:await readDenied(host),peerReadDenied:await readDenied(peer),cleanEnvironment:Object.keys(process.env).sort().join(',')==='HOME,LANG,OPENSSL_CONF,PATH,TMPDIR'&&!process.env.ATOMIUM_WORKER_FAKE_KEY};",
-  "out({type:'boundary-report',checks});",
+  "const baseDir=dirname(process.argv[1]);",
+  "const directoryProof={cwdMatches:process.cwd()===baseDir,homeMatches:process.env.HOME===join(baseDir,'home'),tmpMatches:process.env.TMPDIR===join(baseDir,'tmp')};",
+  "out({type:'boundary-report',checks,...(profileId?{profile:{id:profileId,digest:profileDigest},workerPid:process.pid,directoryProof}:{})});",
   "if(Object.values(checks).includes(false)){out({type:'complete',status:'failed'});}",
   "else if(scenario==='no-request'){out({type:'complete',status:'completed'});}",
   "else if(scenario==='hang'){setInterval(()=>{},1000);}",
@@ -105,18 +111,18 @@ async function boundedClose(child,closed) {
   const groupGone=!killGroup(pid,0);
   return {groupGone,forced,scope:'fixed process group; no escaped sessions claim'};
 }
-async function launch({task,scenario,invoke,port,host,peer,jobId,foreignJobId,onForeignBindingDenied,signal,timeoutMs}) {
+async function launch({task,scenario,invoke,port,host,peer,jobId,foreignJobId,onForeignBindingDenied,profile,signal,timeoutMs}) {
   const home=join(task,'home'),tmp=join(task,'tmp'),source=join(task,'worker.mjs'),openssl=join(task,'openssl.cnf');
   await Promise.all([mkdir(home,{mode:0o700}),mkdir(tmp,{mode:0o700}),writeFile(source,safeChildCode,{mode:0o400,flag:'wx'}),writeFile(openssl,'# no host OpenSSL options\n',{mode:0o400,flag:'wx'})]);
   const runtime=await realpath(process.execPath);
-  const child=spawn('/usr/bin/sandbox-exec',['-p',policy(task,runtime),runtime,source,jobId,scenario,String(port),host,peer,foreignJobId??''],{
+  const child=spawn('/usr/bin/sandbox-exec',['-p',policy(task,runtime),runtime,source,jobId,scenario,String(port),host,peer,foreignJobId??'',profile?.id??'',profile?.digest??''],{
     cwd:task,env:{HOME:home,TMPDIR:tmp,PATH:'/usr/bin:/bin',LANG:'C',OPENSSL_CONF:openssl},stdio:['pipe','pipe','pipe'],detached:true,
   });
   let resultResolve;
   const done=new Promise(yes=>{resultResolve=yes;});
   let closedResolve;
   const closed=new Promise(yes=>{closedResolve=yes;});
-  let phase='boundary',pending=Buffer.alloc(0),total=0,checks=null,requestCount=0,bindingDenied=0,decision=null,callbackReason=null,completed=null,ending=false;
+  let phase='boundary',pending=Buffer.alloc(0),total=0,checks=null,profileProof=null,workerPid=null,directoryProof=null,requestCount=0,bindingDenied=0,decision=null,callbackReason=null,completed=null,ending=false;
   const callbackAbort=new AbortController();
   const stop=status=>{if(!ending){ending=true;callbackAbort.abort();resultResolve(status);}};
   const aborted=()=>stop('aborted');
@@ -145,7 +151,16 @@ async function launch({task,scenario,invoke,port,host,peer,jobId,foreignJobId,on
       },()=>stop('binding-barrier-failed'));
       return;
     }
-    if(phase==='boundary'&&msg.type==='boundary-report'&&exact(msg,['type','jobId','checks'])&&exact(msg.checks,fields)&&fields.every(k=>typeof msg.checks[k]==='boolean')){
+    if(phase==='boundary'&&msg.type==='boundary-report'&&exact(msg,['type','jobId','checks',...(profile?['profile','workerPid','directoryProof']:[])])&&exact(msg.checks,fields)&&fields.every(k=>typeof msg.checks[k]==='boolean')){
+      if(profile){
+        if(!exact(msg.profile,['id','digest'])||msg.profile.id!==profile.id||msg.profile.digest!==profile.digest||
+           msg.workerPid!==child.pid||!Number.isInteger(msg.workerPid)||msg.workerPid<2||
+           !exact(msg.directoryProof,scopeKeys)||!scopeKeys.every(k=>msg.directoryProof[k]===true))
+          throw new Error('worker-profile-binding-mismatch');
+        profileProof=msg.profile;
+        workerPid=msg.workerPid;
+        directoryProof=msg.directoryProof;
+      }
       checks=msg.checks;phase=Object.values(checks).every(Boolean)?(scenario==='no-request'||scenario==='hang'?'complete':'request'):'incomplete';return;
     }
     if(phase==='request'&&msg.type==='model-request'&&exact(msg,['type','route','jobId','text'])&&msg.text===inputs[scenario]){
@@ -201,7 +216,7 @@ async function launch({task,scenario,invoke,port,host,peer,jobId,foreignJobId,on
   signal?.removeEventListener('abort',aborted);
   const cleanup=await boundedClose(child,closed);
   if(!cleanup.groupGone)why='worker-cleanup-incomplete';
-  return {status:['completed','blocked'].includes(why)?why:'failed',reason:why,checks,requestCount,bindingDenied,decision,callbackReason,cleanup};
+  return {status:['completed','blocked'].includes(why)?why:'failed',reason:why,checks,requestCount,bindingDenied,decision,callbackReason,cleanup,...(profile?{profile:profileProof,workerPid,directoryProof}:{})};
 }
 async function verifyAbsoluteFile(p,task) {
   const full=resolve(p);
@@ -209,21 +224,24 @@ async function verifyAbsoluteFile(p,task) {
   return full;
 }
 /** Fixtures only, never pass real filesystem files or arbitrary worker text to this API. */
-export async function runIsolatedAgentWorker({taskDir,scenario='clean',invoke=()=>({decision:'block',reason:'policy'}),loopbackPort,outsideCanaryPath,peerCanaryPath,jobId,foreignJobId,onForeignBindingDenied=()=>{},signal,timeoutMs=8000}) {
+export async function runIsolatedAgentWorker({taskDir,scenario='clean',invoke=()=>({decision:'block',reason:'policy'}),loopbackPort,outsideCanaryPath,peerCanaryPath,jobId,foreignJobId,onForeignBindingDenied=()=>{},profile,signal,timeoutMs=8000}) {
   if(process.platform!=='darwin'||!scenarios.has(scenario)||typeof invoke!=='function'||!/^[a-f0-9]{12,64}$/.test(jobId??'')||
      !Number.isInteger(loopbackPort)||loopbackPort<1||loopbackPort>65535||!Number.isInteger(timeoutMs)||timeoutMs<400||timeoutMs>30000)
     throw new Error('invalid-isolated-worker-fixture');
   if(scenario==='cross-binding'&&(!/^[a-f0-9]{12,64}$/.test(foreignJobId??'')||jobId===foreignJobId||typeof onForeignBindingDenied!=='function'))
     throw new Error('invalid-worker-binding-fixture');
   if(scenario!=='cross-binding'&&foreignJobId!==undefined)throw new Error('unexpected-worker-binding-fixture');
+  if(profile!==undefined&&(!exact(profile,['id','digest'])||typeof profile.id!=='string'||!profileId.test(profile.id)||
+      typeof profile.digest!=='string'||!profileDigest.test(profile.digest)))throw new Error('invalid-projected-profile-fixture');
+  const selected=profile?Object.freeze({id:profile.id,digest:profile.digest}):undefined;
   const task=resolve(taskDir);
   if(await realpath(task)!==task)throw new Error('task-canonical-path-required');
   const st=await lstat(task);
   if(!st.isDirectory()||st.uid!==process.getuid()||(st.mode&0o077))throw new Error('task-directory-not-private');
   const host=await verifyAbsoluteFile(outsideCanaryPath,task),peer=await verifyAbsoluteFile(peerCanaryPath,task);
   if(host===peer)throw new Error('distinct-synthetic-canaries-required');
-  if(signal?.aborted)return {status:'failed',reason:'aborted',checks:null,requestCount:0,bindingDenied:0,decision:null,callbackReason:null,cleanup:{groupGone:true,forced:false,scope:'no process started'}};
-  return launch({task,scenario,invoke,port:loopbackPort,host,peer,jobId,foreignJobId,onForeignBindingDenied,signal,timeoutMs});
+  if(signal?.aborted)return {status:'failed',reason:'aborted',checks:null,requestCount:0,bindingDenied:0,decision:null,callbackReason:null,cleanup:{groupGone:true,forced:false,scope:'no process started'},...(selected?{profile:null,workerPid:null,directoryProof:null}:{})};
+  return launch({task,scenario,invoke,port:loopbackPort,host,peer,jobId,foreignJobId,onForeignBindingDenied,profile:selected,signal,timeoutMs});
 }
 
 async function selfTest() {

@@ -1,5 +1,6 @@
 # Machine-local task data, model login state, and generated artifacts.
 /agy-profile/
+/.atomium-profiles/
 /runs/
 /node_modules/
 .env
