@@ -1,4 +1,46 @@
-# Atomium CLI prototype (macOS)
+# Atomium Monorepo (Rust Core Daemon + Thin Clients)
+
+Atomium is migrated to a Rust Cargo Workspace + pnpm Workspace monorepo on branch `feat/monorepo-rust-tauri-expo`. See [docs/migration-blueprint.md](docs/migration-blueprint.md) for the architecture contract and [docs/account-switch-quickstart.md](docs/account-switch-quickstart.md) for real multi-account `agy` onboarding.
+
+## Monorepo Quickstart
+
+```bash
+# 1. Regenerate TypeScript protocol bindings from Rust (ts-rs)
+pnpm gen:protocol
+
+# 2. Run all Rust core tests (protocol, SQLite WAL leases, AES-256-GCM vault, Fail-Closed gateway, Seatbelt SBPL)
+cargo test --workspace
+
+# 3. Run macOS M0 boundary probes and emit out/capabilities.json + out/evidence.json
+pnpm doctor
+
+# 4. Typecheck and test all TypeScript packages & apps (including migrated agent-drivers/account-auth E2E tests)
+pnpm install
+pnpm -r typecheck
+pnpm -r test
+
+# 5. Start the 0600 Unix Socket daemon (atomiumd)
+pnpm daemon:dev
+```
+
+### Directory Layout
+- `crates/atomium-protocol`: Single source of truth for RPC/Profile/Event types (`serde` + `ts-rs`).
+- `crates/atomium-core`: SQLite WAL multi-resource lease manager (`exclusive`/`shared`/`affinity`), event cursor log, AES-256-GCM vault, and profile store.
+- `crates/atomium-runtime`: `RuntimeBackend` trait, macOS Seatbelt SBPL renderer + M0 probes, and Linux container stub.
+- `crates/atomium-gateway`: Per-run authenticated Fail-Closed Egress Proxy (`407` without auth, `502` on missing/unreachable upstream).
+- `crates/atomiumd`: Standalone daemon serving JSON-RPC 2.0 over `0600` Unix Domain Socket.
+- `crates/atomium-cli`: Thin CLI (`doctor`, `probe`, `daemon`, `profile`).
+- `native-helpers/macos-browser-host`: Standalone Swift + WKWebView helper skeleton decoupled from Tauri.
+- `packages/protocol-types`: Auto-generated TS bindings (do not hand-edit `src/generated/`).
+- `packages/atomium-client`: Shared TS `AtomiumClient`, `RpcTransport`, `TauriIpcTransport`, `WebSocketTransport`, and `after_seq` cursor replay.
+- `packages/agent-drivers`: Migrated Node ESM Agent drivers (`agy-acp`, `gemini-model-adapter`, `proposal-contract`, `harness-task`, and `account-auth`).
+- `apps/desktop`: Tauri v2 + React thin IPC frame relay (`rpc_connect` / `rpc_send` / `atomium:rpc_recv`).
+- `apps/mobile`: Expo (React Native) thin client skeleton with Monorepo Metro config.
+- `legacy/`: Archived original Node CLI prototype and offline/live audit scripts.
+
+---
+
+## Legacy Node CLI prototype (macOS, archived in `legacy/`)
 
 Synthetic fixture only. No global install, no external endpoint, no user project, no model credential touched by the offline commands.
 

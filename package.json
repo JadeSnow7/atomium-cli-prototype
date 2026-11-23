@@ -1,0 +1,18 @@
+{
+  "name": "atomium-monorepo",
+  "private": true,
+  "packageManager": "pnpm@10.34.6",
+  "scripts": {
+    "gen:protocol": "TS_RS_EXPORT_DIR=$PWD/packages/protocol-types/src/generated cargo test -p atomium-protocol export_bindings",
+    "build": "cargo build --workspace && pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "cargo test --workspace && pnpm -r test",
+    "daemon:dev": "cargo run -p atomiumd",
+    "doctor": "cargo run -p atomium-cli -- doctor --emit-evidence ./out",
+    "desktop:dev": "pnpm --filter @atomium/desktop tauri dev",
+    "mobile:dev": "pnpm --filter @atomium/mobile start"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}

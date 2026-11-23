@@ -525,10 +525,21 @@ if (cmd==='profile') {
     {expect:'review-snapshot-mismatch',propose,review:review(),tamper:true},
     {propose,review:review()},
   ]) await runDemo('dual-self-test',null,fixture);
+} else if (cmd==='account') {
+  try {
+    const {runAccountCli}=await import('./account-auth/cli.mjs');
+    const code=await runAccountCli(args,{rootDir:root});
+    if(code!==0)process.exitCode=code;
+  } catch(e) { console.error('Account command failed: '+(e?.message||'unknown'));process.exitCode=1; }
+} else if (cmd==='verify-account-switch' && !args.length) {
+  try {
+    const {verifyAccountSwitch}=await import('./account-auth/cli.mjs');
+    if(!await verifyAccountSwitch(root))process.exitCode=1;
+  } catch { console.error('Account switch verification could not finish.');process.exitCode=1; }
 } else if (['demo','verify','ai-demo','agy-demo','dual-demo'].includes(cmd) && !args.length) {
   try { await runDemo(cmd); }
   catch(e) { console.error('Atomium fixture stopped: '+e.message);process.exitCode=1; }
 } else {
-  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | verify-agy-offline | verify-profile-dispatch | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary | verify-agent-egress | verify-dual-worker [--protocol-only] | verify-native-network | verify-gemini-adapter | verify-gemini-managed | profile | task | verify-profiles [--store-only] | verify-profile-login | verify-harness-config | verify-named-proposal');
+  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | verify-agy-offline | verify-profile-dispatch | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary | verify-agent-egress | verify-dual-worker [--protocol-only] | verify-native-network | verify-gemini-adapter | verify-gemini-managed | profile | task | account | verify-account-switch | verify-profiles [--store-only] | verify-profile-login | verify-harness-config | verify-named-proposal');
   if (cmd && cmd!=='--help') process.exitCode=2;
 }

@@ -2,7 +2,15 @@
 /agy-profile/
 /.atomium-profiles/
 /runs/
-/node_modules/
+/out/
+/target/
+**/target/
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.expo/
+**/.expo/
 .env
 .env.*
 *.log
