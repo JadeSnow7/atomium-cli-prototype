@@ -2,6 +2,7 @@ import {spawn} from 'node:child_process';
 import {mkdir,mkdtemp,rm,lstat,realpath,readFile,writeFile,rename} from 'node:fs/promises';
 import {homedir,tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
+import {patchPrompt} from './proposal-contract.mjs';
 
 const testPrompt = 'Atomium synthetic fixture. Select a JSON view for checked-off tasks only.';
 export async function acpConversation({command,args,env,cwd,prompt,timeout=8000,authorization='clean-home-no-auth',signal}) {
@@ -157,16 +158,55 @@ export async function agyDoctor() {
     return await acpConversation(agyOptions(await profileDirs(dir,true)));
   }finally {await rm(dir,{recursive:true,force:true});}
 }
-export async function dedicatedAgy(profile,prompt) {
+export async function dedicatedAgy(profile,prompt,{timeoutMs=90000,signal}={}) {
+  if(!Number.isInteger(timeoutMs)||timeoutMs<1000||timeoutMs>90000)throw new Error('invalid-agy-timeout');
   const gate=async d=>{const ss=await lstat(d);if(!ss.isDirectory()||ss.isSymbolicLink())throw new Error('profile-directory-unsafe');};
   await gate(profile);
   const paths=await profileDirs(profile);
   await configurePolicy(paths.home);
   // Create a different empty workspace for every prompt; never expose a real repo.
   const cwd=await mkdtemp(join(paths.synthetic,'run-'));
-  try{return await acpConversation({...agyOptions(paths),cwd,prompt,timeout:90000,authorization:'user-dedicated-profile'});}
+  try{return await acpConversation({...agyOptions(paths),cwd,prompt,timeout:timeoutMs,authorization:'user-dedicated-profile',signal});}
   finally{await rm(cwd,{recursive:true,force:true});}
 }
+// This guards only the explicit bundled-plan proposal path. It neither opens
+// login nor discovers an account billing mode. useG1Credits defaults to
+// false per the CLI settings docs; the exact dedicated settings allowlist
+// below excludes overrides. A Google Cloud PAYG login is a separate route.
+export async function namedAgyProposal(profile,prompt,{timeoutMs=75000,signal,includedPlanConfirmed=false}={}) {
+  const blocked=(status,creditFallback='not-verified')=>({status,promptSent:false,creditFallback});
+  if(signal?.aborted)return blocked('cancelled');
+  if(includedPlanConfirmed!==true)return blocked('billing-mode-unverified');
+  if(!Number.isInteger(timeoutMs)||timeoutMs<1000||timeoutMs>90000)return blocked('invalid-agy-timeout');
+  if(prompt!==patchPrompt)return blocked('invalid-fixed-proposal');
+  if(typeof profile!=='string'||resolve(profile)!==profile)return blocked('dedicated-policy-unavailable');
+  let dirs;
+  try{
+    dirs=await profileDirs(profile);
+    await configurePolicy(dirs.home); // Verifies exact pre-existing no-tools settings; does not write them.
+  }catch{return blocked('dedicated-policy-unavailable');}
+  const creditFallback='off-by-documented-default';
+  let scratch,receipt,attempted=false;
+  try{
+    // Keep project/workspace overrides and verbose provider logs out of the existing profile.
+    scratch=await realpath(await mkdtemp(join(tmpdir(),'atomium-agy-named-proposal-')));
+    const cwd=join(scratch,'cwd'),tmp=join(scratch,'tmp');
+    await Promise.all([mkdir(cwd,{mode:0o700}),mkdir(tmp,{mode:0o700})]);
+    if(signal?.aborted)receipt=blocked('cancelled',creditFallback);
+    else {
+      attempted=true;
+      receipt={...await acpConversation({
+        ...agyOptions({...dirs,synthetic:cwd,tmp}),prompt,timeout:timeoutMs,authorization:'named-user-dedicated-profile',signal,
+      }),creditFallback,billingMode:'user-attested-included-plan'};
+    }
+  }catch{receipt={status:'provider-proposal-unavailable',promptSent:attempted?null:false,creditFallback};}
+  if(scratch){
+    try{await rm(scratch,{recursive:true,force:true});}
+    catch{return {status:'proposal-cleanup-incomplete',promptSent:receipt.promptSent,creditFallback};}
+  }
+  return receipt;
+}
+
 async function officialLoginResult(profile,signal){
   if(!process.stdin.isTTY||!process.stdout.isTTY)throw new Error('Open your own Terminal for this step.');
   if(signal?.aborted)return {code:null,signal:'SIGINT'};

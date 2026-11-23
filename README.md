@@ -96,7 +96,17 @@ node atomium.mjs task run --harness codex --profile codex-local
 node atomium.mjs verify-harness-config
 ```
 
-A Profile belongs to one Harness. Use distinct names; creating configuration does not sign in and does not overwrite a saved Profile. At dispatch, the controller loads one matching record and applies its timeout to the selected binary. Wrong pairs, missing Profiles, and unsupported actions stop before launch without selecting a fallback. The current task operation is `version-check`: it runs the actual installed binary with `--version` and fresh HOME, TMPDIR and cwd, without providing any credentials or project. This is a dispatch preflight, not authenticated task execution or an OS sandbox. Existing named agy login Profiles can also be selected for `version-check`; their login state is neither loaded nor changed by it. A new agy configuration is not a second Google OAuth login.
+A Profile belongs to one Harness. Use distinct names; creating configuration does not sign in and does not overwrite a saved Profile. At dispatch, the controller loads one matching record and applies its timeout to the selected binary. Wrong pairs, missing Profiles, and unsupported actions stop before launch without selecting a fallback. The default operation `version-check` runs the actual installed binary with `--version` and fresh HOME, TMPDIR and cwd, without providing any credentials or project. This is a dispatch preflight, not authenticated task execution or an OS sandbox. Existing named agy login Profiles can also be selected for `version-check`; their login state is neither loaded nor changed by it. A new agy configuration is not a second Google OAuth login.
+
+### One real, fixed proposal through a named agy login
+
+`node atomium.mjs verify-named-proposal` exercises the dispatch and contract with no live provider. To request one real proposal, and **only** if `work` was authenticated to a personal Google AI plan using included quota, not Google Cloud Pay As You Go or an API key, run:
+
+```sh
+node atomium.mjs task run --harness agy --profile work --operation synthetic-proposal --included-plan-only
+```
+
+Without the final flag Atomium records `billing-mode-unverified` without contacting agy. The flag records the operator's attestation; it does not inspect billing or verify identity. The dedicated policy must be unchanged and cannot override Google's [default-off AI-credit fallback](https://antigravity.google/docs/settings?tab=cli#ai-credits-and-feedback); [Cloud Pay As You Go](https://antigravity.google/docs/pay-as-you-go) is a separate login mode. The task sends only the built-in todo prompt from an empty workspace. It accepts one exact, typed proposal, saves the selected Profile digest and the validated patch in `runs/named-proposal-*/evidence.json`, and never applies or exports it. Authorization, policy, quota, invalid output, or timeout stops that invocation with no Atomium retry or fallback. This is the host-side SDK/client flow, not OS-enforced isolation or measured egress.
 
 ### Native loopback capability
 
