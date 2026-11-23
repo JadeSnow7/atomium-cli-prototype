@@ -122,6 +122,12 @@ Without the final flag Atomium records `billing-mode-unverified` without contact
 
 Run `node atomium.mjs verify-native-network` on the target Mac. The existing Swift compiler and runtime profiles build and run a fixed Mach-O. An independent local receiver sees an unconfined control before and after each confined attempt. The confined attempt must return an explicit permission denial and add zero connections or datagrams. Evidence: `runs/native-network-*/evidence.json`, including the binary/profile digests and counts for TCP and UDP over IPv4 and IPv6. Exit 2 denotes an environmental block; it is not a pass. The UDP probes use DNS-shaped datagrams to the test receiver, not the OS resolver. This does not certify a signed App Sandbox helper, XPC, external egress, or any vendor CLI.
 
+### Real agy cold start (offline)
+
+Run `node atomium.mjs verify-agy-offline` on the Mac. The fixed probe launches two instances of the same installed agy executable under deny-default Seatbelt policies, with clean, disjoint temporary HOME, TMPDIR and cwd outside the repository. It sends only ACP v1 `initialize`, checks that both processes are live, cancels A while B remains live, then closes both process groups. The test records the executable/policy hashes and only task directory and log metadata before deleting temporary state. The independent synthetic network/file control is not a trace of agy traffic. Exit 2 means the environment refused the sandbox or loopback control; it is not a pass.
+
+No `session/new`, OAuth, credentials, external model calls, or fallback to host execution. The agy path flags are configuration, not proof of an authentication namespace; this does **not** validate macOS Keychain isolation, logged-in accounts, or a production runtime.
+
 ### Official Gemini API adapter (offline contract only)
 
 Run `node atomium.mjs verify-gemini-adapter` for the in-memory contract test; it never opens a network connection or reads a real key. Evidence: `runs/gemini-contract-*/evidence.json`. The adapter pins the official `generateContent` route and [`gemini-3.5-flash-lite`](https://aistudio.google.com/docs/models/gemini-3.5-flash-lite), accepts one fixed synthetic prompt, bounds request and response, aborts on cancel, and never retries or follows a redirect. The trusted host supplies the credential; it never comes from the Worker. Live provider connection, authorization, cost, and the Worker-to-provider path are not verified by this command. The adapter is not exposed as a general proxy or a live CLI command.
