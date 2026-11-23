@@ -80,9 +80,17 @@ Use `profile run --profile fixture-b` in a second terminal for an independent la
 
 ### Register an agy login Profile
 
-From your Mac Terminal, choose an unused ID and run `node atomium.mjs profile login --harness agy --profile work`. This starts [Google's official CLI sign-in](https://antigravity.google/docs/cli/acp) and may update the current macOS user's agy login cache. After exit zero, Atomium opens an ACP session without a model prompt. Only after that step succeeds is the named Profile published. Failure or cancellation before publication does not save the Profile; this is not a rollback of vendor-side login state. To inspect the saved metadata use `node atomium.mjs profile show --profile work`.
+From the macOS user's own Terminal and `~/workspace/Atomium-cli-prototype` checkout, choose an unused ID:
 
-The named Profile JSON holds an opaque reference to one shared agy login slot, not a token or email. Vendor-managed state and Keychain are separate from that JSON and must not be shared. ACP does not verify which Google identity is active or whether usage is available; the saved readiness is historical, and `profile run` does not enable agy. The command refuses to overwrite a Profile, start a concurrent login, add another agy Profile, or fall back to another Harness. `agy-auth` still exists as the legacy login-only command. Other login Harnesses are not supported by this entry point yet.
+```sh
+node atomium.mjs profile create --harness agy --profile personal
+node atomium.mjs profile login-check --harness agy --profile personal
+node atomium.mjs profile login --harness agy --profile personal
+```
+
+`create` saves metadata only and `login-check` is read-only. `login` starts [Google's official CLI sign-in](https://antigravity.google/docs/cli/acp) and may update the current macOS user's agy login cache. Select or check the intended account in Google's own sign-in flow. After exit zero, Atomium opens an ACP session without a model prompt. Only then does the pending Profile become usable as saved login metadata. Failure or cancellation before publication leaves it pending; this is not a rollback of vendor-side state. Use `node atomium.mjs profile show --profile personal` to inspect the result. Login can still register a fresh name in one command when the slot is free.
+
+The named Profile JSON holds an opaque reference to one agy login slot, not a token or email. Multiple pending profiles may coexist, but an already occupied slot blocks the next official login before it starts. To keep a second account, use a separate macOS user login session with its own supported checkout and agy installation, then create and log in there. Do not copy the first user's vendor state or change only `HOME`. Atomium does not yet dispatch across OS sessions or verify that the users hold different Google identities. The guard is for this CLI's named-login path, not a restriction on native agy or the legacy `agy-auth` command. Other Harness login modes are not supported yet.
 
 Run `node atomium.mjs verify-profile-login` for offline login, cancellation, no-overwrite and Profile publication acceptance. It uses only a synthetic driver and a simulated ACP process; it does not validate real OAuth. No API key is required.
 

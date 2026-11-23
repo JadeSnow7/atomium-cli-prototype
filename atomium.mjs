@@ -7,6 +7,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer, connect } from 'node:net';
 import { createInterface } from 'node:readline/promises';
+import { userInfo } from 'node:os';
 import { agyDoctor, dedicatedAgy, userLogin, verifyAcp } from './agy-acp.mjs';
 import { agyRegionStatusDigest, parseProposal, proposeView as boundedProposal, providerStatus, requirement } from './proposal-contract.mjs';
 
@@ -296,31 +297,48 @@ async function runDemo(mode, rejectionTest, dualTest) {
 const [cmd,...args]=process.argv.slice(2);
 if (cmd==='profile') {
   try {
-    const {addProfile,addHarnessConfig,defaultProfileRoot,listProfiles,loadProfile,publicProfile,registerHarnessLogin}=await import('./agent-profiles.mjs');
+    const {addProfile,addPendingAgyProfile,addHarnessConfig,defaultProfileRoot,listProfiles,loadProfile,publicProfile,registerHarnessLogin,pendingAgyProfileSchema}=await import('./agent-profiles.mjs');
     const [op,arg,id]=args;
     if(op==='list'&&args.length===1)console.log(JSON.stringify((await listProfiles(defaultProfileRoot)).map(publicProfile),null,2));
     else if(op==='create'&&args.length===2)console.log(JSON.stringify(publicProfile(await addProfile(defaultProfileRoot,arg)),null,2));
+    else if(op==='create'&&args.length===5&&arg==='--harness'&&args[3]==='--profile'){
+      if(id!=='agy')throw new Error('unsupported-login-harness');
+      console.log(JSON.stringify(publicProfile(await addPendingAgyProfile(defaultProfileRoot,args[4])),null,2));
+    }
     else if(op==='configure'&&arg==='--harness'&&args[3]==='--profile'&&(args.length===5||args.length===7&&args[5]==='--timeout-ms')){
       const timeoutMs=args.length===7?(/^\d{4,5}$/.test(args[6])?Number(args[6]):NaN):undefined;
       console.log(JSON.stringify(publicProfile(await addHarnessConfig(defaultProfileRoot,{harness:id,id:args[4],timeoutMs})),null,2));
     }
-    else if(op==='login'&&args.length===5&&arg==='--harness'&&args[3]==='--profile'){
-      const cancellation=new AbortController();
-      const stop=()=>cancellation.abort();
-      process.on('SIGINT',stop);process.on('SIGTERM',stop);
-      let result;
-      try{
-        result=await registerHarnessLogin(defaultProfileRoot,{
-          harness:id,id:args[4],interactive:!!(process.stdin.isTTY&&process.stdout.isTTY),signal:cancellation.signal,
-          authenticate:async (dir,options)=>{
-            const {runAgyProfileLogin}=await import('./agy-acp.mjs');
-            console.log('Starting agy official sign-in. It may update your macOS user’s agy login cache. No account identity is verified by Atomium.');
-            return runAgyProfileLogin(dir,options);
-          },
-        });
-      }finally{process.removeListener('SIGINT',stop);process.removeListener('SIGTERM',stop);}
-      console.log(JSON.stringify(result,null,2));
-      if(!result.saved)process.exitCode=result.status==='cancelled'?130:1;
+    else if(['login','login-check'].includes(op)&&args.length===5&&arg==='--harness'&&args[3]==='--profile'){
+      if(id!=='agy')throw new Error('unsupported-login-harness');
+      const accountHome=await realpath(userInfo().homedir);
+      if(defaultProfileRoot!==join(accountHome,'workspace','Atomium-cli-prototype','.atomium-profiles'))
+        throw new Error('agy-login-canonical-workspace-required');
+      if(op==='login-check'){
+        const chosen=await loadProfile(defaultProfileRoot,args[4]);
+        if(chosen.schema!==pendingAgyProfileSchema)throw new Error('profile-not-pending-agy-login');
+        const occupied=(await listProfiles(defaultProfileRoot)).find(p=>p.schema==='atomium-agy-login-profile-v1');
+        console.log(JSON.stringify({profile:chosen.id,status:occupied?'blocked-same-macos-user-slot':'ready-for-interactive-login',
+          existingProfile:occupied?.id??null,providerStarted:false},null,2));
+        if(occupied)process.exitCode=2;
+      }else{
+        const cancellation=new AbortController();
+        const stop=()=>cancellation.abort();
+        process.on('SIGINT',stop);process.on('SIGTERM',stop);
+        let result;
+        try{
+          result=await registerHarnessLogin(defaultProfileRoot,{
+            harness:id,id:args[4],interactive:!!(process.stdin.isTTY&&process.stdout.isTTY),signal:cancellation.signal,
+            authenticate:async (dir,options)=>{
+              const {runAgyProfileLogin}=await import('./agy-acp.mjs');
+              console.log('Starting agy official sign-in. It may update your macOS user’s agy login cache. No account identity is verified by Atomium.');
+              return runAgyProfileLogin(dir,options);
+            },
+          });
+        }finally{process.removeListener('SIGINT',stop);process.removeListener('SIGTERM',stop);}
+        console.log(JSON.stringify(result,null,2));
+        if(!result.saved)process.exitCode=result.status==='cancelled'?130:1;
+      }
     }else if(['show','run'].includes(op)&&args.length===3&&arg==='--profile'){
       const config=await loadProfile(defaultProfileRoot,id);
       if(op==='show')console.log(JSON.stringify(publicProfile(config),null,2));
@@ -329,9 +347,9 @@ if (cmd==='profile') {
         const {status}=await runSelectedProfile(config);
         if(status!=='passed')process.exitCode=status==='blocked'?2:1;
       }
-    }else {console.error('Usage: node atomium.mjs profile list | profile create <id> | profile show --profile <id> | profile run --profile <id> | profile configure --harness <agy|codex> --profile <id> [--timeout-ms <ms>] | profile login --harness agy --profile <id>');process.exitCode=64;}
+    }else {console.error('Usage: node atomium.mjs profile list | profile create <id> | profile create --harness agy --profile <id> | profile show --profile <id> | profile run --profile <id> | profile configure --harness <agy|codex> --profile <id> [--timeout-ms <ms>] | profile <login|login-check> --harness agy --profile <id>');process.exitCode=64;}
   }catch(e){
-    const reason=['invalid-profile-id','unsafe-profile-store','profile-already-exists','unsafe-profile-file','profile-file-changed','profile-schema-rejected','profile-not-found','unsupported-login-harness','login-requires-terminal','agy-login-busy','agy-single-login-slot','profile-isolated-execution-unavailable','unsupported-config-harness','invalid-harness-timeout'].includes(e.message)?e.message:'profile-operation-failed';
+    const reason=['invalid-profile-id','unsafe-profile-store','profile-already-exists','unsafe-profile-file','profile-file-changed','profile-schema-rejected','profile-not-found','unsupported-login-harness','login-requires-terminal','agy-login-busy','agy-single-login-slot','profile-isolated-execution-unavailable','unsupported-config-harness','invalid-harness-timeout','agy-login-canonical-workspace-required','profile-not-pending-agy-login','pending-profile-changed'].includes(e.message)?e.message:'profile-operation-failed';
     console.error('Profile: '+reason);process.exitCode=1;
   }
 } else if (cmd==='task') {

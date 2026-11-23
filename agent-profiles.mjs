@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { link, lstat, mkdir, mkdtemp, open, readdir, realpath, rm, rmdir, writeFile } from 'node:fs/promises';
+import { link, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -10,6 +10,7 @@ const idPattern = /^[a-z][a-z0-9-]{0,31}$/;
 const fields = 'agent,credentialRef,id,permissions,route,schema,stateNamespace';
 const marker = 'atomium-agent-profile-v1';
 const agyMarker = 'atomium-agy-login-profile-v1';
+export const pendingAgyProfileSchema = 'atomium-agy-pending-profile-v1';
 export const harnessConfigSchema = 'atomium-harness-config-v1';
 const harnessFields = 'agent,credentialRef,harness,id,permissions,route,schema,stateNamespace,timeoutMs';
 const harnesses = new Set(['agy','codex']);
@@ -23,6 +24,10 @@ const canonical = id => ({
 const agyProfile = id => ({
   schema: agyMarker, id, agent: 'agy', permissions: 'host-login-only', route: null,
   stateNamespace: 'agy-host-single-slot', credentialRef: 'agy:os-keyring-single-slot',
+});
+const pendingAgyProfile = id => ({
+  schema: pendingAgyProfileSchema, id, agent: 'agy', permissions: 'host-login-pending', route: null,
+  stateNamespace: 'agy-pending-' + id, credentialRef: null,
 });
 const harnessProfile = (harness,id,timeoutMs) => ({
   schema: harnessConfigSchema, id, agent: harness, harness, permissions: 'harness-config-only',
@@ -50,6 +55,7 @@ function snapshot(config) {
 export function publicProfile({ id, schema, agent, route, permissions, stateNamespace, digest, harness, timeoutMs }) {
   return { id, agent, route, permissions, stateNamespace, digest,
     ...(schema === harnessConfigSchema ? { schema, harness, timeoutMs, authentication: 'not-configured', isolatedExecution: false }
+      : schema === pendingAgyProfileSchema ? { schema, authentication: 'pending-official-login', identityStatus: 'identity-unavailable', isolatedExecution: false }
       : agent === 'agy' ? { authentication: 'official-login-acp-ready-at-save', identityStatus: 'identity-unavailable',
         isolatedExecution: false } : { authentication: 'synthetic-only' }) };
 }
@@ -67,17 +73,34 @@ export async function addHarnessConfig(root,options) {
   await safeRoot(root,true);
   return publishProfile(root,harnessProfile(harness,id,timeoutMs));
 }
-async function publishProfile(root, doc, signal) {
+export async function addPendingAgyProfile(root,id) {
+  safeId(id);
+  await safeRoot(root,true);
+  return publishProfile(root,pendingAgyProfile(id));
+}
+async function publishProfile(root, doc, signal, expectedPending) {
   const {id}=doc;
   const scratch = await mkdtemp(join(root, '.create-'));
   try {
     const path = join(scratch, 'staged');
     await writeFile(path, JSON.stringify(doc) + '\n', { mode: 0o600, flag: 'wx' });
     if(signal?.aborted)throw new Error('login-cancelled');
-    try { await link(path, join(root, id + '.json')); }
-    catch (error) {
-      if (error.code === 'EEXIST') throw new Error('profile-already-exists');
-      throw error;
+    const destination=join(root,id+'.json');
+    if(expectedPending){
+      // registerHarnessLogin holds this store's agy slot lock; other built-in
+      // profile writers are no-clobber. Arbitrary same-user filesystem writers
+      // are not an isolation boundary.
+      const current=await loadProfile(root,id);
+      if(current.schema!==pendingAgyProfileSchema||current.digest!==expectedPending.digest)
+        throw new Error('pending-profile-changed');
+      if(signal?.aborted)throw new Error('login-cancelled');
+      await rename(path,destination);
+    }else{
+      try { await link(path,destination); }
+      catch (error) {
+        if (error.code === 'EEXIST') throw new Error('profile-already-exists');
+        throw error;
+      }
     }
   } finally { await rm(scratch, { force: true, recursive: true }); }
   return snapshot(doc);
@@ -100,7 +123,7 @@ export async function loadProfile(root, id) {
     const doc = JSON.parse(raw);
     const isHarness = doc?.schema === harnessConfigSchema;
     if (isHarness && (!harnesses.has(doc.harness) || !validTimeout(doc.timeoutMs))) throw new Error('profile-schema-rejected');
-    const fixed = isHarness ? harnessProfile(doc.harness,id,doc.timeoutMs) : doc?.schema === agyMarker ? agyProfile(id) : canonical(id);
+    const fixed = isHarness ? harnessProfile(doc.harness,id,doc.timeoutMs) : doc?.schema === agyMarker ? agyProfile(id) : doc?.schema===pendingAgyProfileSchema ? pendingAgyProfile(id) : canonical(id);
     // No imported OAuth blobs, identity asserted by caller, arbitrary routes or writable paths.
     if (!isRecord(doc) || Object.keys(doc).sort().join(',') !== (isHarness ? harnessFields : fields) ||
         Object.keys(fixed).some(k => fixed[k] !== doc[k]) || raw !== JSON.stringify(doc) + '\n')
@@ -125,7 +148,8 @@ export async function registerHarnessLogin(root, {harness, id, interactive, auth
   catch (e) { if (e.code === 'EEXIST') throw new Error('agy-login-busy'); throw e; }
   try {
     const profiles = await listProfiles(root);
-    if (profiles.some(p => p.id === id)) throw new Error('profile-already-exists');
+    const existing=profiles.find(p=>p.id===id);
+    if(existing&&existing.schema!==pendingAgyProfileSchema)throw new Error('profile-already-exists');
     if (profiles.some(p => p.schema === agyMarker)) throw new Error('agy-single-login-slot');
     if (signal?.aborted) return {status:'cancelled', saved:false};
     const flow = await authenticate(join(root, '.agy-host-state'),{signal});
@@ -137,7 +161,7 @@ export async function registerHarnessLogin(root, {harness, id, interactive, auth
     if (flow.identityStatus !== 'identity-unavailable' || flow.sessionReady !== true || flow.promptSent !== false)
       return {status:'probe-failed', saved:false};
     let config;
-    try { config = await publishProfile(root, agyProfile(id),signal); }
+    try { config = await publishProfile(root, agyProfile(id),signal,existing); }
     catch(e) { if (e.message === 'login-cancelled') return {status:'cancelled',saved:false}; throw e; }
     return {status:'saved', saved:true, profile:publicProfile(config)};
   } finally { await rmdir(lock); }
