@@ -78,7 +78,7 @@ fn help_lists_subcommands() {
         .expect("run atomium-cli --help");
     assert!(out.status.success(), "expected --help exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for cmd in ["doctor", "probe", "daemon", "profile"] {
+    for cmd in ["doctor", "probe", "daemon", "profile", "account", "run"] {
         assert!(
             stdout.contains(cmd),
             "expected --help output to mention '{cmd}', got:\n{stdout}"
@@ -257,4 +257,200 @@ fn probe_outputs_valid_capabilities_report_on_macos() {
         serde_json::from_slice(&out.stdout).expect("stdout parses as CapabilitiesReport");
     assert_eq!(caps.os, "macos");
     assert_eq!(caps.backend, "macos-seatbelt");
+}
+
+#[tokio::test]
+async fn account_and_run_subcommands_end_to_end_via_daemon_socket() {
+    let dir = TempDirGuard::new("acli-e2e");
+    let sock_path = dir.path().join("d.sock");
+    let db_path = dir.path().join("d.sqlite");
+    let secret_file = dir.path().join("oauth.json");
+    std::fs::write(
+        &secret_file,
+        br#"{"id_token_email":"cli@example.test","token":{"access_token":"cli-tok"}}"#,
+    )
+    .expect("write synthetic oauth file");
+
+    let state =
+        std::sync::Arc::new(atomiumd::DaemonState::open(&db_path).expect("open daemon state"));
+    let listener = atomiumd::bind_socket(&sock_path).expect("bind daemon socket");
+    let daemon_task = tokio::spawn(async move {
+        let _ = atomiumd::serve_listener(listener, state).await;
+    });
+
+    let run_cli = |args: Vec<String>| {
+        let out = Command::new(cli_bin())
+            .args(&args)
+            .output()
+            .expect("exec atomium-cli");
+        assert!(
+            out.status.success(),
+            "atomium-cli {:?} failed: stderr={}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .expect("parse atomium-cli JSON stdout")
+    };
+
+    let sock_str = sock_path.to_string_lossy().into_owned();
+    let secret_str = secret_file.to_string_lossy().into_owned();
+
+    // 1. account capture
+    let cap = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        let secret_str = secret_str.clone();
+        move || {
+            run_cli(vec![
+                "account".into(),
+                "--socket".into(),
+                sock_str,
+                "capture".into(),
+                "cli_acct".into(),
+                "--name".into(),
+                "CLI Account".into(),
+                "--source-file".into(),
+                secret_str,
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(cap["profile_id"], json!("cli_acct"));
+    assert_eq!(cap["snapshot_version"], json!(1));
+
+    // 2. account list
+    let list = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        move || {
+            run_cli(vec![
+                "account".into(),
+                "--socket".into(),
+                sock_str,
+                "list".into(),
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(list["accounts"].as_array().unwrap().len(), 1);
+
+    // 3. account switch
+    let sw = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        move || {
+            run_cli(vec![
+                "account".into(),
+                "--socket".into(),
+                sock_str,
+                "switch".into(),
+                "cli_acct".into(),
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(sw["switched"], json!(true));
+
+    // 4. account run --wait
+    let run_done = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        move || {
+            run_cli(vec![
+                "account".into(),
+                "--socket".into(),
+                sock_str,
+                "run".into(),
+                "cli_acct".into(),
+                "--no-seatbelt".into(),
+                "--wait".into(),
+                "--".into(),
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo cli-hello".into(),
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(run_done["status"], json!("completed"));
+    assert_eq!(run_done["cleanup_verified"], json!(true));
+    let run_id = run_done["run_id"].as_str().unwrap().to_string();
+
+    // 5. run get & run list
+    let fetched = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        let run_id = run_id.clone();
+        move || {
+            run_cli(vec![
+                "run".into(),
+                "--socket".into(),
+                sock_str,
+                "get".into(),
+                run_id,
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fetched["run_id"], json!(run_id));
+
+    let runs_list = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        move || {
+            run_cli(vec![
+                "run".into(),
+                "--socket".into(),
+                sock_str,
+                "list".into(),
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(runs_list["runs"].as_array().unwrap().len(), 1);
+
+    // 6. run start + run cancel
+    let long_run = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        move || {
+            run_cli(vec![
+                "run".into(),
+                "--socket".into(),
+                sock_str,
+                "start".into(),
+                "--profile".into(),
+                "cli_acct".into(),
+                "--no-seatbelt".into(),
+                "--".into(),
+                "/bin/sleep".into(),
+                "15".into(),
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    let long_id = long_run["run_id"].as_str().unwrap().to_string();
+
+    let cancelled = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        let long_id = long_id.clone();
+        move || {
+            run_cli(vec![
+                "run".into(),
+                "--socket".into(),
+                sock_str,
+                "cancel".into(),
+                long_id,
+                "--reason".into(),
+                "cli_stop".into(),
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(cancelled["status"], json!("stopped"));
+    assert_eq!(cancelled["cleanup_verified"], json!(true));
+
+    daemon_task.abort();
 }

@@ -192,6 +192,7 @@ dependencies = [
  "atomium-core",
  "atomium-protocol",
  "atomium-runtime",
+ "atomiumd",
  "clap",
  "serde_json",
  "tokio",
@@ -264,11 +265,16 @@ dependencies = [
  "atomium-gateway",
  "atomium-protocol",
  "atomium-runtime",
+ "base64 0.22.1",
+ "hex",
+ "libc",
+ "rand",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -28,10 +28,38 @@ fn escape_sbpl(path: &Path) -> String {
 }
 
 pub fn render_sbpl(cfg: &SeatbeltConfig) -> String {
+    render_sbpl_with_extra_read_paths(cfg, &[])
+}
+
+pub fn render_sbpl_with_extra_read_paths(
+    cfg: &SeatbeltConfig,
+    extra_read_paths: &[PathBuf],
+) -> String {
     let ws = escape_sbpl(&cfg.workspace_dir);
     let home = escape_sbpl(&cfg.run_home_dir);
     let tmp = escape_sbpl(&cfg.run_tmp_dir);
     let cache = escape_sbpl(&cfg.run_cache_dir);
+
+    let extra_read_rule = if extra_read_paths.is_empty() {
+        String::new()
+    } else {
+        let mut buf =
+            String::from("\n; 显式放行只读可执行路径\n(allow file-read* file-map-executable\n");
+        for p in extra_read_paths {
+            let esc = escape_sbpl(p);
+            buf.push_str(&format!("    (literal \"{esc}\")\n"));
+            if let Some(parent) = p.parent() {
+                if p.is_dir() {
+                    buf.push_str(&format!("    (subpath \"{esc}\")\n"));
+                } else {
+                    let p_esc = escape_sbpl(parent);
+                    buf.push_str(&format!("    (literal \"{p_esc}\")\n"));
+                }
+            }
+        }
+        buf.push_str(")\n");
+        buf
+    };
 
     let net_rule = match cfg.allowed_proxy_port {
         Some(port) => format!("(allow network-outbound (remote tcp \"localhost:{port}\"))"),
@@ -101,7 +129,7 @@ pub fn render_sbpl(cfg: &SeatbeltConfig) -> String {
     (subpath "/usr/local")
 )
 (allow file-write* (literal "/dev/null"))
-
+{extra_read_rule}
 ; 仅允许读写当前任务的隔离目录
 (allow file-read* file-write*
     (subpath "{ws}")
@@ -131,13 +159,23 @@ pub fn render_sbpl(cfg: &SeatbeltConfig) -> String {
     )
 }
 
-pub async fn run_in_seatbelt(
+pub fn build_seatbelt_command(
     cfg: &SeatbeltConfig,
     program: &str,
     args: &[&str],
     extra_env: &[(&str, &str)],
-) -> Result<std::process::Output> {
-    let profile = render_sbpl(cfg);
+) -> Command {
+    build_seatbelt_command_with_extra_read_paths(cfg, program, args, extra_env, &[])
+}
+
+pub fn build_seatbelt_command_with_extra_read_paths(
+    cfg: &SeatbeltConfig,
+    program: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    extra_read_paths: &[PathBuf],
+) -> Command {
+    let profile = render_sbpl_with_extra_read_paths(cfg, extra_read_paths);
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-p").arg(profile).arg(program).args(args);
     cmd.current_dir(&cfg.workspace_dir);
@@ -156,6 +194,16 @@ pub async fn run_in_seatbelt(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
+    cmd
+}
+
+pub async fn run_in_seatbelt(
+    cfg: &SeatbeltConfig,
+    program: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Result<std::process::Output> {
+    let mut cmd = build_seatbelt_command(cfg, program, args, extra_env);
     cmd.output().await.context("failed to spawn sandbox-exec")
 }
 

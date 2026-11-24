@@ -294,6 +294,68 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
       () => client.call("unknown.method"),
       (err) => err instanceof Error && err.message.includes("[-32601]"),
     );
+
+    // 7. Live accounts.capture + runs.start + real-time events.push via AtomiumClient
+    const receivedEvents = [];
+    client.onEvent((ev) => receivedEvents.push(ev));
+
+    const syntheticOauth = Buffer.from(
+      JSON.stringify({
+        auth_method: "consumer",
+        id_token_email: "e2e-stream@example.test",
+        token: { access_token: "e2e-tok-1" },
+      }),
+      "utf8",
+    ).toString("base64");
+
+    const captured = await client.call("accounts.capture", {
+      profile_id: "e2e-oauth-acct",
+      display_name: "E2E OAuth Account",
+      raw_secret_b64: syntheticOauth,
+    });
+    assert.equal(captured.profile_id, "e2e-oauth-acct");
+    assert.equal(captured.snapshot_version, 1);
+
+    const startedRun = await client.call("runs.start", {
+      profile_id: "e2e-oauth-acct",
+      program: "/bin/sh",
+      args: ["-c", "echo e2e-live-line"],
+      use_seatbelt: false,
+    });
+    assert.ok(startedRun.run_id);
+
+    // Wait for live Completed event pushed automatically over subscribed socket
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const hasCompleted = receivedEvents.some(
+        (ev) =>
+          ev.run_id === startedRun.run_id &&
+          ev.payload?.type === "status_changed" &&
+          ev.payload?.status === "completed",
+      );
+      if (hasCompleted) break;
+      await new Promise((r) => setTimeout(r, 30));
+    }
+
+    assert.ok(
+      receivedEvents.some(
+        (ev) =>
+          ev.run_id === startedRun.run_id &&
+          ev.payload?.type === "log_line" &&
+          ev.payload?.line === "e2e-live-line",
+      ),
+      "AtomiumClient must receive real-time LogLine push from atomiumd",
+    );
+    assert.ok(
+      receivedEvents.some(
+        (ev) =>
+          ev.run_id === startedRun.run_id &&
+          ev.payload?.type === "status_changed" &&
+          ev.payload?.status === "completed",
+      ),
+      "AtomiumClient must receive real-time Completed push from atomiumd",
+    );
+    assert.ok(client.cursor >= receivedEvents.length, "client cursor must advance on live pushes");
   } finally {
     if (client) {
       client.disconnect();

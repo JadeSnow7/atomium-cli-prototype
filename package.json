@@ -3,7 +3,7 @@
   "private": true,
   "packageManager": "pnpm@10.34.6",
   "scripts": {
-    "gen:protocol": "TS_RS_EXPORT_DIR=$PWD/packages/protocol-types/src/generated cargo test -p atomium-protocol export_bindings",
+    "gen:protocol": "TS_RS_EXPORT_DIR=$PWD/packages/protocol-types/src/generated cargo test -p atomium-protocol export_bindings && TS_RS_EXPORT_DIR=$PWD/crates/atomium-protocol/bindings cargo test -p atomium-protocol export_bindings",
     "build": "cargo build --workspace && pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "test": "cargo test --workspace && pnpm -r test",

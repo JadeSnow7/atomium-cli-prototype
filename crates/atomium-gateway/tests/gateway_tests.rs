@@ -1,8 +1,11 @@
-use atomium_gateway::spawn_run_proxy;
+use atomium_gateway::{spawn_run_proxy, spawn_run_proxy_with_policy};
 use base64::Engine;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 
 fn basic_auth(run_id: &str, token: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(format!("{run_id}:{token}"))
@@ -232,4 +235,168 @@ async fn proxy_revoke_shuts_down_listener() {
         closed,
         "listener on port {port} should reject connections after revoke()"
     );
+}
+
+#[tokio::test]
+async fn proxy_revoke_immediately_terminates_inflight_tcp_connections() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+
+    let req_received = Arc::new(Notify::new());
+    let upstream_saw_eof = Arc::new(Notify::new());
+    let req_rx_clone = req_received.clone();
+    let eof_clone = upstream_saw_eof.clone();
+
+    let server_task = tokio::spawn(async move {
+        let (mut conn, _) = upstream.accept().await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert!(n > 0);
+        req_rx_clone.notify_one();
+
+        // Hold connection open without sending a response until the proxy cuts it.
+        loop {
+            match conn.read(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    eof_clone.notify_one();
+                    break;
+                }
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let handle = spawn_run_proxy(
+        "run-inflight",
+        "tok-inflight",
+        Some(upstream_addr.to_string()),
+    )
+    .await
+    .unwrap();
+    let auth = basic_auth("run-inflight", "tok-inflight");
+
+    let mut client = TcpStream::connect(("127.0.0.1", handle.local_port))
+        .await
+        .unwrap();
+    let req = format!(
+        "GET http://api.example.com/slow HTTP/1.1\r\nHost: api.example.com\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+
+    // Wait until upstream has received the request and is actively holding the tunnel open.
+    tokio::time::timeout(Duration::from_secs(2), req_received.notified())
+        .await
+        .expect("upstream should receive in-flight request");
+
+    // Revoke MUST immediately tear down the in-flight TCP connection.
+    handle.revoke();
+
+    let mut resp_buf = [0u8; 256];
+    let client_read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut resp_buf))
+        .await
+        .expect("in-flight client read must terminate promptly after revoke()");
+    assert!(
+        matches!(client_read, Ok(0) | Err(_)),
+        "expected EOF/error on revoked in-flight stream, got {client_read:?}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), upstream_saw_eof.notified())
+        .await
+        .expect("upstream socket must also observe disconnect promptly after revoke()");
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn proxy_enforces_optional_destination_host_allowlist() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let hit_count = Arc::new(AtomicUsize::new(0));
+    let hit_clone = hit_count.clone();
+
+    let server_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut conn, _)) = upstream.accept().await else {
+                break;
+            };
+            let counter = hit_clone.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let n = conn.read(&mut buf).await.unwrap();
+                if n > 0 {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                    let _ = conn.write_all(resp).await;
+                }
+            });
+        }
+    });
+
+    let handle = spawn_run_proxy_with_policy(
+        "run-acl",
+        "tok-acl",
+        Some(upstream_addr.to_string()),
+        Some(vec!["api.example.com".into(), "*.googleapis.com".into()]),
+    )
+    .await
+    .unwrap();
+    let auth = basic_auth("run-acl", "tok-acl");
+
+    // 1. Disallowed HTTP host -> 403 Forbidden, zero upstream hits
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", handle.local_port))
+            .await
+            .unwrap();
+        let req = format!(
+            "GET http://evil.example.org/steal HTTP/1.1\r\nHost: evil.example.org\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let resp = read_response(&mut s).await;
+        assert!(resp.starts_with("HTTP/1.1 403 Forbidden"), "got: {resp}");
+        assert!(resp.contains("X-Atomium-Policy-Denied: host-not-allowed"));
+    }
+
+    // 2. Disallowed CONNECT host -> 403 Forbidden, zero upstream hits
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", handle.local_port))
+            .await
+            .unwrap();
+        let req = format!(
+            "CONNECT 169.254.169.254:80 HTTP/1.1\r\nHost: 169.254.169.254:80\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let resp = read_response(&mut s).await;
+        assert!(resp.starts_with("HTTP/1.1 403 Forbidden"), "got: {resp}");
+    }
+    assert_eq!(hit_count.load(Ordering::SeqCst), 0);
+
+    // 3. Allowed exact host -> 200 OK
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", handle.local_port))
+            .await
+            .unwrap();
+        let req = format!(
+            "GET http://api.example.com/v1 HTTP/1.1\r\nHost: api.example.com\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let resp = read_response(&mut s).await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+    }
+
+    // 4. Allowed wildcard subdomain via CONNECT -> 200 OK
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", handle.local_port))
+            .await
+            .unwrap();
+        let req = format!(
+            "CONNECT generativelanguage.googleapis.com:443 HTTP/1.1\r\nHost: generativelanguage.googleapis.com:443\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let resp = read_response(&mut s).await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+    }
+
+    assert_eq!(hit_count.load(Ordering::SeqCst), 2);
+    handle.revoke();
+    server_task.abort();
 }
