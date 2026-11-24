@@ -7,7 +7,9 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer, connect } from 'node:net';
 import { createInterface } from 'node:readline/promises';
+import { userInfo } from 'node:os';
 import { agyDoctor, dedicatedAgy, userLogin, verifyAcp } from './agy-acp.mjs';
+import { agyRegionStatusDigest, parseProposal, proposeView as boundedProposal, providerStatus, requirement } from './proposal-contract.mjs';
 
 const root = resolve(fileURLToPath(new URL('.', import.meta.url)));
 const hash = x => createHash('sha256').update(x).digest('hex');
@@ -49,10 +51,6 @@ const worker = [
 
 const execute = promisify(execFile);
 const baselineView=JSON.stringify({view:'open'});
-function parseProposal(text) {
-  if (typeof text!=='string'||text.length>512||!/^\s*\{\s*"view"\s*:\s*"(open|completed|all)"\s*\}\s*$/.test(text)) throw new Error('unsupported-proposal');
-  return JSON.parse(text).view;
-}
 async function askCodex(prompt) {
   const pending=execute('/opt/homebrew/bin/codex',['-a','never','exec','--ignore-user-config','--ignore-rules','--ephemeral','--skip-git-repo-check','--sandbox','read-only','-C','/private/var/empty','-c','web_search="disabled"','--color','never','--json',prompt],{cwd:'/private/var/empty',env:{HOME:process.env.HOME,PATH:'/opt/homebrew/bin:/usr/bin:/bin',LANG:'C',TMPDIR:process.env.TMPDIR},timeout:90000,maxBuffer:262144});
   pending.child.stdin.end();
@@ -62,29 +60,7 @@ async function askCodex(prompt) {
   if (events.filter(e=>e.type==='turn.completed').length!==1||items.length!==1||items[0].type!=='item.completed'||items[0].item?.type!=='agent_message') throw new Error('unexpected-provider-events');
   return items[0].item.text;
 }
-const requirement='Show only the tasks the user has already checked off.';
-const patchPrompt='Synthetic Atomium todo fixture (no tools). Audit is checked off, Ship is not. Current view shows unfinished tasks. The requested change is: '+requirement+' Choose one view among open, completed, all. Reply solely with a JSON object containing the single field view, no markdown or prose.';
-// agy 1.5.14 can surface a provider availability refusal as an ordinary
-// ACP text chunk with end_turn. Recognize the exact observed message by digest
-// without retaining its body or generalizing from unconstrained text.
-const agyRegionStatusDigest='9896b44c9c9dc1a1b3ecc58e3cb689df55ff0c3b9182354197246634e07a5930';
-function providerStatus(source,digest) {
-  return source==='agy-acp-host' && digest===agyRegionStatusDigest
-    ? 'provider-region-unavailable' : null;
-}
-async function proposeView(receive=askCodex,source='codex-host') {
-  let text;
-  try { text=await receive(patchPrompt); }
-  catch { return {source,status:'provider-unavailable-or-unexpected'}; }
-  const status=typeof text==='string' ? providerStatus(source,hash(text.trim())) : null;
-  if(status) return {source,status};
-  let view;
-  try { view=parseProposal(text); }
-  catch { return {source,status:'proposal-schema-rejected'}; }
-  if(view!=='completed') return {source,status:'proposal-contract-rejected'};
-  const patch={op:'replace',path:'view.json#/view',from:'open',value:view};
-  return {source,status:'accepted',patch,patchSha256:hash(JSON.stringify(patch))};
-}
+const proposeView=(receive=askCodex,source='codex-host')=>boundedProposal(receive,source);
 const denied = r => r.exitCode === 0 && /^(EACCES|EPERM)$/.test(r.result);
 const cleanOutput = s => /^(build-asserted|EACCES|EPERM|ENOENT|EADDRNOTAVAIL|ECONNREFUSED|ETIMEDOUT|TIMEOUT|unexpected-allowed|connected)$/.test(s) ? s : 'unclassified';
 function sub(path) { return '(subpath '+JSON.stringify(path)+')'; }
@@ -319,16 +295,172 @@ async function runDemo(mode, rejectionTest, dualTest) {
 }
 
 const [cmd,...args]=process.argv.slice(2);
-if (cmd==='verify-boundary' && !args.length) {
+if (cmd==='profile') {
+  try {
+    const {addProfile,addPendingAgyProfile,addHarnessConfig,defaultProfileRoot,listProfiles,loadProfile,publicProfile,registerHarnessLogin,pendingAgyProfileSchema}=await import('./agent-profiles.mjs');
+    const [op,arg,id]=args;
+    if(op==='list'&&args.length===1)console.log(JSON.stringify((await listProfiles(defaultProfileRoot)).map(publicProfile),null,2));
+    else if(op==='create'&&args.length===2)console.log(JSON.stringify(publicProfile(await addProfile(defaultProfileRoot,arg)),null,2));
+    else if(op==='create'&&args.length===5&&arg==='--harness'&&args[3]==='--profile'){
+      if(id!=='agy')throw new Error('unsupported-login-harness');
+      console.log(JSON.stringify(publicProfile(await addPendingAgyProfile(defaultProfileRoot,args[4])),null,2));
+    }
+    else if(op==='configure'&&arg==='--harness'&&args[3]==='--profile'&&(args.length===5||args.length===7&&args[5]==='--timeout-ms')){
+      const timeoutMs=args.length===7?(/^\d{4,5}$/.test(args[6])?Number(args[6]):NaN):undefined;
+      console.log(JSON.stringify(publicProfile(await addHarnessConfig(defaultProfileRoot,{harness:id,id:args[4],timeoutMs})),null,2));
+    }
+    else if(['login','login-check'].includes(op)&&args.length===5&&arg==='--harness'&&args[3]==='--profile'){
+      if(id!=='agy')throw new Error('unsupported-login-harness');
+      const accountHome=await realpath(userInfo().homedir);
+      if(defaultProfileRoot!==join(accountHome,'workspace','Atomium-cli-prototype','.atomium-profiles'))
+        throw new Error('agy-login-canonical-workspace-required');
+      if(op==='login-check'){
+        const chosen=await loadProfile(defaultProfileRoot,args[4]);
+        if(chosen.schema!==pendingAgyProfileSchema)throw new Error('profile-not-pending-agy-login');
+        const occupied=(await listProfiles(defaultProfileRoot)).find(p=>p.schema==='atomium-agy-login-profile-v1');
+        console.log(JSON.stringify({profile:chosen.id,status:occupied?'blocked-same-macos-user-slot':'ready-for-interactive-login',
+          existingProfile:occupied?.id??null,providerStarted:false},null,2));
+        if(occupied)process.exitCode=2;
+      }else{
+        const cancellation=new AbortController();
+        const stop=()=>cancellation.abort();
+        process.on('SIGINT',stop);process.on('SIGTERM',stop);
+        let result;
+        try{
+          result=await registerHarnessLogin(defaultProfileRoot,{
+            harness:id,id:args[4],interactive:!!(process.stdin.isTTY&&process.stdout.isTTY),signal:cancellation.signal,
+            authenticate:async (dir,options)=>{
+              const {runAgyProfileLogin}=await import('./agy-acp.mjs');
+              console.log('Starting agy official sign-in. It may update your macOS user’s agy login cache. No account identity is verified by Atomium.');
+              return runAgyProfileLogin(dir,options);
+            },
+          });
+        }finally{process.removeListener('SIGINT',stop);process.removeListener('SIGTERM',stop);}
+        console.log(JSON.stringify(result,null,2));
+        if(!result.saved)process.exitCode=result.status==='cancelled'?130:1;
+      }
+    }else if(['show','run'].includes(op)&&args.length===3&&arg==='--profile'){
+      const config=await loadProfile(defaultProfileRoot,id);
+      if(op==='show')console.log(JSON.stringify(publicProfile(config),null,2));
+      else {
+        const {runSelectedProfile}=await import('./agent-profile-audit.mjs');
+        const {status}=await runSelectedProfile(config);
+        if(status!=='passed')process.exitCode=status==='blocked'?2:1;
+      }
+    }else {console.error('Usage: node atomium.mjs profile list | profile create <id> | profile create --harness agy --profile <id> | profile show --profile <id> | profile run --profile <id> | profile configure --harness <agy|codex> --profile <id> [--timeout-ms <ms>] | profile <login|login-check> --harness agy --profile <id>');process.exitCode=64;}
+  }catch(e){
+    const reason=['invalid-profile-id','unsafe-profile-store','profile-already-exists','unsafe-profile-file','profile-file-changed','profile-schema-rejected','profile-not-found','unsupported-login-harness','login-requires-terminal','agy-login-busy','agy-single-login-slot','profile-isolated-execution-unavailable','unsupported-config-harness','invalid-harness-timeout','agy-login-canonical-workspace-required','profile-not-pending-agy-login','pending-profile-changed'].includes(e.message)?e.message:'profile-operation-failed';
+    console.error('Profile: '+reason);
+    if(reason==='profile-already-exists'){
+      console.error('Nothing was overwritten. Inspect the saved profile with: node atomium.mjs profile show --profile <id>');
+    }else if(reason==='agy-single-login-slot'){
+      console.error('Official sign-in was not started. This macOS user already has a saved agy login profile.');
+      console.error('To keep both Google accounts, create and sign in to the second profile in a separate macOS user session, using that user’s own Atomium checkout and agy installation.');
+    }
+    process.exitCode=1;
+  }
+} else if (cmd==='task') {
+  const [op,hFlag,harness,pFlag,profile,actionFlag,operation,billingFlag]=args;
+  if(op!=='run'||hFlag!=='--harness'||pFlag!=='--profile'||!(args.length===5||args.length===7&&actionFlag==='--operation'||
+     args.length===8&&actionFlag==='--operation'&&operation==='synthetic-proposal'&&billingFlag==='--included-plan-only')){
+    console.error('Usage: node atomium.mjs task run --harness <agy|codex> --profile <id> [--operation version-check|synthetic-proposal [--included-plan-only]]');process.exitCode=64;
+  }else try{
+    const {defaultProfileRoot}=await import('./agent-profiles.mjs');
+    if(operation==='synthetic-proposal'){
+      const {runNamedProposal}=await import('./named-profile-proposal.mjs');
+      const cancel=new AbortController(),stop=()=>cancel.abort();
+      process.on('SIGINT',stop);process.on('SIGTERM',stop);
+      try {
+        const result=await runNamedProposal(defaultProfileRoot,{harness,profile,signal:cancel.signal,includedPlanConfirmed:billingFlag==='--included-plan-only'});
+        console.log(JSON.stringify(result,null,2));
+        if(result.status!=='accepted')process.exitCode=result.status==='cancelled'?130:1;
+      } finally {process.removeListener('SIGINT',stop);process.removeListener('SIGTERM',stop);}
+    }else {
+      const {runHarnessTask}=await import('./harness-task.mjs');
+      const result=await runHarnessTask(defaultProfileRoot,{harness,profile,operation});
+      console.log(JSON.stringify(result,null,2));
+      if(result.status!=='passed')process.exitCode=1;
+    }
+  }catch(e){
+    const reason=['unsupported-task-harness','unsupported-task-operation','harness-profile-mismatch','profile-not-found','invalid-profile-id','invalid-task-profile','named-agy-login-profile-required'].includes(e.message)?e.message:'harness-task-failed';
+    console.error('Task: '+reason);process.exitCode=1;
+  }
+} else if (cmd==='verify-named-proposal' && !args.length) {
+  try{
+    const {verifyNamedProposal}=await import('./named-profile-proposal.mjs');
+    if((await verifyNamedProposal()).status!=='passed')process.exitCode=1;
+  }catch{console.error('Named proposal audit could not finish.');process.exitCode=1;}
+} else if (cmd==='verify-harness-config' && !args.length) {
+  try{
+    const {verifyHarnessTasks}=await import('./harness-task.mjs');
+    if((await verifyHarnessTasks()).status!=='passed')process.exitCode=1;
+  }catch{console.error('Harness configuration audit could not finish.');process.exitCode=1;}
+} else if (cmd==='verify-profile-login' && !args.length) {
+  try {
+    const {verifyProfileLogin}=await import('./profile-login-audit.mjs');
+    if(!await verifyProfileLogin())process.exitCode=1;
+  }catch{console.error('Profile login audit could not finish.');process.exitCode=1;}
+} else if (cmd==='verify-profiles' && (args.length===0||args.length===1&&args[0]==='--store-only')) {
+  try {
+    const {verifyProfiles}=await import('./agent-profile-audit.mjs');
+    const {status}=await verifyProfiles({storeOnly:args.length===1});
+    if(status!=='passed')process.exitCode=status==='blocked'?2:1;
+  }catch{console.error('Profile fixture could not finish.');process.exitCode=1;}
+} else if (cmd==='verify-dual-worker' && (args.length===0||args.length===1&&args[0]==='--protocol-only')) {
+  try{
+    const {runDualWorkerDemo,runDualWorkerProtocolOnly}=await import('./dual-worker-demo.mjs');
+    const report=await (args.length?runDualWorkerProtocolOnly():runDualWorkerDemo());
+    if(report.status!=='passed')process.exitCode=report.status==='blocked'?2:1;
+  }catch{console.error('Dual worker fixture could not finish.');process.exitCode=1;}
+} else if (cmd==='verify-agent-egress' && !args.length) {
+  try {
+    const {runAgentEgressAudit}=await import('./agent-egress-audit.mjs');
+    if(!await runAgentEgressAudit())process.exitCode=1;
+  } catch(e) { console.error('Agent egress audit stopped: '+e.message);process.exitCode=1; }
+} else if (cmd==='verify-boundary' && !args.length) {
   try {
     const {runBoundaryAudit}=await import('./boundary.mjs');
     if(!await runBoundaryAudit())process.exitCode=1;
   } catch(e) { console.error('Boundary audit stopped: '+e.message);process.exitCode=1; }
+} else if (cmd==='verify-native-network' && !args.length) {
+  try {
+    const {runNativeNetworkAudit}=await import('./native-network-audit.mjs');
+    await runNativeNetworkAudit();
+  } catch {console.error('Native network fixture could not finish.');process.exitCode=1;}
+} else if (cmd==='verify-gemini-managed' && !args.length) {
+  try {
+    const {runManagedGeminiFixtureAudit}=await import('./gemini-model-managed-audit.mjs');
+    const {status}=await runManagedGeminiFixtureAudit();
+    if(status!=='passed')process.exitCode=['blocked','environment-blocked'].includes(status)?2:1;
+  } catch {console.error('Managed Gemini loopback fixture could not finish.');process.exitCode=1;}
+} else if (cmd==='verify-gemini-adapter' && !args.length) {
+  try {
+    const {runGeminiContractAudit}=await import('./gemini-model-verify.mjs');
+    if(!await runGeminiContractAudit())process.exitCode=1;
+  } catch {console.error('Gemini offline contract could not finish.');process.exitCode=1;}
 } else if (['native-live','verify-native','replay','native-app'].includes(cmd)) {
   try {
     const {nativeMain}=await import('./native-replay.mjs');
     await nativeMain(cmd,args,{askCodex,proposeAgy:prompt=>dedicatedAgy(join(root,'agy-profile'),prompt)});
   } catch(e) {console.error('Native fixture stopped: '+e.message);process.exitCode=1;}
+} else if (cmd==='verify-profile-dispatch' && !args.length) {
+  const controller=new AbortController(),cancel=()=>controller.abort();
+  process.on('SIGINT',cancel);process.on('SIGTERM',cancel);
+  try{
+    const {verifyProfileDispatch}=await import('./profile-dispatch-audit.mjs');
+    const report=await verifyProfileDispatch({signal:controller.signal});
+    if(report.status!=='passed')process.exitCode=report.status==='cancelled'?130:1;
+  }catch{console.error('Synthetic profile dispatch fixture could not finish.');process.exitCode=1;}
+  finally{process.removeListener('SIGINT',cancel);process.removeListener('SIGTERM',cancel);}
+} else if (cmd==='verify-agy-offline' && !args.length) {
+  const controller=new AbortController(),cancel=()=>controller.abort();
+  process.on('SIGINT',cancel);process.on('SIGTERM',cancel);
+  try{
+    const {verifyAgyOffline}=await import('./agy-offline-audit.mjs');
+    const report=await verifyAgyOffline({signal:controller.signal});
+    if(report.status!=='passed')process.exitCode=controller.signal.aborted?130:report.status==='blocked'?2:1;
+  }catch{console.error('agy offline probe could not finish.');process.exitCode=1;}
+  finally{process.removeListener('SIGINT',cancel);process.removeListener('SIGTERM',cancel);}
 } else if (cmd==='agy-doctor' && !args.length) {
   try { console.log(JSON.stringify(await agyDoctor(),null,2)); }
   catch { console.error('AGY clean-profile probe could not start.');process.exitCode=1; }
@@ -393,10 +525,21 @@ if (cmd==='verify-boundary' && !args.length) {
     {expect:'review-snapshot-mismatch',propose,review:review(),tamper:true},
     {propose,review:review()},
   ]) await runDemo('dual-self-test',null,fixture);
+} else if (cmd==='account') {
+  try {
+    const {runAccountCli}=await import('./account-auth/cli.mjs');
+    const code=await runAccountCli(args,{rootDir:root});
+    if(code!==0)process.exitCode=code;
+  } catch(e) { console.error('Account command failed: '+(e?.message||'unknown'));process.exitCode=1; }
+} else if (cmd==='verify-account-switch' && !args.length) {
+  try {
+    const {verifyAccountSwitch}=await import('./account-auth/cli.mjs');
+    if(!await verifyAccountSwitch(root))process.exitCode=1;
+  } catch { console.error('Account switch verification could not finish.');process.exitCode=1; }
 } else if (['demo','verify','ai-demo','agy-demo','dual-demo'].includes(cmd) && !args.length) {
   try { await runDemo(cmd); }
   catch(e) { console.error('Atomium fixture stopped: '+e.message);process.exitCode=1; }
 } else {
-  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary');
+  console.log('Usage: node atomium.mjs doctor | verify | demo | ai-smoke | ai-demo | verify-proposal | agy-doctor | verify-agy-offline | verify-profile-dispatch | agy-auth | agy-demo | verify-acp | dual-demo | verify-dual | codex-review-smoke | native-live | verify-native | replay | native-app | verify-boundary | verify-agent-egress | verify-dual-worker [--protocol-only] | verify-native-network | verify-gemini-adapter | verify-gemini-managed | profile | task | account | verify-account-switch | verify-profiles [--store-only] | verify-profile-login | verify-harness-config | verify-named-proposal');
   if (cmd && cmd!=='--help') process.exitCode=2;
 }

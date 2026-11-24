@@ -1,0 +1,22 @@
+{
+  "name": "atomium-monorepo",
+  "private": true,
+  "packageManager": "pnpm@10.34.6",
+  "scripts": {
+    "gen:protocol": "TS_RS_EXPORT_DIR=$PWD/packages/protocol-types/src/generated cargo test -p atomium-protocol export_bindings",
+    "build": "cargo build --workspace && pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "cargo test --workspace && pnpm -r test",
+    "daemon:dev": "cargo run -p atomiumd",
+    "doctor": "cargo run -p atomium-cli -- doctor --emit-evidence ./out",
+    "desktop:dev": "pnpm --filter @atomium/desktop tauri dev",
+    "mobile:dev": "pnpm --filter @atomium/mobile start",
+    "check:protocol-sync": "bash scripts/check_protocol_sync.sh",
+    "test:scripts": "python3 -m unittest discover -s scripts -p 'test_*.py' -v && bash scripts/test_shell_scripts.sh",
+    "test:e2e": "node --test scripts/test_e2e_daemon_client.mjs",
+    "ci:local": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && pnpm run check:protocol-sync && pnpm run typecheck && pnpm run build && pnpm run test && pnpm run test:scripts && pnpm run test:e2e"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}

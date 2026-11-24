@@ -1,0 +1,16 @@
+{
+  "name": "@atomium/client",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@atomium/protocol-types": "workspace:*"
+  },
+  "scripts": {
+    "build": "echo 'client is source-exported'",
+    "typecheck": "tsc --noEmit",
+    "test": "rm -rf .test-dist && tsc -p tsconfig.test.json && node -e \"require('node:fs').writeFileSync('.test-dist/package.json', JSON.stringify({ type: 'commonjs' }))\" && node --test tests/*.test.mjs && rm -rf .test-dist"
+  }
+}

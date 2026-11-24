@@ -149,6 +149,35 @@ async function inSandbox(task,profile,command,args,timeout=8000,toolPath='',expe
     return {ok:false,error:why.includes('sandbox_apply')?'nested-sandbox-denied':/Operation not permitted|Permission denied|errno=1\b/.test(why)?'sandbox-operation-denied':'sandboxed-command-failed',exitCode:Number.isInteger(e.code)?e.code:null,signal:e.signal??null};
   }
 }
+
+// Internal hook for trusted, fixed offline acceptance fixtures. Never pipe user
+// source or arguments from a public CLI into this helper.
+export async function prepareNativeNetworkFixture(run, sourceText) {
+  const task=join(run,'task'), scratch=join(task,'compiler-scratch'), cache=join(scratch,'cache');
+  await mkdir(cache,{recursive:true,mode:0o700});
+  const tools=await toolchain();
+  const source=join(task,'network-probe.swift'), staged=join(scratch,'network-probe'), binary=join(task,'network-probe');
+  await writeFile(source,sourceText,{mode:0o400,flag:'wx'});
+  const buildProfile=restricted({binary,source,scratch,tools});
+  const build=await inSandbox(scratch,buildProfile,tools.compiler,['-sdk',tools.sdk,'-module-cache-path',cache,source,'-o',staged],35000,tools.bin);
+  if(!build.ok) return {ok:false,buildResult:build.error,buildProfileSha256:sha(buildProfile)};
+  if(sha(await readFixed(source,limits.source))!==sha(sourceText))throw new Error('native-network-source-changed');
+  const bytes=await readFixed(staged,limits.binary);
+  await writeFile(binary,bytes,{mode:0o500,flag:'wx'});
+  const runtimeProfile=restricted({binary});
+  return {
+    ok:true, swiftVersion:tools.version, compilerSha256:tools.compilerSha,
+    sourceSha256:sha(sourceText), executableSha256:sha(bytes),
+    buildProfileSha256:sha(buildProfile), runtimeProfileSha256:sha(runtimeProfile),
+    async runProbe(args,confined) {
+      if(sha(await readFixed(binary,limits.binary))!==sha(bytes))throw new Error('native-network-binary-changed');
+      if(confined)return inSandbox(task,runtimeProfile,binary,args,5000);
+      try {
+        return {ok:true,stdout:(await execute(binary,args,{cwd:task,env:{HOME:task,TMPDIR:task,PATH:'/usr/bin:/bin',LANG:'C'},timeout:5000,maxBuffer:1024})).stdout};
+      }catch{return {ok:false,error:'native-network-control-launch-failed'};}
+    },
+  };
+}
 async function probeNativePolicies() {
   const run=await fresh('native-boundary-'), task=join(run,'task'), scratch=join(task,'compiler-scratch'), cache=join(scratch,'cache');
   await mkdir(cache,{recursive:true,mode:0o700});

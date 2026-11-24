@@ -1,0 +1,17 @@
+// Auto-exported protocol bindings from crates/atomium-protocol (ts-rs).
+// Do not hand-edit files under ./generated/.
+export type { ApprovalRequest } from "./generated/ApprovalRequest";
+export type { CapabilitiesReport } from "./generated/CapabilitiesReport";
+export type { CredentialSpec } from "./generated/CredentialSpec";
+export type { EgressBinding } from "./generated/EgressBinding";
+export type { IdentityProfile } from "./generated/IdentityProfile";
+export type { JsonRpcError } from "./generated/JsonRpcError";
+export type { JsonRpcRequest } from "./generated/JsonRpcRequest";
+export type { JsonRpcResponse } from "./generated/JsonRpcResponse";
+export type { LocalePolicy } from "./generated/LocalePolicy";
+export type { OAuthStorageMode } from "./generated/OAuthStorageMode";
+export type { ProbeEvidence } from "./generated/ProbeEvidence";
+export type { ProfileState } from "./generated/ProfileState";
+export type { TaskEvent } from "./generated/TaskEvent";
+export type { TaskEventPayload } from "./generated/TaskEventPayload";
+export type { TaskStatus } from "./generated/TaskStatus";
