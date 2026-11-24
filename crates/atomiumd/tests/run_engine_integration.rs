@@ -847,9 +847,13 @@ async fn pending_approvals_persist_across_daemon_restart_and_enforce_digest() {
             .register_pending_approval(ApprovalRequest {
                 approval_id: "appr-restart-1".into(),
                 run_id: "run-99".into(),
-                action_kind: "export_patch".into(),
+                action_kind: "expand_host_write".into(),
                 candidate_digest: "sha256:expected-across-restart".into(),
-                summary: "Apply patch".into(),
+                candidate_id: None,
+                baseline_digest: None,
+                patch_digest: None,
+                target_dir: None,
+                summary: "Apply host write scope".into(),
                 created_at_ms: 1_700_000_000_000,
             })
             .await;

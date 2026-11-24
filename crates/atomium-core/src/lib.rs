@@ -1,9 +1,15 @@
+pub mod broker;
 pub mod keychain;
 pub mod lease;
 pub mod oauth_codec;
 pub mod profile;
 pub mod store;
 pub mod vault;
+
+pub use broker::{
+    compute_tree_digest, import_workspace, validate_relative_path, BrokerError, ImportedTree,
+    WorkspaceBroker,
+};
 
 pub use keychain::{
     decode_master_key_bytes, format_security_batch_write_cmd, validate_keychain_label,

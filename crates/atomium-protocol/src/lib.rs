@@ -96,6 +96,14 @@ pub struct ApprovalRequest {
     pub run_id: String,
     pub action_kind: String, // "export_patch" | "expand_host_write" | "expand_egress"
     pub candidate_digest: String,
+    #[serde(default)]
+    pub candidate_id: Option<String>,
+    #[serde(default)]
+    pub baseline_digest: Option<String>,
+    #[serde(default)]
+    pub patch_digest: Option<String>,
+    #[serde(default)]
+    pub target_dir: Option<String>,
     pub summary: String,
     pub created_at_ms: i64,
 }
@@ -276,6 +284,174 @@ pub struct ProbeEvidence {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct WorkspaceImportLimits {
+    pub max_files: u32,
+    pub max_total_bytes: u64,
+    pub max_file_bytes: u64,
+}
+
+impl Default for WorkspaceImportLimits {
+    fn default() -> Self {
+        Self {
+            max_files: 4096,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_file_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct SnapshotFileEntry {
+    pub relative_path: String,
+    pub size_bytes: u64,
+    pub executable: bool,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkspaceImportRequest {
+    pub source_dir: String,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub limits: Option<WorkspaceImportLimits>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkspaceSnapshot {
+    pub workspace_id: String,
+    pub source_dir: String,
+    pub baseline_dir: String,
+    pub working_dir: String,
+    pub baseline_digest: String,
+    pub file_count: u32,
+    pub total_bytes: u64,
+    pub excluded_count: u32,
+    pub files: Vec<SnapshotFileEntry>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum FileChangeKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct FileDiffEntry {
+    pub relative_path: String,
+    pub kind: FileChangeKind,
+    pub baseline_sha256: Option<String>,
+    pub candidate_sha256: Option<String>,
+    pub baseline_executable: Option<bool>,
+    pub candidate_executable: Option<bool>,
+    pub is_binary: bool,
+    pub unified_diff: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CandidateDiffSummary {
+    pub added_files: u32,
+    pub modified_files: u32,
+    pub deleted_files: u32,
+    pub patch_digest: String,
+    pub unified_diff: String,
+    pub entries: Vec<FileDiffEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum CandidateStatus {
+    Frozen,
+    Exported,
+    Invalidated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CandidateFreezeRequest {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub run_workspace_dir: Option<String>,
+    #[serde(default)]
+    pub limits: Option<WorkspaceImportLimits>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CandidateSnapshot {
+    pub candidate_id: String,
+    pub workspace_id: String,
+    pub run_id: Option<String>,
+    pub frozen_dir: String,
+    pub baseline_digest: String,
+    pub candidate_digest: String,
+    pub patch_digest: String,
+    pub status: CandidateStatus,
+    pub file_count: u32,
+    pub total_bytes: u64,
+    pub files: Vec<SnapshotFileEntry>,
+    pub diff: CandidateDiffSummary,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ApprovalCreateRequest {
+    pub candidate_id: String,
+    pub candidate_digest: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub action_kind: Option<String>,
+    #[serde(default)]
+    pub target_dir: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ApprovalResolveRequest {
+    pub approval_id: String,
+    pub candidate_digest: String,
+    pub approved: bool,
+    #[serde(default)]
+    pub baseline_digest: Option<String>,
+    #[serde(default)]
+    pub patch_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ExportResult {
+    pub exported: bool,
+    pub approval_id: String,
+    pub candidate_id: String,
+    pub workspace_id: String,
+    pub target_dir: String,
+    pub baseline_digest: String,
+    pub candidate_digest: String,
+    pub patch_digest: String,
+    pub applied_added: u32,
+    pub applied_modified: u32,
+    pub applied_deleted: u32,
+    pub exported_at_ms: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +471,18 @@ mod tests {
         JsonRpcResponse::export_all().unwrap();
         CapabilitiesReport::export_all().unwrap();
         ProbeEvidence::export_all().unwrap();
+        WorkspaceImportLimits::export_all().unwrap();
+        SnapshotFileEntry::export_all().unwrap();
+        WorkspaceImportRequest::export_all().unwrap();
+        WorkspaceSnapshot::export_all().unwrap();
+        FileChangeKind::export_all().unwrap();
+        FileDiffEntry::export_all().unwrap();
+        CandidateDiffSummary::export_all().unwrap();
+        CandidateStatus::export_all().unwrap();
+        CandidateFreezeRequest::export_all().unwrap();
+        CandidateSnapshot::export_all().unwrap();
+        ApprovalCreateRequest::export_all().unwrap();
+        ApprovalResolveRequest::export_all().unwrap();
+        ExportResult::export_all().unwrap();
     }
 }
