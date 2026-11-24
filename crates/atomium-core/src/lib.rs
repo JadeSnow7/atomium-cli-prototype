@@ -155,7 +155,9 @@ mod tests {
         };
         store.upsert(&profile).unwrap();
         assert_eq!(store.list().unwrap().len(), 1);
-        store.set_state("acct_a", ProfileState::DirtyReconcile).unwrap();
+        store
+            .set_state("acct_a", ProfileState::DirtyReconcile)
+            .unwrap();
         assert!(matches!(
             store.get("acct_a").unwrap().unwrap().state,
             ProfileState::DirtyReconcile

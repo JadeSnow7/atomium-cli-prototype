@@ -1,0 +1,344 @@
+use atomium_protocol::{
+    ApprovalRequest, CapabilitiesReport, CredentialSpec, EgressBinding, IdentityProfile,
+    JsonRpcError, JsonRpcRequest, JsonRpcResponse, LocalePolicy, OAuthStorageMode, ProbeEvidence,
+    ProfileState, TaskEvent, TaskEventPayload, TaskStatus,
+};
+use serde_json::json;
+
+fn assert_json_roundtrip<T>(value: &T) -> serde_json::Value
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let serialized = serde_json::to_value(value).expect("serialize");
+    let raw = serde_json::to_string(value).expect("serialize string");
+    let deserialized: T = serde_json::from_str(&raw).expect("deserialize");
+    let reserialized = serde_json::to_value(&deserialized).expect("reserialize");
+    assert_eq!(serialized, reserialized);
+    serialized
+}
+
+fn base_egress() -> EgressBinding {
+    EgressBinding {
+        proxy_id: "proxy-us-west".into(),
+        expected_country: "US".into(),
+        expected_region: Some("CA".into()),
+        fail_closed: true,
+        exclusive_proxy_use: false,
+    }
+}
+
+fn base_locale() -> LocalePolicy {
+    LocalePolicy {
+        timezone: "America/Los_Angeles".into(),
+        lang: "en_US.UTF-8".into(),
+        auto_align_with_proxy: true,
+    }
+}
+
+#[test]
+fn identity_profile_and_credential_specs_wire_format_and_roundtrip() {
+    let api_key_profile = IdentityProfile {
+        id: "prof-api".into(),
+        display_name: "API Key Profile".into(),
+        agent_kind: "claude-code".into(),
+        credential: CredentialSpec::ApiKey {
+            vault_secret_id: "sec-1".into(),
+            model_alias: "sonnet".into(),
+            max_concurrent_runs: 4,
+        },
+        egress: base_egress(),
+        locale_policy: base_locale(),
+        state: ProfileState::Active,
+    };
+    let v_api = assert_json_roundtrip(&api_key_profile);
+    assert_eq!(v_api["credential"]["kind"], "api_key");
+    assert_eq!(v_api["credential"]["vault_secret_id"], "sec-1");
+    assert_eq!(v_api["credential"]["model_alias"], "sonnet");
+    assert_eq!(v_api["credential"]["max_concurrent_runs"], 4);
+    assert_eq!(v_api["egress"]["expected_region"], "CA");
+    assert_eq!(v_api["state"], "active");
+
+    let adc_profile = IdentityProfile {
+        id: "prof-adc".into(),
+        display_name: "ADC Profile".into(),
+        agent_kind: "gemini".into(),
+        credential: CredentialSpec::Adc {
+            vault_blob_id: "blob-adc".into(),
+            project_id: None,
+            env_flag_name: "GOOGLE_APPLICATION_CREDENTIALS".into(),
+        },
+        egress: EgressBinding {
+            expected_region: None,
+            ..base_egress()
+        },
+        locale_policy: base_locale(),
+        state: ProfileState::NeedsReauth,
+    };
+    let v_adc = assert_json_roundtrip(&adc_profile);
+    assert_eq!(v_adc["credential"]["kind"], "adc");
+    assert_eq!(v_adc["credential"]["vault_blob_id"], "blob-adc");
+    assert!(v_adc["credential"]["project_id"].is_null());
+    assert_eq!(
+        v_adc["credential"]["env_flag_name"],
+        "GOOGLE_APPLICATION_CREDENTIALS"
+    );
+    assert_eq!(v_adc["state"], "needs_reauth");
+
+    let oauth_isolated = IdentityProfile {
+        id: "prof-oauth-iso".into(),
+        display_name: "OAuth Isolated".into(),
+        agent_kind: "antigravity".into(),
+        credential: CredentialSpec::OauthSnapshot {
+            vault_blob_id: "blob-oauth-1".into(),
+            mode: OAuthStorageMode::IsolatedFile {
+                relative_home_path: ".gemini/antigravity-cli/antigravity-oauth-token".into(),
+            },
+            snapshot_version: 2,
+            content_digest: "deadbeef".into(),
+        },
+        egress: base_egress(),
+        locale_policy: base_locale(),
+        state: ProfileState::DirtyReconcile,
+    };
+    let v_iso = assert_json_roundtrip(&oauth_isolated);
+    assert_eq!(v_iso["credential"]["kind"], "oauth_snapshot");
+    assert_eq!(v_iso["credential"]["mode"]["storage"], "isolated_file");
+    assert_eq!(
+        v_iso["credential"]["mode"]["relative_home_path"],
+        ".gemini/antigravity-cli/antigravity-oauth-token"
+    );
+    assert_eq!(v_iso["state"], "dirty_reconcile");
+
+    let oauth_keychain = IdentityProfile {
+        id: "prof-oauth-kc".into(),
+        display_name: "OAuth Keychain".into(),
+        agent_kind: "codex".into(),
+        credential: CredentialSpec::OauthSnapshot {
+            vault_blob_id: "blob-oauth-2".into(),
+            mode: OAuthStorageMode::HostKeychainSlot {
+                service: "antigravity-cli".into(),
+                account: "default".into(),
+            },
+            snapshot_version: 5,
+            content_digest: "cafebabe".into(),
+        },
+        egress: base_egress(),
+        locale_policy: base_locale(),
+        state: ProfileState::Disabled,
+    };
+    let v_kc = assert_json_roundtrip(&oauth_keychain);
+    assert_eq!(v_kc["credential"]["kind"], "oauth_snapshot");
+    assert_eq!(v_kc["credential"]["mode"]["storage"], "host_keychain_slot");
+    assert_eq!(v_kc["credential"]["mode"]["service"], "antigravity-cli");
+    assert_eq!(v_kc["credential"]["mode"]["account"], "default");
+    assert_eq!(v_kc["state"], "disabled");
+}
+
+#[test]
+fn profile_state_all_variants_wire_format() {
+    let cases = [
+        (ProfileState::Active, "active"),
+        (ProfileState::NeedsReauth, "needs_reauth"),
+        (ProfileState::DirtyReconcile, "dirty_reconcile"),
+        (ProfileState::Disabled, "disabled"),
+    ];
+    for (variant, expected) in cases {
+        let v = assert_json_roundtrip(&variant);
+        assert_eq!(v, json!(expected));
+    }
+}
+
+#[test]
+fn task_status_all_11_variants_wire_format() {
+    let cases = [
+        (TaskStatus::Prepared, "prepared"),
+        (TaskStatus::Running, "running"),
+        (TaskStatus::AwaitingApproval, "awaiting_approval"),
+        (TaskStatus::Finalizing, "finalizing"),
+        (TaskStatus::Completed, "completed"),
+        (TaskStatus::Revoking, "revoking"),
+        (TaskStatus::Stopping, "stopping"),
+        (TaskStatus::Stopped, "stopped"),
+        (TaskStatus::Interrupted, "interrupted"),
+        (TaskStatus::CleanupUnverified, "cleanup_unverified"),
+        (TaskStatus::Blocked, "blocked"),
+    ];
+    assert_eq!(cases.len(), 11);
+    for (variant, expected) in cases {
+        let v = assert_json_roundtrip(&variant);
+        assert_eq!(v, json!(expected));
+    }
+}
+
+#[test]
+fn approval_request_and_task_event_all_payload_variants() {
+    let approval = ApprovalRequest {
+        approval_id: "appr-1".into(),
+        run_id: "run-42".into(),
+        action_kind: "export_patch".into(),
+        candidate_digest: "abc123".into(),
+        summary: "Export patch to host repo".into(),
+        created_at_ms: 1_700_000_000_000,
+    };
+    let v_appr = assert_json_roundtrip(&approval);
+    assert_eq!(v_appr["approval_id"], "appr-1");
+    assert_eq!(v_appr["action_kind"], "export_patch");
+
+    let cases = [
+        (
+            TaskEventPayload::StatusChanged {
+                status: TaskStatus::AwaitingApproval,
+                reason: Some("waiting for operator".into()),
+            },
+            "status_changed",
+        ),
+        (
+            TaskEventPayload::LogLine {
+                stream: "stderr".into(),
+                line: "warning: something".into(),
+            },
+            "log_line",
+        ),
+        (
+            TaskEventPayload::PolicyDenied {
+                category: "egress".into(),
+                detail: "direct tcp blocked".into(),
+            },
+            "policy_denied",
+        ),
+        (
+            TaskEventPayload::ApprovalRequested {
+                request: approval.clone(),
+            },
+            "approval_requested",
+        ),
+        (
+            TaskEventPayload::ApprovalResolved {
+                approval_id: "appr-1".into(),
+                approved: true,
+            },
+            "approval_resolved",
+        ),
+    ];
+
+    for (idx, (payload, expected_type)) in cases.into_iter().enumerate() {
+        let event = TaskEvent {
+            seq: (idx + 1) as i64,
+            run_id: "run-42".into(),
+            timestamp_ms: 1_700_000_000_000 + idx as i64,
+            payload,
+        };
+        let v = assert_json_roundtrip(&event);
+        assert_eq!(v["seq"], (idx + 1) as i64);
+        assert_eq!(v["run_id"], "run-42");
+        assert_eq!(v["payload"]["type"], expected_type);
+    }
+}
+
+#[test]
+fn json_rpc_request_response_and_error_wire_format() {
+    // Omitted params defaults to Null
+    let raw_req = r#"{"jsonrpc":"2.0","id":1,"method":"health.check"}"#;
+    let req: JsonRpcRequest = serde_json::from_str(raw_req).expect("parse request without params");
+    assert_eq!(req.jsonrpc, "2.0");
+    assert_eq!(req.id, json!(1));
+    assert_eq!(req.method, "health.check");
+    assert_eq!(req.params, serde_json::Value::Null);
+    assert_json_roundtrip(&req);
+
+    // Explicit params
+    let req_with_params = JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: json!("req-str"),
+        method: "task.start".into(),
+        params: json!({"profile_id": "p1"}),
+    };
+    let v_req = assert_json_roundtrip(&req_with_params);
+    assert_eq!(v_req["params"]["profile_id"], "p1");
+
+    // Success response omits `error`
+    let ok_resp = JsonRpcResponse {
+        jsonrpc: "2.0".into(),
+        id: json!(1),
+        result: Some(json!({"ok": true})),
+        error: None,
+    };
+    let v_ok = assert_json_roundtrip(&ok_resp);
+    let ok_obj = v_ok.as_object().expect("response object");
+    assert!(ok_obj.contains_key("result"));
+    assert!(!ok_obj.contains_key("error"));
+
+    // Error response omits `result`; JsonRpcError omits `data` when None
+    let err_no_data = JsonRpcError {
+        code: -32601,
+        message: "Method not found".into(),
+        data: None,
+    };
+    let v_err_no_data = assert_json_roundtrip(&err_no_data);
+    assert!(!v_err_no_data.as_object().unwrap().contains_key("data"));
+
+    let err_resp = JsonRpcResponse {
+        jsonrpc: "2.0".into(),
+        id: serde_json::Value::Null,
+        result: None,
+        error: Some(err_no_data),
+    };
+    let v_err_resp = assert_json_roundtrip(&err_resp);
+    let err_resp_obj = v_err_resp.as_object().expect("error response object");
+    assert!(!err_resp_obj.contains_key("result"));
+    assert!(err_resp_obj.contains_key("error"));
+    assert!(!err_resp_obj["error"]
+        .as_object()
+        .unwrap()
+        .contains_key("data"));
+
+    // JsonRpcError with `data: Some(...)`
+    let err_with_data = JsonRpcError {
+        code: -32000,
+        message: "Conflict".into(),
+        data: Some(json!({"resource": "proxy:us-1"})),
+    };
+    let v_err_data = assert_json_roundtrip(&err_with_data);
+    assert_eq!(v_err_data["data"]["resource"], "proxy:us-1");
+}
+
+#[test]
+fn capabilities_report_and_probe_evidence_roundtrip() {
+    let report = CapabilitiesReport {
+        schema_version: "atomium-capabilities-v1".into(),
+        os: "macos".into(),
+        os_version: "15.3".into(),
+        backend: "macos-seatbelt".into(),
+        file_isolation: "enforced_verified".into(),
+        egress_enforcement: "enforced_verified".into(),
+        keychain_isolation: "enforced_verified".into(),
+        location_blocked: "enforced_verified".into(),
+        timezone_policy: "default_configured".into(),
+        notes: vec!["note-1".into(), "note-2".into()],
+    };
+    let v_rep = assert_json_roundtrip(&report);
+    assert_eq!(v_rep["schema_version"], "atomium-capabilities-v1");
+    assert_eq!(v_rep["notes"].as_array().unwrap().len(), 2);
+
+    let ev_some = ProbeEvidence {
+        probe_id: "workspace_rw_allowed".into(),
+        passed: true,
+        expected: "exit 0".into(),
+        actual: "exit Some(0)".into(),
+        exit_code: Some(0),
+        detail: String::new(),
+    };
+    let v_ev_some = assert_json_roundtrip(&ev_some);
+    assert_eq!(v_ev_some["exit_code"], 0);
+
+    let ev_none = ProbeEvidence {
+        probe_id: "signal_killed".into(),
+        passed: false,
+        expected: "non-zero".into(),
+        actual: "signaled".into(),
+        exit_code: None,
+        detail: "terminated by signal".into(),
+    };
+    let v_ev_none = assert_json_roundtrip(&ev_none);
+    assert!(v_ev_none["exit_code"].is_null());
+}

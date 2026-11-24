@@ -8,6 +8,6 @@
   "scripts": {
     "build": "echo 'protocol-types is source-exported'",
     "typecheck": "tsc --noEmit",
-    "test": "echo 'protocol-types verified via cargo test -p atomium-protocol'"
+    "test": "node --test tests/*.test.mjs"
   }
 }

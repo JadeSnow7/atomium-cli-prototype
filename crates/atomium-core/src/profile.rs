@@ -55,12 +55,18 @@ impl ProfileStore {
 
     pub fn list(&self) -> Result<Vec<IdentityProfile>> {
         let conn = Connection::open(&self.db_path)?;
-        let mut stmt = conn.prepare("SELECT profile_json FROM identity_profiles ORDER BY id ASC")?;
+        let mut stmt =
+            conn.prepare("SELECT profile_json FROM identity_profiles ORDER BY id ASC")?;
         let items = stmt
             .query_map([], |r| {
                 let json: String = r.get(0)?;
-                serde_json::from_str::<IdentityProfile>(&json)
-                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))
+                serde_json::from_str::<IdentityProfile>(&json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(items)

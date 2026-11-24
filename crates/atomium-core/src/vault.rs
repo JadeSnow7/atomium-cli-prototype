@@ -29,7 +29,10 @@ impl EncryptedVault {
         let root_dir = root_dir.as_ref().to_path_buf();
         fs::create_dir_all(&root_dir)?;
         fs::set_permissions(&root_dir, fs::Permissions::from_mode(0o700))?;
-        Ok(Self { root_dir, master_key })
+        Ok(Self {
+            root_dir,
+            master_key,
+        })
     }
 
     pub fn digest_hex(bytes: &[u8]) -> String {

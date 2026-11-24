@@ -237,7 +237,11 @@ impl RuntimeBackend for MacOsSeatbeltBackend {
             probe_id: "host_secret_read_denied".into(),
             passed: p2_passed,
             expected: "non-zero exit, host canary unreadable".into(),
-            actual: format!("exit {:?} leaked={}", p2.status.code(), p2_out.contains("SYNTHETIC_HOST_CANARY")),
+            actual: format!(
+                "exit {:?} leaked={}",
+                p2.status.code(),
+                p2_out.contains("SYNTHETIC_HOST_CANARY")
+            ),
             exit_code: p2.status.code(),
             detail: p2_err.trim().to_string(),
         });
@@ -261,15 +265,17 @@ impl RuntimeBackend for MacOsSeatbeltBackend {
         .await?;
         let p3_err = String::from_utf8_lossy(&p3.stderr).to_string();
         let p3_out = String::from_utf8_lossy(&p3.stdout).to_string();
-        let p3_passed = p1_passed
-            && !nested_blocked
-            && !p3.status.success()
-            && !p3_out.contains("CONNECTED");
+        let p3_passed =
+            p1_passed && !nested_blocked && !p3.status.success() && !p3_out.contains("CONNECTED");
         evidences.push(ProbeEvidence {
             probe_id: "direct_egress_denied".into(),
             passed: p3_passed,
             expected: "non-zero exit (EPERM/denied), direct TCP blocked".into(),
-            actual: format!("exit {:?} connected={}", p3.status.code(), p3_out.contains("CONNECTED")),
+            actual: format!(
+                "exit {:?} connected={}",
+                p3.status.code(),
+                p3_out.contains("CONNECTED")
+            ),
             exit_code: p3.status.code(),
             detail: p3_err.trim().to_string(),
         });
@@ -292,7 +298,11 @@ impl RuntimeBackend for MacOsSeatbeltBackend {
             probe_id: "unauthorized_localhost_denied".into(),
             passed: p4_passed,
             expected: format!("non-zero exit, connection to 127.0.0.1:{unauth_port} denied"),
-            actual: format!("exit {:?} connected={}", p4.status.code(), p4_out.contains("LOCAL_CONNECTED")),
+            actual: format!(
+                "exit {:?} connected={}",
+                p4.status.code(),
+                p4_out.contains("LOCAL_CONNECTED")
+            ),
             exit_code: p4.status.code(),
             detail: p4_err.trim().to_string(),
         });
@@ -321,10 +331,30 @@ impl RuntimeBackend for MacOsSeatbeltBackend {
             os: std::env::consts::OS.into(),
             os_version,
             backend: self.name().into(),
-            file_isolation: if all_passed { "enforced_verified" } else { "unverified" }.into(),
-            egress_enforcement: if all_passed { "enforced_verified" } else { "unverified" }.into(),
-            keychain_isolation: if nested_blocked { "unverified" } else { "enforced_verified" }.into(),
-            location_blocked: if nested_blocked { "unverified" } else { "enforced_verified" }.into(),
+            file_isolation: if all_passed {
+                "enforced_verified"
+            } else {
+                "unverified"
+            }
+            .into(),
+            egress_enforcement: if all_passed {
+                "enforced_verified"
+            } else {
+                "unverified"
+            }
+            .into(),
+            keychain_isolation: if nested_blocked {
+                "unverified"
+            } else {
+                "enforced_verified"
+            }
+            .into(),
+            location_blocked: if nested_blocked {
+                "unverified"
+            } else {
+                "enforced_verified"
+            }
+            .into(),
             timezone_policy: "default_configured".into(),
             notes,
         };

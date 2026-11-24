@@ -11,6 +11,6 @@
   "scripts": {
     "build": "echo 'client is source-exported'",
     "typecheck": "tsc --noEmit",
-    "test": "echo 'client typecheck passed'"
+    "test": "rm -rf .test-dist && tsc -p tsconfig.test.json && node -e \"require('node:fs').writeFileSync('.test-dist/package.json', JSON.stringify({ type: 'commonjs' }))\" && node --test tests/*.test.mjs && rm -rf .test-dist"
   }
 }

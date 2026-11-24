@@ -7,6 +7,6 @@
   "scripts": {
     "build": "echo 'agent-drivers is native ESM'",
     "typecheck": "node --check src/index.mjs src/agy-acp.mjs src/gemini-model-adapter.mjs src/proposal-contract.mjs src/harness-task.mjs",
-    "test": "node --test src/account-auth/account-auth.test.mjs"
+    "test": "node --test src/account-auth/account-auth.test.mjs src/account-auth/components.test.mjs src/gemini-model-adapter.test.mjs src/proposal-contract.test.mjs src/agy-acp.test.mjs"
   }
 }

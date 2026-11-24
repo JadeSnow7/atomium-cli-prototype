@@ -69,7 +69,12 @@ impl LeaseManager {
     }
 
     /// 按字典序排序后在单个 IMMEDIATE 事务内一次性加锁，彻底避免死锁与半成品状态
-    pub fn acquire_all(&self, run_id: &str, mut reqs: Vec<LeaseRequest>, ttl_secs: i64) -> Result<()> {
+    pub fn acquire_all(
+        &self,
+        run_id: &str,
+        mut reqs: Vec<LeaseRequest>,
+        ttl_secs: i64,
+    ) -> Result<()> {
         reqs.sort_by(|a, b| a.resource_key.cmp(&b.resource_key));
         let mut conn = Connection::open(&self.db_path)?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
@@ -78,7 +83,10 @@ impl LeaseManager {
         let pid = std::process::id() as i64;
 
         // 1. 清理已过期租约（注：OAuth 过期租约需在调用层触发 dirty_reconcile 审计）
-        tx.execute("DELETE FROM resource_leases WHERE expires_at <= ?1", params![now])?;
+        tx.execute(
+            "DELETE FROM resource_leases WHERE expires_at <= ?1",
+            params![now],
+        )?;
 
         // 2. 逐项检查冲突
         for req in &reqs {
@@ -86,7 +94,9 @@ impl LeaseManager {
                 "SELECT lease_mode, affinity_owner, run_id FROM resource_leases WHERE resource_key = ?1",
             )?;
             let existing: Vec<(String, Option<String>, String)> = stmt
-                .query_map(params![&req.resource_key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .query_map(params![&req.resource_key], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
                 .collect::<std::result::Result<_, _>>()?;
 
             for (mode, owner, holder_run) in existing {
@@ -96,7 +106,9 @@ impl LeaseManager {
                 let conflict = match (&req.mode, mode.as_str()) {
                     (LeaseMode::Exclusive, _) | (_, "exclusive") => true,
                     (LeaseMode::Shared, "shared") => false,
-                    (LeaseMode::Affinity(want), "affinity") => owner.as_deref() != Some(want.as_str()),
+                    (LeaseMode::Affinity(want), "affinity") => {
+                        owner.as_deref() != Some(want.as_str())
+                    }
                     _ => true,
                 };
                 if conflict {
@@ -141,7 +153,10 @@ impl LeaseManager {
 
     pub fn release_all(&self, run_id: &str) -> Result<()> {
         let conn = Connection::open(&self.db_path)?;
-        conn.execute("DELETE FROM resource_leases WHERE run_id = ?1", params![run_id])?;
+        conn.execute(
+            "DELETE FROM resource_leases WHERE run_id = ?1",
+            params![run_id],
+        )?;
         Ok(())
     }
 
@@ -151,13 +166,17 @@ impl LeaseManager {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Self::now_secs();
         let keys: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT resource_key FROM resource_leases WHERE expires_at <= ?1")?;
+            let mut stmt =
+                tx.prepare("SELECT resource_key FROM resource_leases WHERE expires_at <= ?1")?;
             let rows = stmt
                 .query_map(params![now], |r| r.get(0))?
                 .collect::<std::result::Result<Vec<String>, _>>()?;
             rows
         };
-        tx.execute("DELETE FROM resource_leases WHERE expires_at <= ?1", params![now])?;
+        tx.execute(
+            "DELETE FROM resource_leases WHERE expires_at <= ?1",
+            params![now],
+        )?;
         tx.commit()?;
         Ok(keys)
     }
@@ -187,8 +206,14 @@ impl LeaseManager {
         let events = stmt
             .query_map(params![after_seq], |r| {
                 let payload_json: String = r.get(3)?;
-                let payload: TaskEventPayload = serde_json::from_str(&payload_json)
-                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
+                let payload: TaskEventPayload =
+                    serde_json::from_str(&payload_json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
                 Ok(TaskEvent {
                     seq: r.get(0)?,
                     run_id: r.get(1)?,

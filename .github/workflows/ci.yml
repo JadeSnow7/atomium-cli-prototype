@@ -1,0 +1,209 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-lint-and-protocol:
+    name: Rust Lint & Protocol Sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Tauri Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            pkg-config
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check Rust-to-TS protocol sync
+        run: bash scripts/check_protocol_sync.sh
+
+  rust-test:
+    name: Rust Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Tauri Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            pkg-config
+
+      - name: Run Rust workspace tests
+        run: cargo test --workspace
+
+      # GitHub macos-latest runners are not nested under an outer Seatbelt sandbox;
+      # if a runner blocks nested sandbox-exec, always() preserves the emitted evidence.
+      - name: Run Seatbelt doctor probe (macOS)
+        if: runner.os == 'macOS'
+        run: cargo run -p atomium-cli -- doctor --emit-evidence ./out/ci-doctor
+
+      - name: Upload doctor evidence (macOS)
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-doctor-evidence
+          path: out/ci-doctor
+          if-no-files-found: ignore
+
+      - name: Build macOS browser host helper
+        if: runner.os == 'macOS'
+        run: swift build --disable-sandbox --package-path native-helpers/macos-browser-host
+
+  ts-js-workspace:
+    name: TS/JS Workspace (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck workspace
+        run: pnpm -r typecheck
+
+      - name: Build workspace
+        run: pnpm -r build
+
+      - name: Test workspace
+        run: pnpm -r test
+
+  scripts-and-e2e:
+    name: Scripts & E2E (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Python script unit tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+
+      - name: Run shell script syntax and fixture tests
+        run: bash scripts/test_shell_scripts.sh
+
+      - name: Build atomiumd and atomium-cli
+        run: cargo build -p atomiumd -p atomium-cli
+
+      - name: Run cross-layer daemon/client E2E test
+        run: node --test scripts/test_e2e_daemon_client.mjs
+
+  ci-gate:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - rust-lint-and-protocol
+      - rust-test
+      - ts-js-workspace
+      - scripts-and-e2e
+    steps:
+      - name: Verify all required CI jobs succeeded
+        env:
+          RUST_LINT_RESULT: ${{ needs.rust-lint-and-protocol.result }}
+          RUST_TEST_RESULT: ${{ needs.rust-test.result }}
+          TS_JS_RESULT: ${{ needs.ts-js-workspace.result }}
+          E2E_RESULT: ${{ needs.scripts-and-e2e.result }}
+        run: |
+          echo "rust-lint-and-protocol: $RUST_LINT_RESULT"
+          echo "rust-test: $RUST_TEST_RESULT"
+          echo "ts-js-workspace: $TS_JS_RESULT"
+          echo "scripts-and-e2e: $E2E_RESULT"
+          for res in "$RUST_LINT_RESULT" "$RUST_TEST_RESULT" "$TS_JS_RESULT" "$E2E_RESULT"; do
+            if [[ "$res" != "success" ]]; then
+              echo "::error::One or more required CI jobs did not succeed."
+              exit 1
+            fi
+          done

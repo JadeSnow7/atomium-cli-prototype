@@ -112,11 +112,25 @@ pub struct TaskEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
 pub enum TaskEventPayload {
-    StatusChanged { status: TaskStatus, reason: Option<String> },
-    LogLine { stream: String, line: String },
-    PolicyDenied { category: String, detail: String },
-    ApprovalRequested { request: ApprovalRequest },
-    ApprovalResolved { approval_id: String, approved: bool },
+    StatusChanged {
+        status: TaskStatus,
+        reason: Option<String>,
+    },
+    LogLine {
+        stream: String,
+        line: String,
+    },
+    PolicyDenied {
+        category: String,
+        detail: String,
+    },
+    ApprovalRequested {
+        request: ApprovalRequest,
+    },
+    ApprovalResolved {
+        approval_id: String,
+        approved: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -162,11 +176,11 @@ pub struct CapabilitiesReport {
     pub os: String,
     pub os_version: String,
     pub backend: String,
-    pub file_isolation: String,      // "enforced_verified" | "unverified" | "unsupported"
+    pub file_isolation: String, // "enforced_verified" | "unverified" | "unsupported"
     pub egress_enforcement: String,
     pub keychain_isolation: String,
     pub location_blocked: String,
-    pub timezone_policy: String,     // "default_configured"
+    pub timezone_policy: String, // "default_configured"
     pub notes: Vec<String>,
 }
 

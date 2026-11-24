@@ -71,7 +71,8 @@ async fn handle_client(
     }
     let header_text = String::from_utf8_lossy(&buf[..n]);
     let authorized = header_text.lines().any(|line| {
-        line.to_ascii_lowercase().starts_with("proxy-authorization:")
+        line.to_ascii_lowercase()
+            .starts_with("proxy-authorization:")
             && line.contains(expected_auth)
     });
     if !authorized {

@@ -37,7 +37,10 @@ mod tests {
         let n2 = s2.read(&mut buf).await.unwrap();
         let resp2 = String::from_utf8_lossy(&buf[..n2]);
         assert!(resp2.starts_with("HTTP/1.1 502"), "got: {resp2}");
-        assert!(resp2.contains("X-Atomium-Fail-Closed: true"), "got: {resp2}");
+        assert!(
+            resp2.contains("X-Atomium-Fail-Closed: true"),
+            "got: {resp2}"
+        );
 
         handle.revoke();
     }

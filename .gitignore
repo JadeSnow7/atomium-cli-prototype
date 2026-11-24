@@ -9,6 +9,13 @@ node_modules/
 **/node_modules/
 dist/
 **/dist/
+.test-dist/
+**/.test-dist/
+.build/
+**/.build/
+__pycache__/
+**/__pycache__/
+*.pyc
 .expo/
 **/.expo/
 .env

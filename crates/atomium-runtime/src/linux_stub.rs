@@ -23,7 +23,9 @@ impl RuntimeBackend for LinuxContainerStubBackend {
             keychain_isolation: "unsupported".into(),
             location_blocked: "unsupported".into(),
             timezone_policy: "default_configured".into(),
-            notes: vec!["Linux container backend is a stub; enable Podman/container runtime in M4.".into()],
+            notes: vec![
+                "Linux container backend is a stub; enable Podman/container runtime in M4.".into(),
+            ],
         };
         Ok((report, vec![]))
     }
