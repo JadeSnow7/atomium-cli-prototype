@@ -345,11 +345,27 @@ pub fn default_db_path() -> PathBuf {
 }
 
 pub fn bind_socket(sock_path: &Path) -> Result<UnixListener> {
+    let parent_opt = sock_path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent_opt {
+        fs::create_dir_all(parent)?;
+        // Bind to a short sibling temporary path, tighten to 0600 BEFORE exposing at sock_path,
+        // and atomically rename into place so sock_path is never observable with mode != 0600.
+        let suffix: u32 = rand::random();
+        let tmp_path = parent.join(format!(".s{:06x}", suffix & 0x00ff_ffff));
+        let _ = fs::remove_file(&tmp_path);
+        let listener = UnixListener::bind(&tmp_path)?;
+        if let Err(err) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
+        if let Err(err) = fs::rename(&tmp_path, sock_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
+        return Ok(listener);
+    }
     if sock_path.exists() {
         let _ = fs::remove_file(sock_path);
-    }
-    if let Some(parent) = sock_path.parent() {
-        fs::create_dir_all(parent)?;
     }
     let listener = UnixListener::bind(sock_path)?;
     fs::set_permissions(sock_path, fs::Permissions::from_mode(0o600))?;
