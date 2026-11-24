@@ -402,9 +402,13 @@ async fn approvals_resolve_validation_mismatch_and_event_logging() {
         .register_pending_approval(ApprovalRequest {
             approval_id: "appr-1".into(),
             run_id: "run-42".into(),
-            action_kind: "export_patch".into(),
+            action_kind: "expand_host_write".into(),
             candidate_digest: "sha256:expected".into(),
-            summary: "Export patch to host repo".into(),
+            candidate_id: None,
+            baseline_digest: None,
+            patch_digest: None,
+            target_dir: None,
+            summary: "Expand host write scope".into(),
             created_at_ms: 1_700_000_000_000,
         })
         .await;

@@ -293,6 +293,10 @@ fn run_store_and_approval_store_persist_across_reopen() {
                 run_id: "run-a".into(),
                 action_kind: "export_patch".into(),
                 candidate_digest: "sha256:abc".into(),
+                candidate_id: Some("cand-1".into()),
+                baseline_digest: Some("sha256:base".into()),
+                patch_digest: Some("sha256:patch".into()),
+                target_dir: None,
                 summary: "Export patch".into(),
                 created_at_ms: 1500,
             })

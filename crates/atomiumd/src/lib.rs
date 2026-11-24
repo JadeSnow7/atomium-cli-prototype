@@ -2,16 +2,17 @@ use anyhow::{anyhow, Result};
 use atomium_core::{
     decode_agy_oauth_for_file, default_agy_oauth_mode, encode_agy_oauth_for_keychain,
     is_process_alive, process_start_time, project_isolated_oauth_file, read_projected_oauth_file,
-    ApprovalStore, EncryptedVault, FileMasterKeyProvider, InMemoryKeychainAdapter, KeychainAdapter,
-    LeaseManager, LeaseMode, LeaseRequest, MasterKeyProvider, ProfileStore, RunStore,
-    AGY_KEYCHAIN_ACCOUNT, AGY_KEYCHAIN_SERVICE,
+    ApprovalStore, BrokerError, EncryptedVault, FileMasterKeyProvider, InMemoryKeychainAdapter,
+    KeychainAdapter, LeaseManager, LeaseMode, LeaseRequest, MasterKeyProvider, ProfileStore,
+    RunStore, WorkspaceBroker, AGY_KEYCHAIN_ACCOUNT, AGY_KEYCHAIN_SERVICE,
 };
 use atomium_gateway::{spawn_run_proxy_with_policy, EgressProxyHandle};
 use atomium_protocol::{
-    AccountCaptureRequest, AccountSummary, AccountSwitchRequest, ApprovalRequest, CredentialSpec,
-    EgressBinding, IdentityProfile, JsonRpcError, JsonRpcRequest, JsonRpcResponse, LocalePolicy,
-    OAuthStorageMode, ProfileState, RunCancelRequest, RunRecord, RunStartRequest, TaskEvent,
-    TaskEventPayload, TaskStatus,
+    AccountCaptureRequest, AccountSummary, AccountSwitchRequest, ApprovalCreateRequest,
+    ApprovalRequest, ApprovalResolveRequest, CandidateFreezeRequest, CandidateStatus,
+    CredentialSpec, EgressBinding, IdentityProfile, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
+    LocalePolicy, OAuthStorageMode, ProfileState, RunCancelRequest, RunRecord, RunStartRequest,
+    TaskEvent, TaskEventPayload, TaskStatus, WorkspaceImportRequest,
 };
 use atomium_runtime::{build_seatbelt_command_with_extra_read_paths, SeatbeltConfig};
 use base64::Engine;
@@ -80,6 +81,7 @@ struct ActiveRunControl {
     cancel_tx: watch::Sender<Option<String>>,
     egress_handle: Arc<Mutex<Option<EgressProxyHandle>>>,
     done_notify: Arc<Notify>,
+    workspace_dir: PathBuf,
 }
 
 pub struct DaemonState {
@@ -87,11 +89,13 @@ pub struct DaemonState {
     profiles: ProfileStore,
     runs: RunStore,
     approvals: ApprovalStore,
+    broker: WorkspaceBroker,
     vault: EncryptedVault,
     keychain: Arc<dyn KeychainAdapter>,
     runs_dir: PathBuf,
     event_tx: broadcast::Sender<TaskEvent>,
     active_runs: Mutex<HashMap<String, ActiveRunControl>>,
+    broker_lock: Mutex<()>,
 }
 
 impl DaemonState {
@@ -120,6 +124,15 @@ impl DaemonState {
         let profiles = ProfileStore::open(db_path)?;
         let runs = RunStore::open(db_path)?;
         let approvals = ApprovalStore::open(db_path)?;
+        let broker_dir = std::env::var("ATOMIUM_BROKER_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                db_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("broker")
+            });
+        let broker = WorkspaceBroker::open(db_path, &broker_dir)?;
         let vault = EncryptedVault::with_provider(vault_dir, master_key_provider)?;
 
         // 1. Terminate any orphaned run process groups left behind by a crashed daemon BEFORE
@@ -150,11 +163,13 @@ impl DaemonState {
             profiles,
             runs,
             approvals,
+            broker,
             vault,
             keychain,
             runs_dir: runs_dir.to_path_buf(),
             event_tx,
             active_runs: Mutex::new(HashMap::new()),
+            broker_lock: Mutex::new(()),
         })
     }
 
@@ -192,6 +207,10 @@ impl DaemonState {
 
     pub fn approvals(&self) -> &ApprovalStore {
         &self.approvals
+    }
+
+    pub fn broker(&self) -> &WorkspaceBroker {
+        &self.broker
     }
 
     pub fn vault(&self) -> &EncryptedVault {
@@ -587,6 +606,17 @@ pub async fn dispatch(
             data: None,
         }),
     };
+    let err_with_data =
+        |code: i32, message: String, data: Option<serde_json::Value>| JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: id.clone(),
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message,
+                data,
+            }),
+        };
 
     match req.method.as_str() {
         "daemon.ping" => (
@@ -709,45 +739,146 @@ pub async fn dispatch(
                 Err(e) => (err(-32000, e.to_string()), vec![]),
             }
         }
+        "workspaces.import" => {
+            match serde_json::from_value::<WorkspaceImportRequest>(req.params.clone()) {
+                Ok(import_req) => match state.broker.import_and_record(
+                    Path::new(&import_req.source_dir),
+                    import_req.workspace_id,
+                    import_req.limits,
+                ) {
+                    Ok(snap) => (
+                        ok(serde_json::to_value(&snap).unwrap_or(serde_json::Value::Null)),
+                        vec![],
+                    ),
+                    Err(e) => (err(e.rpc_code(), e.to_string()), vec![]),
+                },
+                Err(e) => (
+                    err(-32602, format!("invalid workspaces.import params: {e}")),
+                    vec![],
+                ),
+            }
+        }
+        "workspaces.list" => match state.broker.list_workspaces() {
+            Ok(list) => (ok(serde_json::json!({ "workspaces": list })), vec![]),
+            Err(e) => (err(e.rpc_code(), e.to_string()), vec![]),
+        },
+        "workspaces.get" => {
+            let Some(ws_id) = req.params.get("workspace_id").and_then(|v| v.as_str()) else {
+                return (err(-32602, "workspace_id is required".into()), vec![]);
+            };
+            match state.broker.get_workspace(ws_id) {
+                Ok(Some(snap)) => (
+                    ok(serde_json::to_value(&snap).unwrap_or(serde_json::Value::Null)),
+                    vec![],
+                ),
+                Ok(None) => (
+                    err(-32004, format!("workspace_id not found: {ws_id}")),
+                    vec![],
+                ),
+                Err(e) => (err(e.rpc_code(), e.to_string()), vec![]),
+            }
+        }
+        "candidates.freeze" => {
+            match serde_json::from_value::<CandidateFreezeRequest>(req.params.clone()) {
+                Ok(freeze_req) => match handle_candidates_freeze(state, freeze_req).await {
+                    Ok(cand) => (
+                        ok(serde_json::to_value(&cand).unwrap_or(serde_json::Value::Null)),
+                        vec![],
+                    ),
+                    Err((code, msg, data)) => (err_with_data(code, msg, data), vec![]),
+                },
+                Err(e) => (
+                    err(-32602, format!("invalid candidates.freeze params: {e}")),
+                    vec![],
+                ),
+            }
+        }
+        "candidates.list" => {
+            let ws_id = req.params.get("workspace_id").and_then(|v| v.as_str());
+            match state.broker.list_candidates(ws_id) {
+                Ok(list) => (ok(serde_json::json!({ "candidates": list })), vec![]),
+                Err(e) => (err(e.rpc_code(), e.to_string()), vec![]),
+            }
+        }
+        "candidates.get" => {
+            let candidate_id = req.params.get("candidate_id").and_then(|v| v.as_str());
+            let candidate_digest = req.params.get("candidate_digest").and_then(|v| v.as_str());
+            match (candidate_id, candidate_digest) {
+                (Some(cid), Some(digest)) => match state.broker.get_candidate(cid) {
+                    Ok(Some(snap)) if snap.candidate_digest == digest => (
+                        ok(serde_json::to_value(&snap).unwrap_or(serde_json::Value::Null)),
+                        vec![],
+                    ),
+                    Ok(Some(_)) => (
+                        err(
+                            -32001,
+                            format!("candidate {cid} does not match candidate_digest {digest}"),
+                        ),
+                        vec![],
+                    ),
+                    Ok(None) => (
+                        err(-32004, format!("candidate_id not found: {cid}")),
+                        vec![],
+                    ),
+                    Err(e) => (err(e.rpc_code(), e.to_string()), vec![]),
+                },
+                (Some(cid), None) => match state.broker.get_candidate(cid) {
+                    Ok(Some(snap)) => (
+                        ok(serde_json::to_value(&snap).unwrap_or(serde_json::Value::Null)),
+                        vec![],
+                    ),
+                    Ok(None) => (
+                        err(-32004, format!("candidate_id not found: {cid}")),
+                        vec![],
+                    ),
+                    Err(e) => (err(e.rpc_code(), e.to_string()), vec![]),
+                },
+                (None, Some(digest)) => match state.broker.get_candidate_by_digest(digest) {
+                    Ok(Some(snap)) => (
+                        ok(serde_json::to_value(&snap).unwrap_or(serde_json::Value::Null)),
+                        vec![],
+                    ),
+                    Ok(None) => (
+                        err(-32004, format!("candidate_digest not found: {digest}")),
+                        vec![],
+                    ),
+                    Err(e) => (err(e.rpc_code(), e.to_string()), vec![]),
+                },
+                (None, None) => (
+                    err(
+                        -32602,
+                        "candidate_id or candidate_digest is required".into(),
+                    ),
+                    vec![],
+                ),
+            }
+        }
+        "approvals.request" => {
+            match serde_json::from_value::<ApprovalCreateRequest>(req.params.clone()) {
+                Ok(create_req) => match handle_approvals_request(state, create_req).await {
+                    Ok(approval) => (
+                        ok(serde_json::to_value(&approval).unwrap_or(serde_json::Value::Null)),
+                        vec![],
+                    ),
+                    Err((code, msg, data)) => (err_with_data(code, msg, data), vec![]),
+                },
+                Err(e) => (
+                    err(-32602, format!("invalid approvals.request params: {e}")),
+                    vec![],
+                ),
+            }
+        }
         "approvals.list" => match state.approvals.list() {
             Ok(list) => (ok(serde_json::json!({ "approvals": list })), vec![]),
             Err(e) => (err(-32000, e.to_string()), vec![]),
         },
         "approvals.resolve" => {
-            let approval_id = req.params.get("approval_id").and_then(|v| v.as_str());
-            let candidate_digest = req.params.get("candidate_digest").and_then(|v| v.as_str());
-            let approved = req.params.get("approved").and_then(|v| v.as_bool());
-            match (approval_id, candidate_digest, approved) {
-                (Some(aid), Some(digest), Some(decision)) => match state.approvals.get(aid) {
-                    Ok(Some(pending)) if pending.candidate_digest == digest => {
-                        let run_id = pending.run_id.clone();
-                        if let Err(e) = state.approvals.remove(aid) {
-                            return (err(-32000, e.to_string()), vec![]);
-                        }
-                        let _ = state.emit_event(
-                            &run_id,
-                            &TaskEventPayload::ApprovalResolved {
-                                approval_id: aid.into(),
-                                approved: decision,
-                            },
-                        );
-                        (
-                            ok(serde_json::json!({
-                                "resolved": true,
-                                "approval_id": aid,
-                                "approved": decision
-                            })),
-                            vec![],
-                        )
-                    }
-                    Ok(Some(_)) => (
-                        err(-32001, "approval candidate_digest mismatch".into()),
-                        vec![],
-                    ),
-                    Ok(None) => (err(-32004, "approval_id not found".into()), vec![]),
-                    Err(e) => (err(-32000, e.to_string()), vec![]),
+            match serde_json::from_value::<ApprovalResolveRequest>(req.params.clone()) {
+                Ok(resolve_req) => match handle_approvals_resolve(state, resolve_req).await {
+                    Ok(res) => (ok(res), vec![]),
+                    Err((code, msg, data)) => (err_with_data(code, msg, data), vec![]),
                 },
-                _ => (
+                Err(_) => (
                     err(
                         -32602,
                         "approval_id, candidate_digest, and approved are required".into(),
@@ -1376,6 +1507,7 @@ async fn handle_runs_start(
                 cancel_tx,
                 egress_handle: egress_slot.clone(),
                 done_notify: done_notify.clone(),
+                workspace_dir: canon_ws.clone(),
             },
         );
     }
@@ -1739,17 +1871,408 @@ async fn handle_runs_cancel(
         let _ = cancel_tx.send(Some(reason));
         let _ = tokio::time::timeout(Duration::from_secs(5), notified).await;
 
+        invalidate_run_candidates_and_approvals(state, &req.run_id).await;
+
         state
             .runs
             .get(&req.run_id)
             .map_err(|e| (-32000, e.to_string()))?
             .ok_or_else(|| (-32004, format!("run_id not found: {}", req.run_id)))
     } else {
-        // Already finished or unknown run_id.
-        state
+        // Already finished or unknown run_id: still invalidate any pending candidates/approvals
+        // if this run exists so cancelling cannot leave stale approvals exportable.
+        let existing = state
             .runs
             .get(&req.run_id)
             .map_err(|e| (-32000, e.to_string()))?
-            .ok_or_else(|| (-32004, format!("run_id not found: {}", req.run_id)))
+            .ok_or_else(|| (-32004, format!("run_id not found: {}", req.run_id)))?;
+        invalidate_run_candidates_and_approvals(state, &req.run_id).await;
+        Ok(existing)
     }
+}
+
+async fn invalidate_run_candidates_and_approvals(state: &DaemonState, run_id: &str) {
+    let _guard = state.broker_lock.lock().await;
+    let invalidated_cands = state
+        .broker
+        .invalidate_run_candidates(run_id)
+        .unwrap_or_default();
+    if let Ok(removed_by_cands) = state.approvals.remove_by_candidate_ids(&invalidated_cands) {
+        for appr in removed_by_cands {
+            let _ = state.emit_event(
+                &appr.run_id,
+                &TaskEventPayload::ApprovalResolved {
+                    approval_id: appr.approval_id,
+                    approved: false,
+                },
+            );
+        }
+    }
+    if let Ok(removed_by_run) = state.approvals.remove_by_run_id(run_id) {
+        for appr in removed_by_run {
+            let _ = state.emit_event(
+                &appr.run_id,
+                &TaskEventPayload::ApprovalResolved {
+                    approval_id: appr.approval_id,
+                    approved: false,
+                },
+            );
+        }
+    }
+}
+
+type RpcErr = (i32, String, Option<serde_json::Value>);
+
+fn broker_err_to_rpc(err: BrokerError) -> RpcErr {
+    let code = err.rpc_code();
+    let msg = err.to_string();
+    let data = match &err {
+        BrokerError::BaselineConflict {
+            expected_baseline_digest,
+            actual_target_digest,
+            drifted_paths,
+            ..
+        } => Some(serde_json::json!({
+            "kind": "baseline_conflict",
+            "expected_baseline_digest": expected_baseline_digest,
+            "actual_target_digest": actual_target_digest,
+            "drifted_paths": drifted_paths,
+        })),
+        _ => None,
+    };
+    (code, msg, data)
+}
+
+async fn handle_candidates_freeze(
+    state: &Arc<DaemonState>,
+    req: CandidateFreezeRequest,
+) -> std::result::Result<atomium_protocol::CandidateSnapshot, RpcErr> {
+    let _broker_guard = state.broker_lock.lock().await;
+    let workspace = state
+        .broker
+        .get_workspace(&req.workspace_id)
+        .map_err(broker_err_to_rpc)?
+        .ok_or_else(|| {
+            (
+                -32004,
+                format!("workspace_id not found: {}", req.workspace_id),
+                None,
+            )
+        })?;
+
+    let target_working = match &req.run_workspace_dir {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(&workspace.working_dir),
+    };
+    let canon_working =
+        fs::canonicalize(&target_working).unwrap_or_else(|_| target_working.clone());
+
+    // Refuse to freeze while any active writer run is running on this run_id or overlapping workspace.
+    {
+        let active = state.active_runs.lock().await;
+        if let Some(rid) = &req.run_id {
+            if active.contains_key(rid) {
+                return Err((
+                    -32009,
+                    format!(
+                        "workspace_busy: run {rid} is still active; wait or cancel before freezing"
+                    ),
+                    None,
+                ));
+            }
+        }
+        for (active_run_id, ctrl) in active.iter() {
+            if ctrl.workspace_dir == canon_working
+                || ctrl.workspace_dir.starts_with(&canon_working)
+                || canon_working.starts_with(&ctrl.workspace_dir)
+            {
+                return Err((
+                    -32009,
+                    format!(
+                        "workspace_busy: active run {active_run_id} is still writing to workspace {}",
+                        canon_working.display()
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+
+    let (candidate, invalidated_ids) = state
+        .broker
+        .freeze_candidate(
+            &req.workspace_id,
+            req.run_workspace_dir.as_deref().map(Path::new),
+            req.run_id,
+            req.limits,
+        )
+        .map_err(broker_err_to_rpc)?;
+
+    // Invalidate any pending approvals bound to superseded candidates immediately.
+    if let Ok(removed) = state.approvals.remove_by_candidate_ids(&invalidated_ids) {
+        for appr in removed {
+            let _ = state.emit_event(
+                &appr.run_id,
+                &TaskEventPayload::ApprovalResolved {
+                    approval_id: appr.approval_id,
+                    approved: false,
+                },
+            );
+        }
+    }
+
+    Ok(candidate)
+}
+
+async fn handle_approvals_request(
+    state: &DaemonState,
+    req: ApprovalCreateRequest,
+) -> std::result::Result<ApprovalRequest, RpcErr> {
+    let _broker_guard = state.broker_lock.lock().await;
+    let candidate = state
+        .broker
+        .get_candidate(&req.candidate_id)
+        .map_err(broker_err_to_rpc)?
+        .ok_or_else(|| {
+            (
+                -32004,
+                format!("candidate_id not found: {}", req.candidate_id),
+                None,
+            )
+        })?;
+
+    if candidate.status != CandidateStatus::Frozen {
+        return Err((
+            -32011,
+            format!(
+                "candidate {} is not frozen (status={:?})",
+                candidate.candidate_id, candidate.status
+            ),
+            None,
+        ));
+    }
+
+    if candidate.candidate_digest != req.candidate_digest {
+        return Err((
+            -32001,
+            format!(
+                "candidate_digest mismatch: requested {}, stored {}",
+                req.candidate_digest, candidate.candidate_digest
+            ),
+            None,
+        ));
+    }
+
+    let workspace = state
+        .broker
+        .get_workspace(&candidate.workspace_id)
+        .map_err(broker_err_to_rpc)?
+        .ok_or_else(|| {
+            (
+                -32004,
+                format!("workspace_id not found: {}", candidate.workspace_id),
+                None,
+            )
+        })?;
+
+    let run_id = req
+        .run_id
+        .or_else(|| candidate.run_id.clone())
+        .unwrap_or_else(|| format!("ws-{}", candidate.workspace_id));
+
+    // If bound to a recorded run that was cancelled/interrupted/unverified, block approval creation.
+    if let Ok(Some(run_rec)) = state.runs.get(&run_id) {
+        let disallowed = matches!(
+            run_rec.status,
+            TaskStatus::Revoking
+                | TaskStatus::Stopping
+                | TaskStatus::Interrupted
+                | TaskStatus::CleanupUnverified
+                | TaskStatus::Blocked
+        ) || (run_rec.status == TaskStatus::Stopped
+            && run_rec.exit_code.is_none());
+        if disallowed {
+            return Err((
+                -32011,
+                format!(
+                    "run {run_id} is in non-exportable state {:?}; approval blocked",
+                    run_rec.status
+                ),
+                None,
+            ));
+        }
+    }
+
+    let action_kind = req.action_kind.unwrap_or_else(|| "export_patch".into());
+    let target_dir = match req.target_dir {
+        Some(requested_target) => {
+            let canon_req = fs::canonicalize(&requested_target).map_err(|_| {
+                (
+                    -32012,
+                    format!("target_dir does not exist: {requested_target}"),
+                    None,
+                )
+            })?;
+            let canon_src = fs::canonicalize(&workspace.source_dir)
+                .unwrap_or_else(|_| PathBuf::from(&workspace.source_dir));
+            if canon_req != canon_src {
+                return Err((
+                    -32012,
+                    format!(
+                        "broker_policy_violation: target_dir {} is outside imported workspace scope {}",
+                        canon_req.display(),
+                        canon_src.display()
+                    ),
+                    None,
+                ));
+            }
+            canon_req.to_string_lossy().into_owned()
+        }
+        None => workspace.source_dir.clone(),
+    };
+    let summary = req.summary.unwrap_or_else(|| {
+        format!(
+            "Export candidate {} (+{} ~{} -{}) to {}",
+            candidate.candidate_id,
+            candidate.diff.added_files,
+            candidate.diff.modified_files,
+            candidate.diff.deleted_files,
+            target_dir
+        )
+    });
+
+    let approval = ApprovalRequest {
+        approval_id: format!("appr-{}", uuid::Uuid::now_v7()),
+        run_id: run_id.clone(),
+        action_kind,
+        candidate_digest: candidate.candidate_digest.clone(),
+        candidate_id: Some(candidate.candidate_id.clone()),
+        baseline_digest: Some(candidate.baseline_digest.clone()),
+        patch_digest: Some(candidate.patch_digest.clone()),
+        target_dir: Some(target_dir),
+        summary,
+        created_at_ms: now_ms(),
+    };
+
+    state
+        .approvals
+        .insert(&approval)
+        .map_err(|e| (-32000, e.to_string(), None))?;
+
+    let _ = state.emit_event(
+        &run_id,
+        &TaskEventPayload::ApprovalRequested {
+            request: approval.clone(),
+        },
+    );
+
+    Ok(approval)
+}
+
+async fn handle_approvals_resolve(
+    state: &DaemonState,
+    req: ApprovalResolveRequest,
+) -> std::result::Result<serde_json::Value, RpcErr> {
+    let _broker_guard = state.broker_lock.lock().await;
+    let pending = state
+        .approvals
+        .get(&req.approval_id)
+        .map_err(|e| (-32000, e.to_string(), None))?
+        .ok_or_else(|| (-32004, "approval_id not found".into(), None))?;
+
+    if pending.candidate_digest != req.candidate_digest {
+        return Err((-32001, "approval candidate_digest mismatch".into(), None));
+    }
+    if let (Some(expected), Some(supplied)) = (&pending.baseline_digest, &req.baseline_digest) {
+        if expected != supplied {
+            return Err((-32001, "approval baseline_digest mismatch".into(), None));
+        }
+    }
+    if let (Some(expected), Some(supplied)) = (&pending.patch_digest, &req.patch_digest) {
+        if expected != supplied {
+            return Err((-32001, "approval patch_digest mismatch".into(), None));
+        }
+    }
+
+    if pending.action_kind == "export_patch" && req.approved {
+        let cid = pending.candidate_id.as_deref().ok_or_else(|| {
+            (
+                -32602,
+                "export_patch approval is missing candidate_id binding".into(),
+                None,
+            )
+        })?;
+        let candidate = state
+            .broker
+            .get_candidate(cid)
+            .map_err(broker_err_to_rpc)?
+            .ok_or_else(|| (-32004, format!("candidate_id not found: {cid}"), None))?;
+        let target_dir = match &pending.target_dir {
+            Some(dir) => PathBuf::from(dir),
+            None => {
+                let ws = state
+                    .broker
+                    .get_workspace(&candidate.workspace_id)
+                    .map_err(broker_err_to_rpc)?
+                    .ok_or_else(|| {
+                        (
+                            -32004,
+                            format!("workspace_id not found: {}", candidate.workspace_id),
+                            None,
+                        )
+                    })?;
+                PathBuf::from(ws.source_dir)
+            }
+        };
+
+        let export_result = state
+            .broker
+            .verify_and_export_candidate(
+                &pending.approval_id,
+                cid,
+                &pending.candidate_digest,
+                pending.baseline_digest.as_deref(),
+                pending.patch_digest.as_deref(),
+                &target_dir,
+            )
+            .map_err(broker_err_to_rpc)?;
+
+        state
+            .approvals
+            .remove(&pending.approval_id)
+            .map_err(|e| (-32000, e.to_string(), None))?;
+
+        let _ = state.emit_event(
+            &pending.run_id,
+            &TaskEventPayload::ApprovalResolved {
+                approval_id: pending.approval_id.clone(),
+                approved: true,
+            },
+        );
+
+        return Ok(serde_json::json!({
+            "resolved": true,
+            "approval_id": pending.approval_id,
+            "approved": true,
+            "export_result": export_result
+        }));
+    }
+
+    state
+        .approvals
+        .remove(&pending.approval_id)
+        .map_err(|e| (-32000, e.to_string(), None))?;
+    let _ = state.emit_event(
+        &pending.run_id,
+        &TaskEventPayload::ApprovalResolved {
+            approval_id: pending.approval_id.clone(),
+            approved: req.approved,
+        },
+    );
+
+    Ok(serde_json::json!({
+        "resolved": true,
+        "approval_id": pending.approval_id,
+        "approved": req.approved
+    }))
 }

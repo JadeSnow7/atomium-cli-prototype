@@ -1,8 +1,11 @@
 use atomium_protocol::{
-    AccountCaptureRequest, AccountSummary, AccountSwitchRequest, ApprovalRequest,
-    CapabilitiesReport, CredentialSpec, EgressBinding, IdentityProfile, JsonRpcError,
-    JsonRpcRequest, JsonRpcResponse, LocalePolicy, OAuthStorageMode, ProbeEvidence, ProfileState,
-    RunCancelRequest, RunRecord, RunStartRequest, TaskEvent, TaskEventPayload, TaskStatus,
+    AccountCaptureRequest, AccountSummary, AccountSwitchRequest, ApprovalCreateRequest,
+    ApprovalRequest, ApprovalResolveRequest, CandidateDiffSummary, CandidateFreezeRequest,
+    CandidateSnapshot, CandidateStatus, CapabilitiesReport, CredentialSpec, EgressBinding,
+    ExportResult, FileChangeKind, FileDiffEntry, IdentityProfile, JsonRpcError, JsonRpcRequest,
+    JsonRpcResponse, LocalePolicy, OAuthStorageMode, ProbeEvidence, ProfileState, RunCancelRequest,
+    RunRecord, RunStartRequest, SnapshotFileEntry, TaskEvent, TaskEventPayload, TaskStatus,
+    WorkspaceImportLimits, WorkspaceImportRequest, WorkspaceSnapshot,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -179,6 +182,10 @@ fn approval_request_and_task_event_all_payload_variants() {
         run_id: "run-42".into(),
         action_kind: "export_patch".into(),
         candidate_digest: "abc123".into(),
+        candidate_id: Some("cand-1".into()),
+        baseline_digest: Some("sha256:base".into()),
+        patch_digest: Some("sha256:patch".into()),
+        target_dir: Some("/tmp/repo".into()),
         summary: "Export patch to host repo".into(),
         created_at_ms: 1_700_000_000_000,
     };
@@ -425,4 +432,112 @@ fn run_and_account_rpc_types_roundtrip() {
     };
     let v_sum = assert_json_roundtrip(&summary);
     assert_eq!(v_sum["snapshot_version"], 2);
+}
+
+#[test]
+fn broker_and_approval_m3_types_roundtrip() {
+    let imp_req = WorkspaceImportRequest {
+        source_dir: "/tmp/repo".into(),
+        workspace_id: Some("ws-1".into()),
+        limits: Some(WorkspaceImportLimits::default()),
+    };
+    assert_json_roundtrip(&imp_req);
+
+    let ws = WorkspaceSnapshot {
+        workspace_id: "ws-1".into(),
+        source_dir: "/tmp/repo".into(),
+        baseline_dir: "/tmp/broker/ws-1/baseline".into(),
+        working_dir: "/tmp/broker/ws-1/working".into(),
+        baseline_digest: "sha256:base".into(),
+        file_count: 1,
+        total_bytes: 12,
+        excluded_count: 2,
+        files: vec![SnapshotFileEntry {
+            relative_path: "src/main.rs".into(),
+            size_bytes: 12,
+            executable: false,
+            sha256: "abc".into(),
+        }],
+        created_at_ms: 1000,
+    };
+    assert_json_roundtrip(&ws);
+
+    let freeze = CandidateFreezeRequest {
+        workspace_id: "ws-1".into(),
+        run_id: Some("run-1".into()),
+        run_workspace_dir: None,
+        limits: None,
+    };
+    assert_json_roundtrip(&freeze);
+
+    let cand = CandidateSnapshot {
+        candidate_id: "cand-1".into(),
+        workspace_id: "ws-1".into(),
+        run_id: Some("run-1".into()),
+        frozen_dir: "/tmp/broker/cand-1/snapshot".into(),
+        baseline_digest: "sha256:base".into(),
+        candidate_digest: "sha256:cand".into(),
+        patch_digest: "sha256:patch".into(),
+        status: CandidateStatus::Frozen,
+        file_count: 1,
+        total_bytes: 16,
+        files: ws.files.clone(),
+        diff: CandidateDiffSummary {
+            added_files: 0,
+            modified_files: 1,
+            deleted_files: 0,
+            patch_digest: "sha256:patch".into(),
+            unified_diff: "--- a/src/main.rs\n+++ b/src/main.rs\n".into(),
+            entries: vec![FileDiffEntry {
+                relative_path: "src/main.rs".into(),
+                kind: FileChangeKind::Modified,
+                baseline_sha256: Some("abc".into()),
+                candidate_sha256: Some("def".into()),
+                baseline_executable: Some(false),
+                candidate_executable: Some(false),
+                is_binary: false,
+                unified_diff: Some("@@ -1,1 +1,1 @@\n".into()),
+            }],
+        },
+        created_at_ms: 1001,
+    };
+    let v_cand = assert_json_roundtrip(&cand);
+    assert_eq!(v_cand["status"], "frozen");
+    assert_eq!(v_cand["diff"]["entries"][0]["kind"], "modified");
+
+    let create_appr = ApprovalCreateRequest {
+        candidate_id: "cand-1".into(),
+        candidate_digest: "sha256:cand".into(),
+        run_id: Some("run-1".into()),
+        action_kind: Some("export_patch".into()),
+        target_dir: Some("/tmp/repo".into()),
+        summary: Some("Export cand-1".into()),
+    };
+    assert_json_roundtrip(&create_appr);
+
+    let resolve_appr = ApprovalResolveRequest {
+        approval_id: "appr-1".into(),
+        candidate_digest: "sha256:cand".into(),
+        approved: true,
+        baseline_digest: Some("sha256:base".into()),
+        patch_digest: Some("sha256:patch".into()),
+    };
+    assert_json_roundtrip(&resolve_appr);
+
+    let export = ExportResult {
+        exported: true,
+        approval_id: "appr-1".into(),
+        candidate_id: "cand-1".into(),
+        workspace_id: "ws-1".into(),
+        target_dir: "/tmp/repo".into(),
+        baseline_digest: "sha256:base".into(),
+        candidate_digest: "sha256:cand".into(),
+        patch_digest: "sha256:patch".into(),
+        applied_added: 0,
+        applied_modified: 1,
+        applied_deleted: 0,
+        exported_at_ms: 1002,
+    };
+    let v_exp = assert_json_roundtrip(&export);
+    assert_eq!(v_exp["exported"], true);
 }

@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Result};
 use atomium_core::ProfileStore;
 use atomium_protocol::{
-    AccountCaptureRequest, AccountSwitchRequest, JsonRpcRequest, JsonRpcResponse, OAuthStorageMode,
-    RunCancelRequest, RunStartRequest, TaskEvent, TaskEventPayload, TaskStatus,
+    AccountCaptureRequest, AccountSwitchRequest, ApprovalCreateRequest, ApprovalResolveRequest,
+    CandidateFreezeRequest, JsonRpcRequest, JsonRpcResponse, OAuthStorageMode, RunCancelRequest,
+    RunStartRequest, TaskEvent, TaskEventPayload, TaskStatus, WorkspaceImportLimits,
+    WorkspaceImportRequest,
 };
 use atomium_runtime::{MacOsSeatbeltBackend, RuntimeBackend};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -56,6 +58,27 @@ enum Commands {
         socket: Option<PathBuf>,
         #[command(subcommand)]
         action: RunCommands,
+    },
+    /// Import and inspect brokered host workspaces via atomiumd Unix Socket JSON-RPC
+    Workspace {
+        #[arg(long, global = true)]
+        socket: Option<PathBuf>,
+        #[command(subcommand)]
+        action: WorkspaceCommands,
+    },
+    /// Freeze and inspect read-only candidate snapshots via atomiumd Unix Socket JSON-RPC
+    Candidate {
+        #[arg(long, global = true)]
+        socket: Option<PathBuf>,
+        #[command(subcommand)]
+        action: CandidateCommands,
+    },
+    /// Request, list, and resolve candidate export approvals via atomiumd Unix Socket JSON-RPC
+    Approval {
+        #[arg(long, global = true)]
+        socket: Option<PathBuf>,
+        #[command(subcommand)]
+        action: ApprovalCommands,
     },
 }
 
@@ -139,6 +162,84 @@ enum RunCommands {
         run_id: String,
         #[arg(long)]
         reason: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommands {
+    /// Import a host directory into the Workspace Broker and compute baseline_digest
+    Import {
+        source_dir: PathBuf,
+        #[arg(long)]
+        workspace_id: Option<String>,
+        #[arg(long)]
+        max_files: Option<u32>,
+        #[arg(long)]
+        max_total_bytes: Option<u64>,
+        #[arg(long)]
+        max_file_bytes: Option<u64>,
+    },
+    /// List imported workspace snapshots
+    List,
+    /// Show a single workspace snapshot by workspace_id
+    Get { workspace_id: String },
+}
+
+#[derive(Subcommand)]
+enum CandidateCommands {
+    /// Freeze a working copy into a read-only candidate snapshot with diff and patch_digest
+    Freeze {
+        workspace_id: String,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        workspace_dir: Option<PathBuf>,
+    },
+    /// List frozen candidate snapshots
+    List {
+        #[arg(long)]
+        workspace_id: Option<String>,
+    },
+    /// Show a candidate snapshot by candidate_id or --digest (for read-only review/build pickup)
+    Show {
+        candidate_id: Option<String>,
+        #[arg(long)]
+        digest: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalCommands {
+    /// Create a persistent export approval request bound to a frozen candidate_digest
+    Request {
+        #[arg(long)]
+        candidate_id: String,
+        #[arg(long)]
+        candidate_digest: String,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        action_kind: Option<String>,
+        #[arg(long)]
+        target_dir: Option<PathBuf>,
+        #[arg(long)]
+        summary: Option<String>,
+    },
+    /// List pending approvals
+    List,
+    /// Approve (triggers baseline check + atomic export) or reject a pending approval
+    Resolve {
+        approval_id: String,
+        #[arg(long)]
+        candidate_digest: String,
+        #[arg(long, conflicts_with = "reject")]
+        approve: bool,
+        #[arg(long, conflicts_with = "approve")]
+        reject: bool,
+        #[arg(long)]
+        baseline_digest: Option<String>,
+        #[arg(long)]
+        patch_digest: Option<String>,
     },
 }
 
@@ -459,6 +560,162 @@ async fn main() -> Result<()> {
                     let req = RunCancelRequest { run_id, reason };
                     let res = rpc_call_expect_ok(&sock, "runs.cancel", serde_json::to_value(req)?)
                         .await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+            }
+        }
+        Commands::Workspace { socket, action } => {
+            let sock = resolve_socket_path(socket);
+            match action {
+                WorkspaceCommands::Import {
+                    source_dir,
+                    workspace_id,
+                    max_files,
+                    max_total_bytes,
+                    max_file_bytes,
+                } => {
+                    let limits = if max_files.is_some()
+                        || max_total_bytes.is_some()
+                        || max_file_bytes.is_some()
+                    {
+                        let def = WorkspaceImportLimits::default();
+                        Some(WorkspaceImportLimits {
+                            max_files: max_files.unwrap_or(def.max_files),
+                            max_total_bytes: max_total_bytes.unwrap_or(def.max_total_bytes),
+                            max_file_bytes: max_file_bytes.unwrap_or(def.max_file_bytes),
+                        })
+                    } else {
+                        None
+                    };
+                    let req = WorkspaceImportRequest {
+                        source_dir: source_dir.to_string_lossy().into_owned(),
+                        workspace_id,
+                        limits,
+                    };
+                    let res =
+                        rpc_call_expect_ok(&sock, "workspaces.import", serde_json::to_value(req)?)
+                            .await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                WorkspaceCommands::List => {
+                    let res =
+                        rpc_call_expect_ok(&sock, "workspaces.list", serde_json::json!({})).await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                WorkspaceCommands::Get { workspace_id } => {
+                    let res = rpc_call_expect_ok(
+                        &sock,
+                        "workspaces.get",
+                        serde_json::json!({ "workspace_id": workspace_id }),
+                    )
+                    .await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+            }
+        }
+        Commands::Candidate { socket, action } => {
+            let sock = resolve_socket_path(socket);
+            match action {
+                CandidateCommands::Freeze {
+                    workspace_id,
+                    run_id,
+                    workspace_dir,
+                } => {
+                    let req = CandidateFreezeRequest {
+                        workspace_id,
+                        run_id,
+                        run_workspace_dir: workspace_dir.map(|p| p.to_string_lossy().into_owned()),
+                        limits: None,
+                    };
+                    let res =
+                        rpc_call_expect_ok(&sock, "candidates.freeze", serde_json::to_value(req)?)
+                            .await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                CandidateCommands::List { workspace_id } => {
+                    let params = match workspace_id {
+                        Some(ws) => serde_json::json!({ "workspace_id": ws }),
+                        None => serde_json::json!({}),
+                    };
+                    let res = rpc_call_expect_ok(&sock, "candidates.list", params).await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                CandidateCommands::Show {
+                    candidate_id,
+                    digest,
+                } => {
+                    if candidate_id.is_none() && digest.is_none() {
+                        return Err(anyhow!(
+                            "either <candidate_id> or --digest <candidate_digest> is required"
+                        ));
+                    }
+                    let mut params = serde_json::Map::new();
+                    if let Some(cid) = candidate_id {
+                        params.insert("candidate_id".into(), serde_json::Value::String(cid));
+                    }
+                    if let Some(d) = digest {
+                        params.insert("candidate_digest".into(), serde_json::Value::String(d));
+                    }
+                    let res = rpc_call_expect_ok(
+                        &sock,
+                        "candidates.get",
+                        serde_json::Value::Object(params),
+                    )
+                    .await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+            }
+        }
+        Commands::Approval { socket, action } => {
+            let sock = resolve_socket_path(socket);
+            match action {
+                ApprovalCommands::Request {
+                    candidate_id,
+                    candidate_digest,
+                    run_id,
+                    action_kind,
+                    target_dir,
+                    summary,
+                } => {
+                    let req = ApprovalCreateRequest {
+                        candidate_id,
+                        candidate_digest,
+                        run_id,
+                        action_kind,
+                        target_dir: target_dir.map(|p| p.to_string_lossy().into_owned()),
+                        summary,
+                    };
+                    let res =
+                        rpc_call_expect_ok(&sock, "approvals.request", serde_json::to_value(req)?)
+                            .await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                ApprovalCommands::List => {
+                    let res =
+                        rpc_call_expect_ok(&sock, "approvals.list", serde_json::json!({})).await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                ApprovalCommands::Resolve {
+                    approval_id,
+                    candidate_digest,
+                    approve,
+                    reject,
+                    baseline_digest,
+                    patch_digest,
+                } => {
+                    if !approve && !reject {
+                        return Err(anyhow!("specify either --approve or --reject"));
+                    }
+                    let req = ApprovalResolveRequest {
+                        approval_id,
+                        candidate_digest,
+                        approved: approve,
+                        baseline_digest,
+                        patch_digest,
+                    };
+                    let res =
+                        rpc_call_expect_ok(&sock, "approvals.resolve", serde_json::to_value(req)?)
+                            .await?;
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
             }

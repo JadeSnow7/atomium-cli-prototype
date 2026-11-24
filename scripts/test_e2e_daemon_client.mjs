@@ -356,6 +356,108 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
       "AtomiumClient must receive real-time Completed push from atomiumd",
     );
     assert.ok(client.cursor >= receivedEvents.length, "client cursor must advance on live pushes");
+
+    // 8. M3 Host Workspace Broker + Dual-Role Snapshot Review + Approval Export + Baseline Conflict
+    const hostRepo = path.join(tmpDir, "host-repo");
+    await fs.mkdir(path.join(hostRepo, "src"), { recursive: true });
+    await fs.writeFile(path.join(hostRepo, "src", "app.txt"), "baseline-v1\n", "utf8");
+    await fs.writeFile(path.join(hostRepo, ".env"), "SECRET=exclude-me\n", "utf8");
+
+    const ws = await client.importWorkspace({
+      source_dir: hostRepo,
+      workspace_id: "e2e-ws-1",
+      limits: null,
+    });
+    assert.equal(ws.workspace_id, "e2e-ws-1");
+    assert.equal(ws.file_count, 1);
+    assert.equal(ws.excluded_count, 1);
+
+    // Simulate implementer editing working copy
+    await fs.writeFile(path.join(ws.working_dir, "src", "app.txt"), "candidate-v2\n", "utf8");
+    await fs.writeFile(path.join(ws.working_dir, "added.txt"), "new-file\n", "utf8");
+
+    const cand = await client.freezeCandidate({
+      workspace_id: "e2e-ws-1",
+      run_id: startedRun.run_id,
+      run_workspace_dir: null,
+      limits: null,
+    });
+    assert.equal(cand.status, "frozen");
+    assert.equal(cand.diff.added_files, 1);
+    assert.equal(cand.diff.modified_files, 1);
+
+    // Reviewer reads the exact same candidate by candidate_digest via atomium-cli
+    const cliCandShow = await execFileAsync(
+      ATOMIUM_CLI_BIN,
+      ["candidate", "--socket", sockPath, "show", "--digest", cand.candidate_digest],
+      { cwd: ROOT_DIR },
+    );
+    const cliCand = JSON.parse(cliCandShow.stdout.trim());
+    assert.equal(cliCand.candidate_id, cand.candidate_id);
+    assert.equal(cliCand.patch_digest, cand.patch_digest);
+
+    // Request approval -> must broadcast real-time approval_requested event
+    const appr = await client.requestApproval({
+      candidate_id: cand.candidate_id,
+      candidate_digest: cand.candidate_digest,
+      run_id: startedRun.run_id,
+      action_kind: "export_patch",
+      target_dir: null,
+      summary: null,
+    });
+    assert.equal(appr.action_kind, "export_patch");
+
+    const apprDeadline = Date.now() + 5000;
+    while (Date.now() < apprDeadline) {
+      if (
+        receivedEvents.some(
+          (ev) =>
+            ev.payload?.type === "approval_requested" &&
+            ev.payload?.request?.approval_id === appr.approval_id,
+        )
+      ) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    assert.ok(
+      receivedEvents.some(
+        (ev) =>
+          ev.payload?.type === "approval_requested" &&
+          ev.payload?.request?.approval_id === appr.approval_id,
+      ),
+      "AtomiumClient must receive real-time ApprovalRequested push",
+    );
+
+    // Concurrent host edit -> resolveApproval MUST reject with baseline_conflict (-32010) and zero partial writes
+    await fs.writeFile(path.join(hostRepo, "src", "app.txt"), "host-concurrent-edit\n", "utf8");
+    await assert.rejects(
+      () =>
+        client.resolveApproval({
+          approval_id: appr.approval_id,
+          candidate_digest: cand.candidate_digest,
+          approved: true,
+          baseline_digest: cand.baseline_digest,
+          patch_digest: cand.patch_digest,
+        }),
+      (err) => err instanceof Error && err.message.includes("[-32010]") && err.message.includes("baseline_conflict"),
+    );
+    assert.equal(await fileExists(path.join(hostRepo, "added.txt")), false);
+
+    // Restore host baseline -> resolveApproval succeeds and atomically exports changes
+    await fs.writeFile(path.join(hostRepo, "src", "app.txt"), "baseline-v1\n", "utf8");
+    const exportRes = await client.resolveApproval({
+      approval_id: appr.approval_id,
+      candidate_digest: cand.candidate_digest,
+      approved: true,
+      baseline_digest: cand.baseline_digest,
+      patch_digest: cand.patch_digest,
+    });
+    assert.equal(exportRes.resolved, true);
+    assert.equal(exportRes.export_result.exported, true);
+    assert.equal(await fs.readFile(path.join(hostRepo, "src", "app.txt"), "utf8"), "candidate-v2\n");
+    assert.equal(await fs.readFile(path.join(hostRepo, "added.txt"), "utf8"), "new-file\n");
+    assert.equal(await fs.readFile(path.join(hostRepo, ".env"), "utf8"), "SECRET=exclude-me\n");
   } finally {
     if (client) {
       client.disconnect();

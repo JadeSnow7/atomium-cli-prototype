@@ -330,4 +330,52 @@ impl ApprovalStore {
         )?;
         Ok(deleted > 0)
     }
+
+    /// Remove all pending approvals whose `run_id` matches (used when a run is cancelled).
+    pub fn remove_by_run_id(&self, run_id: &str) -> Result<Vec<ApprovalRequest>> {
+        let matching: Vec<ApprovalRequest> = self
+            .list()?
+            .into_iter()
+            .filter(|a| a.run_id == run_id)
+            .collect();
+        if !matching.is_empty() {
+            let conn = Connection::open(&self.db_path)?;
+            conn.pragma_update(None, "busy_timeout", 5000)?;
+            conn.execute(
+                "DELETE FROM pending_approvals WHERE run_id = ?1",
+                params![run_id],
+            )?;
+        }
+        Ok(matching)
+    }
+
+    /// Remove all pending approvals whose `candidate_id` matches any id in `candidate_ids`.
+    pub fn remove_by_candidate_ids(
+        &self,
+        candidate_ids: &[String],
+    ) -> Result<Vec<ApprovalRequest>> {
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let matching: Vec<ApprovalRequest> = self
+            .list()?
+            .into_iter()
+            .filter(|a| {
+                a.candidate_id
+                    .as_ref()
+                    .is_some_and(|cid| candidate_ids.iter().any(|target| target == cid))
+            })
+            .collect();
+        if !matching.is_empty() {
+            let conn = Connection::open(&self.db_path)?;
+            conn.pragma_update(None, "busy_timeout", 5000)?;
+            for item in &matching {
+                conn.execute(
+                    "DELETE FROM pending_approvals WHERE approval_id = ?1",
+                    params![&item.approval_id],
+                )?;
+            }
+        }
+        Ok(matching)
+    }
 }

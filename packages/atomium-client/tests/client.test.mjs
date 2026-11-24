@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { AtomiumClient } = require('../.test-dist/index.js');
+const { AtomiumClient, AtomiumRpcError } = require('../.test-dist/index.js');
 
 function createMockTransport({ sendImpl } = {}) {
   const msgHandlers = new Set();
@@ -197,4 +197,114 @@ test('ignores responses for unknown request IDs and disconnect delegates to tran
 
   client.disconnect();
   assert.equal(transport.disconnectCalls, 1);
+});
+
+test('typed RPC helpers send expected methods, unwrap envelopes, and handle BigInt params', async () => {
+  const transport = createMockTransport({
+    async sendImpl(raw) {
+      const req = JSON.parse(raw);
+      const reply = (result) =>
+        queueMicrotask(() => transport.emitMessage({ jsonrpc: '2.0', id: req.id, result }));
+      switch (req.method) {
+        case 'daemon.ping':
+          return reply({ ok: true, service: 'atomiumd', version: '0.2.0', transport: 'unix-socket-0600' });
+        case 'accounts.list':
+          return reply({ accounts: [{ profile_id: 'acct_a', state: 'active' }] });
+        case 'accounts.switch':
+          return reply({ switched: true, profile_id: req.params.profile_id, mode: 'isolated_file', previous_profile_id: null, previous_writeback: false });
+        case 'runs.list':
+          return reply({ runs: [{ run_id: 'run-1', status: 'running' }] });
+        case 'runs.start':
+          return reply({ run_id: 'run-2', profile_id: req.params.profile_id, status: 'running' });
+        case 'runs.cancel':
+          return reply({ run_id: req.params.run_id, status: 'stopped', cleanup_verified: true });
+        case 'workspaces.import':
+          return reply({ workspace_id: 'ws-1', baseline_digest: 'sha256:base' });
+        case 'workspaces.list':
+          return reply({ workspaces: [{ workspace_id: 'ws-1' }] });
+        case 'candidates.freeze':
+          return reply({ candidate_id: 'cand-1', candidate_digest: 'sha256:cand' });
+        case 'candidates.list':
+          return reply({ candidates: [{ candidate_id: 'cand-1', status: 'frozen' }] });
+        case 'candidates.get':
+          return reply({ candidate_id: 'cand-1', candidate_digest: req.params.candidate_digest });
+        case 'approvals.request':
+          return reply({ approval_id: 'appr-1', candidate_digest: req.params.candidate_digest });
+        case 'approvals.list':
+          return reply({ approvals: [{ approval_id: 'appr-1' }] });
+        case 'approvals.resolve':
+          return reply({ resolved: true, approval_id: req.params.approval_id, approved: req.params.approved });
+        default:
+          throw new Error(`Unexpected method ${req.method}`);
+      }
+    },
+  });
+
+  const client = new AtomiumClient(transport);
+  assert.equal((await client.ping()).service, 'atomiumd');
+  assert.equal((await client.listAccounts()).length, 1);
+  assert.equal((await client.switchAccount('acct_a')).switched, true);
+  assert.equal((await client.listRuns()).length, 1);
+  // BigInt timeout_ms must serialize cleanly without throwing
+  const started = await client.startRun({
+    profile_id: 'acct_a',
+    program: '/bin/echo',
+    args: ['hi'],
+    env: {},
+    workspace_dir: null,
+    upstream_proxy_addr: null,
+    allowed_egress_hosts: [],
+    use_seatbelt: false,
+    timeout_ms: 5000n,
+  });
+  assert.equal(started.run_id, 'run-2');
+  assert.equal((await client.cancelRun('run-2', 'test')).status, 'stopped');
+  assert.equal((await client.importWorkspace({ source_dir: '/tmp/repo', workspace_id: null, limits: { max_files: 10, max_total_bytes: 1024n, max_file_bytes: 512n } })).workspace_id, 'ws-1');
+  assert.equal((await client.listWorkspaces()).length, 1);
+  assert.equal((await client.freezeCandidate({ workspace_id: 'ws-1', run_id: null, run_workspace_dir: null, limits: null })).candidate_id, 'cand-1');
+  assert.equal((await client.listCandidates('ws-1')).length, 1);
+  assert.equal((await client.getCandidate({ candidate_digest: 'sha256:cand' })).candidate_id, 'cand-1');
+  assert.equal((await client.requestApproval({ candidate_id: 'cand-1', candidate_digest: 'sha256:cand', run_id: null, action_kind: null, target_dir: null, summary: null })).approval_id, 'appr-1');
+  assert.equal((await client.listApprovals()).length, 1);
+  assert.equal((await client.resolveApproval({ approval_id: 'appr-1', candidate_digest: 'sha256:cand', approved: true, baseline_digest: null, patch_digest: null })).resolved, true);
+});
+
+test('AtomiumRpcError exposes baseline_conflict structured data', async () => {
+  const transport = createMockTransport();
+  const client = new AtomiumClient(transport);
+
+  const p = client.resolveApproval({
+    approval_id: 'appr-conflict',
+    candidate_digest: 'sha256:cand',
+    approved: true,
+    baseline_digest: 'sha256:base',
+    patch_digest: 'sha256:patch',
+  });
+  transport.emitMessage({
+    jsonrpc: '2.0',
+    id: 1,
+    error: {
+      code: -32010,
+      message: 'baseline_conflict: target directory drifted',
+      data: {
+        kind: 'baseline_conflict',
+        expected_baseline_digest: 'sha256:base',
+        actual_target_digest: 'sha256:other',
+        drifted_paths: ['src/main.rs'],
+      },
+    },
+  });
+
+  await assert.rejects(p, (err) => {
+    assert.ok(err instanceof AtomiumRpcError);
+    assert.equal(err.code, -32010);
+    assert.equal(err.isBaselineConflict(), true);
+    assert.deepEqual(err.asBaselineConflict(), {
+      kind: 'baseline_conflict',
+      expected_baseline_digest: 'sha256:base',
+      actual_target_digest: 'sha256:other',
+      drifted_paths: ['src/main.rs'],
+    });
+    return true;
+  });
 });

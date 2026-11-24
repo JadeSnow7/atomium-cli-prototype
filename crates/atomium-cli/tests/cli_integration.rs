@@ -78,7 +78,17 @@ fn help_lists_subcommands() {
         .expect("run atomium-cli --help");
     assert!(out.status.success(), "expected --help exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for cmd in ["doctor", "probe", "daemon", "profile", "account", "run"] {
+    for cmd in [
+        "doctor",
+        "probe",
+        "daemon",
+        "profile",
+        "account",
+        "run",
+        "workspace",
+        "candidate",
+        "approval",
+    ] {
         assert!(
             stdout.contains(cmd),
             "expected --help output to mention '{cmd}', got:\n{stdout}"
@@ -451,6 +461,202 @@ async fn account_and_run_subcommands_end_to_end_via_daemon_socket() {
     .unwrap();
     assert_eq!(cancelled["status"], json!("stopped"));
     assert_eq!(cancelled["cleanup_verified"], json!(true));
+
+    daemon_task.abort();
+}
+
+#[tokio::test]
+async fn workspace_candidate_and_approval_cli_subcommands_end_to_end() {
+    let dir = TempDirGuard::new("acli-broker");
+    let sock_path = dir.path().join("d.sock");
+    let db_path = dir.path().join("d.sqlite");
+    let host_repo = dir.path().join("host-repo");
+    std::fs::create_dir_all(&host_repo).unwrap();
+    std::fs::write(host_repo.join("hello.txt"), b"v1\n").unwrap();
+
+    let state =
+        std::sync::Arc::new(atomiumd::DaemonState::open(&db_path).expect("open daemon state"));
+    let listener = atomiumd::bind_socket(&sock_path).expect("bind daemon socket");
+    let daemon_task = tokio::spawn(async move {
+        let _ = atomiumd::serve_listener(listener, state).await;
+    });
+
+    let run_cli = |args: Vec<String>| {
+        let out = Command::new(cli_bin())
+            .args(&args)
+            .output()
+            .expect("exec atomium-cli");
+        assert!(
+            out.status.success(),
+            "atomium-cli {:?} failed: stderr={}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .expect("parse atomium-cli JSON stdout")
+    };
+
+    let sock_str = sock_path.to_string_lossy().into_owned();
+    let repo_str = host_repo.to_string_lossy().into_owned();
+
+    // 1. workspace import
+    let ws = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        let repo_str = repo_str.clone();
+        move || {
+            run_cli(vec![
+                "workspace".into(),
+                "--socket".into(),
+                sock_str,
+                "import".into(),
+                repo_str,
+                "--workspace-id".into(),
+                "cli-ws-1".into(),
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ws["workspace_id"], json!("cli-ws-1"));
+    let working_dir = ws["working_dir"].as_str().unwrap().to_string();
+
+    // 2. workspace list
+    let ws_list = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        move || {
+            run_cli(vec![
+                "workspace".into(),
+                "--socket".into(),
+                sock_str,
+                "list".into(),
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ws_list["workspaces"].as_array().unwrap().len(), 1);
+
+    // Edit working copy and freeze candidate
+    std::fs::write(Path::new(&working_dir).join("hello.txt"), b"v2-from-cli\n").unwrap();
+
+    // 3. candidate freeze
+    let cand = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        move || {
+            run_cli(vec![
+                "candidate".into(),
+                "--socket".into(),
+                sock_str,
+                "freeze".into(),
+                "cli-ws-1".into(),
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    let cand_id = cand["candidate_id"].as_str().unwrap().to_string();
+    let cand_digest = cand["candidate_digest"].as_str().unwrap().to_string();
+    assert_eq!(cand["diff"]["modified_files"], json!(1));
+
+    // 4. candidate list & candidate show --digest
+    let cand_list = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        move || {
+            run_cli(vec![
+                "candidate".into(),
+                "--socket".into(),
+                sock_str,
+                "list".into(),
+                "--workspace-id".into(),
+                "cli-ws-1".into(),
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(cand_list["candidates"].as_array().unwrap().len(), 1);
+
+    let shown = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        let cand_digest = cand_digest.clone();
+        move || {
+            run_cli(vec![
+                "candidate".into(),
+                "--socket".into(),
+                sock_str,
+                "show".into(),
+                "--digest".into(),
+                cand_digest,
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(shown["candidate_id"], json!(cand_id));
+
+    // 5. approval request & approval list
+    let appr = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        let cand_id = cand_id.clone();
+        let cand_digest = cand_digest.clone();
+        move || {
+            run_cli(vec![
+                "approval".into(),
+                "--socket".into(),
+                sock_str,
+                "request".into(),
+                "--candidate-id".into(),
+                cand_id,
+                "--candidate-digest".into(),
+                cand_digest,
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    let appr_id = appr["approval_id"].as_str().unwrap().to_string();
+
+    let appr_list = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        move || {
+            run_cli(vec![
+                "approval".into(),
+                "--socket".into(),
+                sock_str,
+                "list".into(),
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(appr_list["approvals"].as_array().unwrap().len(), 1);
+
+    // 6. approval resolve --approve -> atomically exports to host_repo
+    let resolved = tokio::task::spawn_blocking({
+        let sock_str = sock_str.clone();
+        let appr_id = appr_id.clone();
+        let cand_digest = cand_digest.clone();
+        move || {
+            run_cli(vec![
+                "approval".into(),
+                "--socket".into(),
+                sock_str,
+                "resolve".into(),
+                appr_id,
+                "--candidate-digest".into(),
+                cand_digest,
+                "--approve".into(),
+            ])
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(resolved["resolved"], json!(true));
+    assert_eq!(resolved["export_result"]["exported"], json!(true));
+    assert_eq!(
+        std::fs::read_to_string(host_repo.join("hello.txt")).unwrap(),
+        "v2-from-cli\n"
+    );
 
     daemon_task.abort();
 }
