@@ -1,3 +1,4 @@
+use crate::keychain::MasterKeyProvider;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -33,6 +34,14 @@ impl EncryptedVault {
             root_dir,
             master_key,
         })
+    }
+
+    pub fn with_provider(
+        root_dir: impl AsRef<Path>,
+        provider: &dyn MasterKeyProvider,
+    ) -> Result<Self> {
+        let master_key = provider.load_or_create_master_key()?;
+        Self::new(root_dir, master_key)
     }
 
     pub fn digest_hex(bytes: &[u8]) -> String {

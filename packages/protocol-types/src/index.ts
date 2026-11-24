@@ -1,5 +1,8 @@
 // Auto-exported protocol bindings from crates/atomium-protocol (ts-rs).
 // Do not hand-edit files under ./generated/.
+export type { AccountCaptureRequest } from "./generated/AccountCaptureRequest";
+export type { AccountSummary } from "./generated/AccountSummary";
+export type { AccountSwitchRequest } from "./generated/AccountSwitchRequest";
 export type { ApprovalRequest } from "./generated/ApprovalRequest";
 export type { CapabilitiesReport } from "./generated/CapabilitiesReport";
 export type { CredentialSpec } from "./generated/CredentialSpec";
@@ -12,6 +15,9 @@ export type { LocalePolicy } from "./generated/LocalePolicy";
 export type { OAuthStorageMode } from "./generated/OAuthStorageMode";
 export type { ProbeEvidence } from "./generated/ProbeEvidence";
 export type { ProfileState } from "./generated/ProfileState";
+export type { RunCancelRequest } from "./generated/RunCancelRequest";
+export type { RunRecord } from "./generated/RunRecord";
+export type { RunStartRequest } from "./generated/RunStartRequest";
 export type { TaskEvent } from "./generated/TaskEvent";
 export type { TaskEventPayload } from "./generated/TaskEventPayload";
 export type { TaskStatus } from "./generated/TaskStatus";

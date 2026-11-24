@@ -4,7 +4,10 @@ pub mod macos_seatbelt;
 
 pub use backend::RuntimeBackend;
 pub use linux_stub::LinuxContainerStubBackend;
-pub use macos_seatbelt::{render_sbpl, run_in_seatbelt, MacOsSeatbeltBackend, SeatbeltConfig};
+pub use macos_seatbelt::{
+    build_seatbelt_command, build_seatbelt_command_with_extra_read_paths, render_sbpl,
+    render_sbpl_with_extra_read_paths, run_in_seatbelt, MacOsSeatbeltBackend, SeatbeltConfig,
+};
 
 #[cfg(test)]
 mod tests {

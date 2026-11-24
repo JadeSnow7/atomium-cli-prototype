@@ -1,6 +1,9 @@
 pub mod egress;
 
-pub use egress::{spawn_run_proxy, EgressProxyHandle};
+pub use egress::{
+    extract_destination_host, host_matches_allowlist, spawn_run_proxy, spawn_run_proxy_with_policy,
+    EgressProxyHandle,
+};
 
 #[cfg(test)]
 mod tests {

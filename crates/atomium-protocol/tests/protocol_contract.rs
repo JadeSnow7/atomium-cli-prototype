@@ -1,9 +1,11 @@
 use atomium_protocol::{
-    ApprovalRequest, CapabilitiesReport, CredentialSpec, EgressBinding, IdentityProfile,
-    JsonRpcError, JsonRpcRequest, JsonRpcResponse, LocalePolicy, OAuthStorageMode, ProbeEvidence,
-    ProfileState, TaskEvent, TaskEventPayload, TaskStatus,
+    AccountCaptureRequest, AccountSummary, AccountSwitchRequest, ApprovalRequest,
+    CapabilitiesReport, CredentialSpec, EgressBinding, IdentityProfile, JsonRpcError,
+    JsonRpcRequest, JsonRpcResponse, LocalePolicy, OAuthStorageMode, ProbeEvidence, ProfileState,
+    RunCancelRequest, RunRecord, RunStartRequest, TaskEvent, TaskEventPayload, TaskStatus,
 };
 use serde_json::json;
+use std::collections::HashMap;
 
 fn assert_json_roundtrip<T>(value: &T) -> serde_json::Value
 where
@@ -341,4 +343,86 @@ fn capabilities_report_and_probe_evidence_roundtrip() {
     };
     let v_ev_none = assert_json_roundtrip(&ev_none);
     assert!(v_ev_none["exit_code"].is_null());
+}
+
+#[test]
+fn run_and_account_rpc_types_roundtrip() {
+    let rec = RunRecord {
+        run_id: "run-123".into(),
+        profile_id: "acct_a".into(),
+        agent_kind: "antigravity".into(),
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "echo ok".into()],
+        status: TaskStatus::Completed,
+        exit_code: Some(0),
+        proxy_port: Some(43210),
+        cleanup_verified: true,
+        token_refreshed: true,
+        snapshot_version: Some(2),
+        reason: None,
+        created_at_ms: 1_700_000_000_000,
+        updated_at_ms: 1_700_000_001_000,
+    };
+    let v_rec = assert_json_roundtrip(&rec);
+    assert_eq!(v_rec["status"], "completed");
+    assert_eq!(v_rec["token_refreshed"], true);
+
+    let start = RunStartRequest {
+        profile_id: "acct_a".into(),
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "true".into()],
+        env: HashMap::from([("FOO".into(), "bar".into())]),
+        workspace_dir: None,
+        upstream_proxy_addr: Some("127.0.0.1:7890".into()),
+        allowed_egress_hosts: vec!["*.googleapis.com".into()],
+        use_seatbelt: Some(false),
+        timeout_ms: Some(5000),
+    };
+    let v_start = assert_json_roundtrip(&start);
+    assert_eq!(v_start["allowed_egress_hosts"][0], "*.googleapis.com");
+
+    let cancel = RunCancelRequest {
+        run_id: "run-123".into(),
+        reason: Some("user_abort".into()),
+    };
+    assert_json_roundtrip(&cancel);
+
+    let capture = AccountCaptureRequest {
+        profile_id: "acct_a".into(),
+        display_name: "Account A".into(),
+        agent_kind: Some("antigravity".into()),
+        storage_mode: Some(OAuthStorageMode::IsolatedFile {
+            relative_home_path: ".gemini/antigravity-cli/antigravity-oauth-token".into(),
+        }),
+        raw_secret_b64: None,
+        source_file_path: Some("/tmp/oauth.json".into()),
+        proxy_id: Some("proxy-us-1".into()),
+        expected_country: Some("US".into()),
+        expected_region: None,
+        timezone: Some("UTC".into()),
+        lang: Some("en_US.UTF-8".into()),
+    };
+    assert_json_roundtrip(&capture);
+
+    let switch = AccountSwitchRequest {
+        profile_id: "acct_b".into(),
+    };
+    assert_json_roundtrip(&switch);
+
+    let summary = AccountSummary {
+        profile_id: "acct_a".into(),
+        display_name: "Account A".into(),
+        agent_kind: "antigravity".into(),
+        state: ProfileState::Active,
+        storage_mode: Some(OAuthStorageMode::IsolatedFile {
+            relative_home_path: ".gemini/antigravity-cli/antigravity-oauth-token".into(),
+        }),
+        snapshot_version: Some(2),
+        content_digest: Some("deadbeef".into()),
+        proxy_id: "proxy-us-1".into(),
+        active_host_slot: false,
+        active_leases: vec![],
+    };
+    let v_sum = assert_json_roundtrip(&summary);
+    assert_eq!(v_sum["snapshot_version"], 2);
 }

@@ -1,15 +1,29 @@
+pub mod keychain;
 pub mod lease;
 pub mod oauth_codec;
 pub mod profile;
+pub mod store;
 pub mod vault;
 
-pub use lease::{LeaseManager, LeaseMode, LeaseRequest};
+pub use keychain::{
+    decode_master_key_bytes, format_security_batch_write_cmd, validate_keychain_label,
+    FileMasterKeyProvider, InMemoryKeychainAdapter, InMemoryMasterKeyProvider, KeychainAdapter,
+    KeychainMasterKeyProvider, MasterKeyProvider, AGY_KEYCHAIN_ACCOUNT, AGY_KEYCHAIN_SERVICE,
+    VAULT_KEYCHAIN_ACCOUNT, VAULT_KEYCHAIN_SERVICE,
+};
+#[cfg(target_os = "macos")]
+pub use keychain::{macos_keychain_master_key_provider, MacOsKeychainAdapter};
+pub use lease::{
+    is_process_alive, oauth_profile_id_from_resource_key, process_start_time, ActiveLease,
+    LeaseManager, LeaseMode, LeaseRequest, ReclaimedLease,
+};
 pub use oauth_codec::{
     decode_agy_oauth_for_file, default_agy_oauth_mode, encode_agy_oauth_for_keychain,
     project_isolated_oauth_file, read_projected_oauth_file, AGY_DEFAULT_RELATIVE_PATH,
     GO_KEYRING_B64_PREFIX,
 };
 pub use profile::ProfileStore;
+pub use store::{ApprovalStore, IncompleteRun, RunStore};
 pub use vault::EncryptedVault;
 
 #[cfg(test)]

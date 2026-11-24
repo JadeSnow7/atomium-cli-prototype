@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use ts_rs::TS;
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -61,7 +62,7 @@ pub struct LocalePolicy {
     pub auto_align_with_proxy: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum ProfileState {
@@ -71,7 +72,7 @@ pub enum ProfileState {
     Disabled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum TaskStatus {
@@ -131,6 +132,86 @@ pub enum TaskEventPayload {
         approval_id: String,
         approved: bool,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RunRecord {
+    pub run_id: String,
+    pub profile_id: String,
+    pub agent_kind: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub status: TaskStatus,
+    pub exit_code: Option<i32>,
+    pub proxy_port: Option<u16>,
+    pub cleanup_verified: bool,
+    pub token_refreshed: bool,
+    pub snapshot_version: Option<i64>,
+    pub reason: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RunStartRequest {
+    pub profile_id: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub workspace_dir: Option<String>,
+    pub upstream_proxy_addr: Option<String>,
+    #[serde(default)]
+    pub allowed_egress_hosts: Vec<String>,
+    pub use_seatbelt: Option<bool>,
+    pub timeout_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RunCancelRequest {
+    pub run_id: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AccountCaptureRequest {
+    pub profile_id: String,
+    pub display_name: String,
+    pub agent_kind: Option<String>,
+    pub storage_mode: Option<OAuthStorageMode>,
+    pub raw_secret_b64: Option<String>,
+    pub source_file_path: Option<String>,
+    pub proxy_id: Option<String>,
+    pub expected_country: Option<String>,
+    pub expected_region: Option<String>,
+    pub timezone: Option<String>,
+    pub lang: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AccountSwitchRequest {
+    pub profile_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AccountSummary {
+    pub profile_id: String,
+    pub display_name: String,
+    pub agent_kind: String,
+    pub state: ProfileState,
+    pub storage_mode: Option<OAuthStorageMode>,
+    pub snapshot_version: Option<i64>,
+    pub content_digest: Option<String>,
+    pub proxy_id: String,
+    pub active_host_slot: bool,
+    pub active_leases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -204,6 +285,12 @@ mod tests {
     fn export_bindings() {
         IdentityProfile::export_all().unwrap();
         TaskEvent::export_all().unwrap();
+        RunRecord::export_all().unwrap();
+        RunStartRequest::export_all().unwrap();
+        RunCancelRequest::export_all().unwrap();
+        AccountCaptureRequest::export_all().unwrap();
+        AccountSwitchRequest::export_all().unwrap();
+        AccountSummary::export_all().unwrap();
         JsonRpcRequest::export_all().unwrap();
         JsonRpcResponse::export_all().unwrap();
         CapabilitiesReport::export_all().unwrap();
