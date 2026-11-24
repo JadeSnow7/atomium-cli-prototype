@@ -28,6 +28,10 @@ mod tests {
         assert!(sbpl.contains("(deny network*)"));
         assert!(sbpl.contains("(allow network-outbound (remote tcp \"localhost:43210\"))"));
         assert!(sbpl.contains("com.apple.SecurityServer"));
+        assert!(sbpl.contains("com.apple.securityd"));
+        assert!(sbpl.contains("/Library/Keychains"));
+        assert!(sbpl.contains("\\.gemini/antigravity-cli"));
+        assert!(sbpl.contains("\\.codex"));
         assert!(sbpl.contains("com.apple.locationd.desktop.registration"));
     }
 }

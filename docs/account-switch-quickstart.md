@@ -19,14 +19,15 @@
 rm -rf /tmp/agy-probe-*
 ```
 
-**本机实测结论（2026-11-24，macOS arm64，`agy 1.5.15`）：**
-- **Keychain 槽位已确认**：`service=gemini` / `account=antigravity`（`go-keyring` 格式，约 802 字节），`~/.gemini/antigravity-cli/` 下无本地明文 OAuth 文件。
-- **文件回退已证伪**：阻断 `~/Library/Keychains` 与 `com.apple.SecurityServer` 后，canary 文件 `atime/mtime` 无变化，`agy acp` 直接返回 `-32000 Authentication required`，**不会回退读取本地文件**。
-- **模式结论**：本机 `agy 1.5.15` 必须使用默认的 **`hostKeychainSlot`** 模式（串行切换 + 全局槽位互斥锁 `host:keychain:gemini:antigravity`）。若未来需要双 Google 账号真正并行，需使用独立凭证命名空间（如 Linux 容器 / Podman VM 或独立 macOS 用户会话），而不要在当前 `agy 1.5.15` 上强行启用 `isolatedFile`。
+**本机实测结论（2026-11-24，macOS arm64，`agy 1.5.16`）：**
+- **Keychain 槽位已确认**：`service=gemini` / `account=antigravity`（`zalando/go-keyring` 编码的 `go-keyring-base64:<base64>` 包装格式，解码后为 JSON `{"auth_method","id_token_email","token"}`）。
+- **文件回退已实机证实**：阻断 `~/Library/Keychains`、`/Library/Keychains`、`~/.gemini/antigravity-cli`、`com.apple.SecurityServer` 与 `com.apple.securityd` 后，若将**剥离 `go-keyring-base64:` 并 base64 解码后的纯 JSON** 投影至隔离 `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`（`0600`），`agy` 会平滑回退读取该文件并静默认证成功（早期 `probe_agy_fallback.sh` 失败原因在于直接写入了非 JSON canary / 未解码的 `go-keyring-base64:` 包装文本，导致 `keyring.go` 报 `invalid character 'g'`）。
+- **双异号原生并行已实测通过**：使用 `scripts/verify_harness_switch.py parallel-agy` 同时并发运行两个不同 Google 账号（`an***8@gmail.com` 与 `ke***1@gmail.com`），均在 ~10–11s 内返回 `PASS` 且零串号；同时支持在隔离 Seatbelt 沙盒内直接 `login` 新账号而不修改宿主 Keychain。
+- **模式结论**：macOS 原生底座默认优先启用 **`isolatedFile`**（Seatbelt 阻断 Keychain + 剥离 `go-keyring-base64:` 投影 JSON + 按 Profile 粒度互斥防同账号刷新竞态），支持双 `agy` + `codex` 真并行；`hostKeychainSlot` 保留作为兼容回退模式。
 
 **如何选择模式（`--mode`）：**
-- 默认且推荐 `hostKeychainSlot`（串行宿主机 Keychain 槽位模式）：通过全局 SQLite 租约 `host:keychain:<service>:<account>` 保证同一时间只有一个任务占用宿主机 Keychain 槽位，最稳妥。
-- 仅当未来新版本 `agy` 经 `probe_agy_fallback.sh` 实测返回 **`FILE FALLBACK DETECTED`** 时，才启用 `--mode isolatedFile` 实现原生并行。
+- 默认且推荐 `isolatedFile`（macOS 原生隔离文件回退模式）：投影解码后的 JSON 至独立 `$HOME`，无需全局 Keychain 锁，支持多 Google 账号真并行且不污染宿主登录态。
+- 兼容回退 `hostKeychainSlot`（串行宿主机 Keychain 槽位模式）：通过全局 SQLite 租约 `host:keychain:<service>:<account>` 串行切号，适用于旧环境或无法启用 Seatbelt 的场景。
 
 ---
 

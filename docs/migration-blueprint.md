@@ -3,9 +3,9 @@
 本文档为 Atomium 仓库迁移至「跨平台核心守护进程 + 五端瘦客户端」Monorepo 架构（Rust Cargo Workspace + pnpm Workspace）的统一契约与核心骨架。
 
 > [!NOTE]
-> 结合 2026-11-24 本机实测结论（macOS arm64 / `agy 1.5.15`）：
-> - `agy` 凭据槽位为 Login Keychain `service=gemini`, `account=antigravity`（`go-keyring` 格式）。
-> - 阻断 Keychain 与 `com.apple.SecurityServer` 后 `agy` 不会回退本地文件，因此当前版本默认应使用 `HostKeychainSlot`；`IsolatedFile` 仅在未来实机探针证实支持回退的 CLI 版本上启用。
+> 结合 2026-11-24 本机实测结论（macOS arm64 / `agy 1.5.16`）：
+> - `agy` Keychain 槽位为 Login Keychain `service=gemini`, `account=antigravity`（`zalando/go-keyring` 的 `go-keyring-base64:<base64>` 包装格式）。
+> - 在 Seatbelt 阻断 `~/Library/Keychains`、`com.apple.SecurityServer` 与 `com.apple.securityd` 后，**剥离 `go-keyring-base64:` 并 base64 解码为纯 JSON** 投影至隔离 `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`，`agy` 可平滑回退读文件并已实测通过**双异号真并行**（详见 `out/harness-verify/report_20261124_130600.json`）。因此 macOS 原生底座默认优先启用 `IsolatedFile`，`HostKeychainSlot` 保留作为兼容回退。
 
 ---
 

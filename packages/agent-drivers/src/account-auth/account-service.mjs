@@ -64,14 +64,34 @@ async function readOptionalFile(filePath) {
   }
 }
 
+export const GO_KEYRING_B64_PREFIX = 'go-keyring-base64:';
+
+export function decodeAgyTokenForFile(secret) {
+  if (typeof secret === 'string' && secret.startsWith(GO_KEYRING_B64_PREFIX)) {
+    const b64 = secret.slice(GO_KEYRING_B64_PREFIX.length).trim();
+    return Buffer.from(b64, 'base64').toString('utf8');
+  }
+  return secret;
+}
+
+export function encodeAgyTokenForKeychain(secret) {
+  if (typeof secret !== 'string' || secret.startsWith(GO_KEYRING_B64_PREFIX)) {
+    return secret;
+  }
+  if (secret.trimStart().startsWith('{')) {
+    return GO_KEYRING_B64_PREFIX + Buffer.from(secret, 'utf8').toString('base64');
+  }
+  return secret;
+}
+
 function buildIsolatedFileSeatbeltProfile({ realHome, runHome, runTmp }) {
   const esc = (p) => JSON.stringify(p);
   const lines = [
     '(version 1)',
     '(allow default)',
     `(allow file-read* file-write* (subpath ${esc(runHome)}) (subpath ${esc(runTmp)}))`,
-    `(deny file-read* file-write* (subpath ${esc(join(realHome, 'Library', 'Keychains'))}) (subpath "/Library/Keychains"))`,
-    '(deny mach-lookup (global-name "com.apple.SecurityServer"))',
+    `(deny file-read* file-write* (subpath ${esc(join(realHome, 'Library', 'Keychains'))}) (subpath "/Library/Keychains") (subpath ${esc(join(realHome, '.gemini', 'antigravity-cli'))}) (subpath ${esc(join(realHome, '.codex'))}))`,
+    '(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))',
   ];
   return lines.join('\n') + '\n';
 }
@@ -156,7 +176,7 @@ export class AccountService {
     profileId,
     {
       displayName = profileId,
-      credentialMode = 'hostKeychainSlot',
+      credentialMode = 'isolatedFile',
       credentialSlot = DEFAULT_CREDENTIAL_SLOT,
       proxyURL = null,
       timezone = null,
@@ -370,11 +390,15 @@ export class AccountService {
       await chmod(runTmp, 0o700);
 
       const targetSecret = await this.vault.loadCredential(profileId);
-      initialDigest = sha256Hex(targetSecret);
+      const projectedSecret =
+        profile.credentialMode === 'isolatedFile'
+          ? decodeAgyTokenForFile(targetSecret)
+          : targetSecret;
+      initialDigest = sha256Hex(projectedSecret);
 
       if (profile.credentialMode === 'isolatedFile') {
         projectedCredPath = join(runHome, slot.fallbackRelPath);
-        await writePrivateFile(projectedCredPath, targetSecret);
+        await writePrivateFile(projectedCredPath, projectedSecret);
       } else {
         await this._backupPreviousKeychainIfChanged(currentProfile);
         const existingSlotSecret = await this.keychain.getSecret(slot.service, slot.account);

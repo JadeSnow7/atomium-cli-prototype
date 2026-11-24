@@ -10,7 +10,10 @@ import { IdentityProfileStore, DEFAULT_CREDENTIAL_SLOT } from './profile-store.m
 import { AtomiumVault, sha256Hex } from './vault.mjs';
 import {
   AccountService,
+  GO_KEYRING_B64_PREFIX,
   LeaseConflictError,
+  decodeAgyTokenForFile,
+  encodeAgyTokenForKeychain,
   hostKeychainResourceKey,
   profileOAuthResourceKey,
 } from './account-service.mjs';
@@ -458,6 +461,41 @@ test('Test 6: Crash zombie lease recovery via SIGKILL marks profile dirtyReconci
     // Vault must remain completely intact (not overwritten/clobbered)
     const vaultSecret = await h.vault.loadCredential('acct_a');
     assert.equal(sha256Hex(vaultSecret), digestA);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('Test 7: go-keyring-base64 Keychain payload decodes to raw JSON in isolatedFile mode', async () => {
+  const h = await createTestHarness();
+  try {
+    const rawJson = JSON.stringify({
+      auth_method: 'consumer',
+      id_token_email: 'synthetic@example.com',
+      token: { access_token: 'synthetic-token' },
+    });
+    const wrapped = encodeAgyTokenForKeychain(rawJson);
+    assert.ok(wrapped.startsWith(GO_KEYRING_B64_PREFIX));
+    assert.equal(decodeAgyTokenForFile(wrapped), rawJson);
+
+    await h.keychain.setSecret(
+      DEFAULT_CREDENTIAL_SLOT.service,
+      DEFAULT_CREDENTIAL_SLOT.account,
+      wrapped,
+    );
+
+    await h.service.captureProfile('acct_b64', { credentialMode: 'isolatedFile' });
+    const reportPath = join(h.baseDir, 'report-b64.json');
+    const res = await h.service.runWithProfile(
+      'acct_b64',
+      ['--report-file', reportPath],
+      { stdio: 'pipe' },
+    );
+    assert.equal(res.exitCode, 0);
+    assert.equal(res.tokenRefreshed, false);
+
+    const report = JSON.parse(await readFile(reportPath, 'utf8'));
+    assert.equal(report.observedDigest, sha256Hex(rawJson));
   } finally {
     await h.cleanup();
   }

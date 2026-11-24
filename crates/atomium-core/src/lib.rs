@@ -1,8 +1,14 @@
 pub mod lease;
+pub mod oauth_codec;
 pub mod profile;
 pub mod vault;
 
 pub use lease::{LeaseManager, LeaseMode, LeaseRequest};
+pub use oauth_codec::{
+    decode_agy_oauth_for_file, default_agy_oauth_mode, encode_agy_oauth_for_keychain,
+    project_isolated_oauth_file, read_projected_oauth_file, AGY_DEFAULT_RELATIVE_PATH,
+    GO_KEYRING_B64_PREFIX,
+};
 pub use profile::ProfileStore;
 pub use vault::EncryptedVault;
 
@@ -129,10 +135,7 @@ mod tests {
             agent_kind: "antigravity".into(),
             credential: CredentialSpec::OauthSnapshot {
                 vault_blob_id: "acct_a".into(),
-                mode: OAuthStorageMode::HostKeychainSlot {
-                    service: "gemini".into(),
-                    account: "antigravity".into(),
-                },
+                mode: default_agy_oauth_mode(),
                 snapshot_version: 1,
                 content_digest: digest,
             },
@@ -157,6 +160,47 @@ mod tests {
             store.get("acct_a").unwrap().unwrap().state,
             ProfileState::DirtyReconcile
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oauth_codec_decodes_go_keyring_and_projects_isolated_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("atomium-core-oauth-codec");
+        let raw_json = br#"{"auth_method":"consumer","id_token_email":"test@example.com","token":{"access_token":"synthetic"}}"#;
+        let wrapped = encode_agy_oauth_for_keychain(raw_json);
+        assert!(wrapped.starts_with(GO_KEYRING_B64_PREFIX));
+        // Idempotent re-wrap
+        assert_eq!(encode_agy_oauth_for_keychain(&wrapped), wrapped);
+        // Decode wrapped -> raw JSON
+        assert_eq!(decode_agy_oauth_for_file(&wrapped).unwrap(), raw_json);
+        // Passthrough already-raw JSON
+        assert_eq!(decode_agy_oauth_for_file(raw_json).unwrap(), raw_json);
+
+        // Default agy mode is IsolatedFile targeting antigravity-oauth-token
+        assert!(matches!(
+            default_agy_oauth_mode(),
+            OAuthStorageMode::IsolatedFile { relative_home_path }
+                if relative_home_path == AGY_DEFAULT_RELATIVE_PATH
+        ));
+
+        // Project wrapped Keychain payload into isolated $HOME and verify 0600 decoded JSON
+        let projected =
+            project_isolated_oauth_file(&dir, AGY_DEFAULT_RELATIVE_PATH, &wrapped).unwrap();
+        assert_eq!(projected, dir.join(AGY_DEFAULT_RELATIVE_PATH));
+        let mode = std::fs::metadata(&projected).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&projected).unwrap(), raw_json);
+        assert_eq!(
+            read_projected_oauth_file(&projected).unwrap().as_deref(),
+            Some(raw_json.as_slice())
+        );
+
+        // Reject path traversal and absolute paths
+        assert!(project_isolated_oauth_file(&dir, "../escape", raw_json).is_err());
+        assert!(project_isolated_oauth_file(&dir, "/etc/passwd", raw_json).is_err());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

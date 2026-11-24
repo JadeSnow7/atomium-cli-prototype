@@ -41,7 +41,12 @@ pub fn render_sbpl(cfg: &SeatbeltConfig) -> String {
     let keychain_rule = if cfg.block_keychain {
         r#"
 (deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))
-(deny file-read* file-write* (regex #"^/Users/[^/]+/Library/Keychains(/|$)"))
+(deny file-read* file-write*
+    (subpath "/Library/Keychains")
+    (regex #"^/Users/[^/]+/Library/Keychains(/|$)")
+    (regex #"^/Users/[^/]+/\.gemini/antigravity-cli(/|$)")
+    (regex #"^/Users/[^/]+/\.codex(/|$)")
+)
 "#
     } else {
         ""
@@ -305,7 +310,7 @@ impl RuntimeBackend for MacOsSeatbeltBackend {
 
         let mut notes = vec![
             "SwiftPM build recipes must pass --disable-sandbox and redirect CLANG_MODULE_CACHE_PATH.".into(),
-            "agy 1.5.15 verified on macOS arm64: uses Keychain service=gemini account=antigravity without file fallback (HostKeychainSlot default).".into(),
+            "agy 1.5.16 verified on macOS arm64: supports IsolatedFile fallback ($HOME/.gemini/antigravity-cli/antigravity-oauth-token) when Keychain/SecurityServer are blocked by Seatbelt, after decoding zalando/go-keyring 'go-keyring-base64:' wrapper into raw JSON (IsolatedFile default; HostKeychainSlot retained as fallback).".into(),
         ];
         if nested_blocked {
             notes.push("Nested sandbox-exec blocked by outer sandbox; run doctor in standard macOS Terminal for live enforcement evidence.".into());

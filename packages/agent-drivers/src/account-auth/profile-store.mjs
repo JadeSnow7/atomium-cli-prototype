@@ -4,7 +4,7 @@ import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-export const CREDENTIAL_MODES = Object.freeze(['hostKeychainSlot', 'isolatedFile']);
+export const CREDENTIAL_MODES = Object.freeze(['isolatedFile', 'hostKeychainSlot']);
 export const PROFILE_STATES = Object.freeze(['active', 'dirtyReconcile', 'needsReauth']);
 
 export const DEFAULT_CREDENTIAL_SLOT = Object.freeze({
@@ -98,7 +98,7 @@ export class IdentityProfileStore {
   upsertProfile({
     id,
     displayName = id,
-    credentialMode = 'hostKeychainSlot',
+    credentialMode = 'isolatedFile',
     credentialSlot = DEFAULT_CREDENTIAL_SLOT,
     proxyURL = null,
     timezone = null,
