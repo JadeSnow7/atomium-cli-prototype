@@ -1,26 +1,23 @@
 # Atomium Monorepo (Rust Core Daemon + Thin Clients)
 
-Atomium is migrated to a Rust Cargo Workspace + pnpm Workspace monorepo on branch `feat/monorepo-rust-tauri-expo`. See [docs/migration-blueprint.md](docs/migration-blueprint.md) for the architecture contract and [docs/account-switch-quickstart.md](docs/account-switch-quickstart.md) for real multi-account `agy` onboarding.
+Atomium is a Rust Cargo Workspace + pnpm Workspace monorepo. See [docs/migration-blueprint.md](docs/migration-blueprint.md) for the architecture contract, [DEVELOPMENT-STATUS.md](DEVELOPMENT-STATUS.md) for current verification status, and [docs/account-switch-quickstart.md](docs/account-switch-quickstart.md) for real multi-account `agy` onboarding.
 
 ## Monorepo Quickstart
 
 ```bash
-# 1. Regenerate TypeScript protocol bindings from Rust (ts-rs)
-pnpm gen:protocol
+# 1. Regenerate TypeScript protocol bindings from Rust (ts-rs) and verify sync
+pnpm run gen:protocol
+pnpm run check:protocol-sync
 
-# 2. Run all Rust core tests (protocol, SQLite WAL leases, AES-256-GCM vault, Fail-Closed gateway, Seatbelt SBPL)
-cargo test --workspace
+# 2. Run the full local CI gate (fmt, clippy, protocol sync, typecheck, build, Rust/TS/JS/Python/Shell/E2E tests)
+pnpm run ci:local
 
-# 3. Run macOS M0 boundary probes and emit out/capabilities.json + out/evidence.json
-pnpm doctor
+# 3. Run macOS M0 boundary probes and build the Swift browser host helper (macOS)
+pnpm run doctor
+swift build --disable-sandbox --package-path native-helpers/macos-browser-host
 
-# 4. Typecheck and test all TypeScript packages & apps (including migrated agent-drivers/account-auth E2E tests)
-pnpm install
-pnpm -r typecheck
-pnpm -r test
-
-# 5. Start the 0600 Unix Socket daemon (atomiumd)
-pnpm daemon:dev
+# 4. Start the 0600 Unix Socket daemon (atomiumd)
+pnpm run daemon:dev
 ```
 
 ### Directory Layout

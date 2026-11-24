@@ -1,6 +1,7 @@
 export * from "./agy-acp.mjs";
 export * from "./gemini-model-adapter.mjs";
 export * from "./proposal-contract.mjs";
+export * from "./harness-task.mjs";
 export * from "./account-auth/account-service.mjs";
 export * from "./account-auth/keychain-adapter.mjs";
 export * from "./account-auth/lease-manager.mjs";
