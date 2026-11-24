@@ -32,17 +32,23 @@ fn render_sbpl_network_modes() {
 #[test]
 fn render_sbpl_keychain_toggle_and_always_denied_paths() {
     let blocked = render_sbpl(&sample_cfg(None, true));
-    assert!(blocked.contains("com.apple.SecurityServer"));
-    assert!(blocked.contains("com.apple.securityd"));
+    assert!(blocked.contains(
+        r#"(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))"#
+    ));
     assert!(blocked.contains("/Library/Keychains"));
-    assert!(blocked.contains("Keychains"));
     assert!(blocked.contains(".gemini/antigravity-cli"));
     assert!(blocked.contains(".codex"));
 
+    // HostKeychainSlot mode (block_keychain = false) must explicitly allow Keychain under (deny default)
     let unblocked = render_sbpl(&sample_cfg(None, false));
-    assert!(!unblocked.contains("com.apple.SecurityServer"));
-    assert!(!unblocked.contains("com.apple.securityd"));
-    assert!(!unblocked.contains("/Library/Keychains"));
+    assert!(unblocked.contains(
+        r#"(allow mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))"#
+    ));
+    assert!(
+        unblocked.contains("(allow file-read* file-write*\n    (subpath \"/Library/Keychains\")")
+    );
+    assert!(!unblocked.contains(".gemini/antigravity-cli"));
+    assert!(!unblocked.contains(".codex"));
 
     // Always denied in both modes
     for sbpl in [&blocked, &unblocked] {

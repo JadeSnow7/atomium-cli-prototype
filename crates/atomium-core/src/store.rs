@@ -11,6 +11,13 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+#[derive(Debug, Clone)]
+pub struct IncompleteRun {
+    pub record: RunRecord,
+    pub child_pgid: Option<i64>,
+    pub child_proc_start: Option<i64>,
+}
+
 pub struct RunStore {
     db_path: PathBuf,
 }
@@ -27,12 +34,14 @@ impl RunStore {
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS task_runs (
-                run_id        TEXT PRIMARY KEY,
-                profile_id    TEXT NOT NULL,
-                status        TEXT NOT NULL,
-                record_json   TEXT NOT NULL,
-                created_at_ms INTEGER NOT NULL,
-                updated_at_ms INTEGER NOT NULL
+                run_id           TEXT PRIMARY KEY,
+                profile_id       TEXT NOT NULL,
+                status           TEXT NOT NULL,
+                record_json      TEXT NOT NULL,
+                created_at_ms    INTEGER NOT NULL,
+                updated_at_ms    INTEGER NOT NULL,
+                child_pgid       INTEGER,
+                child_proc_start INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_task_runs_created ON task_runs(created_at_ms DESC);
             CREATE TABLE IF NOT EXISTS host_slot_state (
@@ -42,6 +51,23 @@ impl RunStore {
             );
             "#,
         )?;
+        // Forward-compatible migration for DBs created before child_pgid / child_proc_start.
+        let cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(task_runs)")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        if !cols.iter().any(|c| c == "child_pgid") {
+            conn.execute("ALTER TABLE task_runs ADD COLUMN child_pgid INTEGER", [])?;
+        }
+        if !cols.iter().any(|c| c == "child_proc_start") {
+            conn.execute(
+                "ALTER TABLE task_runs ADD COLUMN child_proc_start INTEGER",
+                [],
+            )?;
+        }
         Ok(Self { db_path })
     }
 
@@ -103,6 +129,65 @@ impl RunStore {
         Ok(items)
     }
 
+    pub fn set_child_process(&self, run_id: &str, pgid: i64, proc_start: i64) -> Result<()> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.execute(
+            "UPDATE task_runs SET child_pgid = ?1, child_proc_start = ?2 WHERE run_id = ?3",
+            params![pgid, proc_start, run_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_child_process(&self, run_id: &str) -> Result<()> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.execute(
+            "UPDATE task_runs SET child_pgid = NULL, child_proc_start = NULL WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
+    /// List all non-terminal runs along with their persisted `(child_pgid, child_proc_start)`.
+    pub fn list_incomplete_runs_with_child(&self) -> Result<Vec<IncompleteRun>> {
+        let conn = Connection::open(&self.db_path)?;
+        let mut stmt = conn.prepare(
+            "SELECT record_json, child_pgid, child_proc_start FROM task_runs ORDER BY created_at_ms DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let json: String = r.get(0)?;
+                let record = serde_json::from_str::<RunRecord>(&json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                Ok(IncompleteRun {
+                    record,
+                    child_pgid: r.get(1)?,
+                    child_proc_start: r.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|item| {
+                matches!(
+                    item.record.status,
+                    TaskStatus::Prepared
+                        | TaskStatus::Running
+                        | TaskStatus::AwaitingApproval
+                        | TaskStatus::Finalizing
+                        | TaskStatus::Revoking
+                        | TaskStatus::Stopping
+                )
+            })
+            .collect())
+    }
+
     /// On daemon startup, mark any previously non-terminal runs as `Interrupted`.
     pub fn mark_incomplete_runs_interrupted(&self, reason: &str) -> Result<Vec<RunRecord>> {
         let all = self.list()?;
@@ -121,6 +206,7 @@ impl RunStore {
                 rec.reason = Some(reason.to_string());
                 rec.updated_at_ms = now_ms();
                 self.upsert(&rec)?;
+                let _ = self.clear_child_process(&rec.run_id);
                 updated.push(rec);
             }
         }

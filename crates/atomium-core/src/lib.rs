@@ -23,7 +23,7 @@ pub use oauth_codec::{
     GO_KEYRING_B64_PREFIX,
 };
 pub use profile::ProfileStore;
-pub use store::{ApprovalStore, RunStore};
+pub use store::{ApprovalStore, IncompleteRun, RunStore};
 pub use vault::EncryptedVault;
 
 #[cfg(test)]

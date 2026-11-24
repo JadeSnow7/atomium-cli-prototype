@@ -77,7 +77,14 @@ pub fn render_sbpl_with_extra_read_paths(
 )
 "#
     } else {
-        ""
+        r#"
+; HostKeychainSlot 模式：在 (deny default) 基线下显式放行 Keychain 访问
+(allow mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))
+(allow file-read* file-write*
+    (subpath "/Library/Keychains")
+    (regex #"^/Users/[^/]+/Library/Keychains(/|$)")
+)
+"#
     };
 
     format!(

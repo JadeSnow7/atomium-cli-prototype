@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Result};
 use atomium_core::{
     decode_agy_oauth_for_file, default_agy_oauth_mode, encode_agy_oauth_for_keychain,
-    project_isolated_oauth_file, read_projected_oauth_file, ApprovalStore, EncryptedVault,
-    FileMasterKeyProvider, InMemoryKeychainAdapter, KeychainAdapter, LeaseManager, LeaseMode,
-    LeaseRequest, MasterKeyProvider, ProfileStore, RunStore, AGY_KEYCHAIN_ACCOUNT,
-    AGY_KEYCHAIN_SERVICE,
+    is_process_alive, process_start_time, project_isolated_oauth_file, read_projected_oauth_file,
+    ApprovalStore, EncryptedVault, FileMasterKeyProvider, InMemoryKeychainAdapter, KeychainAdapter,
+    LeaseManager, LeaseMode, LeaseRequest, MasterKeyProvider, ProfileStore, RunStore,
+    AGY_KEYCHAIN_ACCOUNT, AGY_KEYCHAIN_SERVICE,
 };
 use atomium_gateway::{spawn_run_proxy_with_policy, EgressProxyHandle};
 use atomium_protocol::{
@@ -122,7 +122,24 @@ impl DaemonState {
         let approvals = ApprovalStore::open(db_path)?;
         let vault = EncryptedVault::with_provider(vault_dir, master_key_provider)?;
 
-        // Reclaim stale leases from crashed daemon/processes and mark interrupted runs.
+        // 1. Terminate any orphaned run process groups left behind by a crashed daemon BEFORE
+        //    reclaiming leases or marking runs Interrupted (verified with proc_start to avoid PID reuse).
+        let incomplete = runs.list_incomplete_runs_with_child()?;
+        for item in incomplete {
+            if let Some(pgid) = item.child_pgid {
+                let proc_start = item.child_proc_start.unwrap_or(0);
+                if pgid > 0 && is_process_alive(pgid, proc_start) {
+                    kill_orphaned_process_group_sync(pgid);
+                }
+            }
+            let orphan_dir = runs_dir.join(&item.record.run_id);
+            if orphan_dir.exists() {
+                let _ = fs::remove_dir_all(&orphan_dir);
+            }
+            let _ = runs.clear_child_process(&item.record.run_id);
+        }
+
+        // 2. Reclaim stale leases from crashed daemon/processes and mark interrupted runs.
         let _ = leases.reclaim_stale_leases(Some(&profiles))?;
         let _ = runs.mark_incomplete_runs_interrupted("daemon_restarted")?;
 
@@ -785,66 +802,93 @@ fn handle_accounts_capture(
     let canonical_bytes =
         decode_agy_oauth_for_file(&raw_secret).map_err(|e| (-32602, e.to_string()))?;
 
-    let existing = state
-        .profiles
-        .get(&req.profile_id)
-        .map_err(|e| (-32000, e.to_string()))?;
-    let (vault_blob_id, next_version) = match existing.as_ref().map(|p| &p.credential) {
-        Some(CredentialSpec::OauthSnapshot {
-            vault_blob_id,
-            snapshot_version,
-            ..
-        }) => (vault_blob_id.clone(), snapshot_version + 1),
-        _ => (format!("oauth_{}", req.profile_id), 1),
-    };
-
-    let content_digest = state
-        .vault
-        .write_blob(&vault_blob_id, &canonical_bytes)
-        .map_err(|e| (-32000, e.to_string()))?;
-
-    let profile = IdentityProfile {
-        id: req.profile_id.clone(),
-        display_name: req.display_name,
-        agent_kind: req.agent_kind.unwrap_or_else(|| "antigravity".into()),
-        credential: CredentialSpec::OauthSnapshot {
-            vault_blob_id,
-            mode: storage_mode.clone(),
-            snapshot_version: next_version,
-            content_digest,
-        },
-        egress: EgressBinding {
-            proxy_id: req
-                .proxy_id
-                .unwrap_or_else(|| format!("proxy-{}", req.profile_id)),
-            expected_country: req.expected_country.unwrap_or_else(|| "US".into()),
-            expected_region: req.expected_region,
-            fail_closed: true,
-            exclusive_proxy_use: false,
-        },
-        locale_policy: LocalePolicy {
-            timezone: req.timezone.unwrap_or_else(|| "UTC".into()),
-            lang: req.lang.unwrap_or_else(|| "en_US.UTF-8".into()),
-            auto_align_with_proxy: false,
-        },
-        state: ProfileState::Active,
-    };
-
-    state
-        .profiles
-        .upsert(&profile)
-        .map_err(|e| (-32000, e.to_string()))?;
-
-    if let OAuthStorageMode::HostKeychainSlot { service, account } = &storage_mode {
-        let slot_key = host_slot_key(service, account);
-        let _ = state.runs.set_active_host_slot(&slot_key, &profile.id);
-    }
-
-    let leases = state
+    // Reclaim stale leases and acquire exclusive OAuth lease so recapture cannot race with
+    // an active run holding the same profile or host keychain slot.
+    let _ = state
         .leases
-        .list_active_leases()
+        .reclaim_stale_leases(Some(&state.profiles))
         .map_err(|e| (-32000, e.to_string()))?;
-    Ok(state.build_account_summary(&profile, &leases))
+    let mut capture_leases = vec![LeaseRequest {
+        resource_key: format!("profile:{}:oauth", req.profile_id),
+        mode: LeaseMode::Exclusive,
+    }];
+    if let OAuthStorageMode::HostKeychainSlot { service, account } = &storage_mode {
+        capture_leases.push(LeaseRequest {
+            resource_key: format!("host:keychain:{service}:{account}"),
+            mode: LeaseMode::Exclusive,
+        });
+    }
+    let capture_run_id = format!("capture-{}", uuid::Uuid::now_v7());
+    state
+        .leases
+        .acquire_all(&capture_run_id, capture_leases, 30)
+        .map_err(|e| (-32009, e.to_string()))?;
+
+    let capture_res = (|| -> std::result::Result<AccountSummary, (i32, String)> {
+        let existing = state
+            .profiles
+            .get(&req.profile_id)
+            .map_err(|e| (-32000, e.to_string()))?;
+        let (vault_blob_id, next_version) = match existing.as_ref().map(|p| &p.credential) {
+            Some(CredentialSpec::OauthSnapshot {
+                vault_blob_id,
+                snapshot_version,
+                ..
+            }) => (vault_blob_id.clone(), snapshot_version + 1),
+            _ => (format!("oauth_{}", req.profile_id), 1),
+        };
+
+        let content_digest = state
+            .vault
+            .write_blob(&vault_blob_id, &canonical_bytes)
+            .map_err(|e| (-32000, e.to_string()))?;
+
+        let profile = IdentityProfile {
+            id: req.profile_id.clone(),
+            display_name: req.display_name,
+            agent_kind: req.agent_kind.unwrap_or_else(|| "antigravity".into()),
+            credential: CredentialSpec::OauthSnapshot {
+                vault_blob_id,
+                mode: storage_mode.clone(),
+                snapshot_version: next_version,
+                content_digest,
+            },
+            egress: EgressBinding {
+                proxy_id: req
+                    .proxy_id
+                    .unwrap_or_else(|| format!("proxy-{}", req.profile_id)),
+                expected_country: req.expected_country.unwrap_or_else(|| "US".into()),
+                expected_region: req.expected_region,
+                fail_closed: true,
+                exclusive_proxy_use: false,
+            },
+            locale_policy: LocalePolicy {
+                timezone: req.timezone.unwrap_or_else(|| "UTC".into()),
+                lang: req.lang.unwrap_or_else(|| "en_US.UTF-8".into()),
+                auto_align_with_proxy: false,
+            },
+            state: ProfileState::Active,
+        };
+
+        state
+            .profiles
+            .upsert(&profile)
+            .map_err(|e| (-32000, e.to_string()))?;
+
+        if let OAuthStorageMode::HostKeychainSlot { service, account } = &storage_mode {
+            let slot_key = host_slot_key(service, account);
+            let _ = state.runs.set_active_host_slot(&slot_key, &profile.id);
+        }
+
+        let leases = state
+            .leases
+            .list_active_leases()
+            .map_err(|e| (-32000, e.to_string()))?;
+        Ok(state.build_account_summary(&profile, &leases))
+    })();
+
+    let _ = state.leases.release_all(&capture_run_id);
+    capture_res
 }
 
 fn handle_accounts_list(state: &DaemonState) -> Result<Vec<AccountSummary>> {
@@ -872,8 +916,14 @@ fn handle_accounts_switch(
         .map_err(|e| (-32000, e.to_string()))?
         .ok_or_else(|| (-32004, format!("profile not found: {}", req.profile_id)))?;
 
-    if target.state == ProfileState::Disabled {
-        return Err((-32002, format!("profile is disabled: {}", target.id)));
+    if target.state != ProfileState::Active {
+        return Err((
+            -32002,
+            format!(
+                "profile {} cannot be switched while in state {:?}",
+                target.id, target.state
+            ),
+        ));
     }
 
     let CredentialSpec::OauthSnapshot {
@@ -1297,7 +1347,12 @@ async fn handle_runs_start(
         }
     };
 
-    // 6. Transition to Running & register ActiveRunControl.
+    // 6. Persist child process group (for crash recovery) and transition to Running.
+    if let Some(pid) = child.id() {
+        let pgid = pid as i64;
+        let proc_start = process_start_time(pgid).unwrap_or(0);
+        let _ = state.runs.set_child_process(&run_id, pgid, proc_start);
+    }
     record.status = TaskStatus::Running;
     record.updated_at_ms = now_ms();
     let _ = state.runs.upsert(&record);
@@ -1441,6 +1496,8 @@ async fn handle_runs_start(
 
         // If the run exited normally (not cancelled/timed out), check for OAuth token refresh
         // and atomically write back to Vault + bump snapshot_version BEFORE deleting run_dir.
+        // Writeback is conditional on the profile still matching `initial_version` and `initial_digest`
+        // so an older run can never clobber a newly recaptured credential.
         if cancelled_reason.is_none() {
             match &projection {
                 CredentialProjection::IsolatedFile {
@@ -1451,45 +1508,19 @@ async fn handle_runs_start(
                     if let Ok(Some(after_bytes)) = read_projected_oauth_file(projected_path) {
                         let after_digest = EncryptedVault::digest_hex(&after_bytes);
                         if after_digest != *initial_digest {
-                            if let Ok(written_digest) =
-                                sup_state.vault.write_blob(vault_blob_id, &after_bytes)
-                            {
-                                if let Ok(Some(mut prof)) = sup_state.profiles.get(&sup_profile_id)
-                                {
-                                    if let CredentialSpec::OauthSnapshot {
+                            if let Ok(Some(mut prof)) = sup_state.profiles.get(&sup_profile_id) {
+                                let version_matches = matches!(
+                                    &prof.credential,
+                                    CredentialSpec::OauthSnapshot {
                                         snapshot_version,
                                         content_digest,
                                         ..
-                                    } = &mut prof.credential
-                                    {
-                                        *snapshot_version += 1;
-                                        *content_digest = written_digest;
-                                        sup_record.snapshot_version = Some(*snapshot_version);
-                                        sup_record.token_refreshed = true;
-                                    }
-                                    let _ = sup_state.profiles.upsert(&prof);
-                                }
-                            }
-                        }
-                    }
-                }
-                CredentialProjection::HostKeychainSlot {
-                    vault_blob_id,
-                    service,
-                    account,
-                    initial_digest,
-                } => {
-                    if let Ok(Some(raw)) =
-                        sup_state.keychain.read_generic_password(service, account)
-                    {
-                        if let Ok(after_bytes) = decode_agy_oauth_for_file(&raw) {
-                            let after_digest = EncryptedVault::digest_hex(&after_bytes);
-                            if after_digest != *initial_digest {
-                                if let Ok(written_digest) =
-                                    sup_state.vault.write_blob(vault_blob_id, &after_bytes)
-                                {
-                                    if let Ok(Some(mut prof)) =
-                                        sup_state.profiles.get(&sup_profile_id)
+                                    } if Some(*snapshot_version) == initial_version
+                                        && content_digest == initial_digest
+                                );
+                                if version_matches {
+                                    if let Ok(written_digest) =
+                                        sup_state.vault.write_blob(vault_blob_id, &after_bytes)
                                     {
                                         if let CredentialSpec::OauthSnapshot {
                                             snapshot_version,
@@ -1509,6 +1540,53 @@ async fn handle_runs_start(
                         }
                     }
                 }
+                CredentialProjection::HostKeychainSlot {
+                    vault_blob_id,
+                    service,
+                    account,
+                    initial_digest,
+                } => {
+                    if let Ok(Some(raw)) =
+                        sup_state.keychain.read_generic_password(service, account)
+                    {
+                        if let Ok(after_bytes) = decode_agy_oauth_for_file(&raw) {
+                            let after_digest = EncryptedVault::digest_hex(&after_bytes);
+                            if after_digest != *initial_digest {
+                                if let Ok(Some(mut prof)) = sup_state.profiles.get(&sup_profile_id)
+                                {
+                                    let version_matches = matches!(
+                                        &prof.credential,
+                                        CredentialSpec::OauthSnapshot {
+                                            snapshot_version,
+                                            content_digest,
+                                            ..
+                                        } if Some(*snapshot_version) == initial_version
+                                            && content_digest == initial_digest
+                                    );
+                                    if version_matches {
+                                        if let Ok(written_digest) =
+                                            sup_state.vault.write_blob(vault_blob_id, &after_bytes)
+                                        {
+                                            if let CredentialSpec::OauthSnapshot {
+                                                snapshot_version,
+                                                content_digest,
+                                                ..
+                                            } = &mut prof.credential
+                                            {
+                                                *snapshot_version += 1;
+                                                *content_digest = written_digest;
+                                                sup_record.snapshot_version =
+                                                    Some(*snapshot_version);
+                                                sup_record.token_refreshed = true;
+                                            }
+                                            let _ = sup_state.profiles.upsert(&prof);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 CredentialProjection::None => {}
             }
         }
@@ -1516,6 +1594,7 @@ async fn handle_runs_start(
         // Remove isolated run directory and verify cleanup.
         let _ = fs::remove_dir_all(&run_dir);
         let cleanup_verified = !run_dir.exists();
+        let _ = sup_state.runs.clear_child_process(&sup_run_id);
 
         // Release all leases after child has exited and directory cleanup completed.
         let _ = sup_state.leases.release_all(&sup_run_id);
@@ -1554,24 +1633,67 @@ async fn handle_runs_start(
     Ok(record)
 }
 
-async fn terminate_child_process_group(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        let pgid = -(pid as libc::pid_t);
+fn process_group_alive(pgid: i64) -> bool {
+    if pgid <= 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(-(pgid as libc::pid_t), 0) };
+    if rc == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno != libc::ESRCH
+}
+
+fn kill_orphaned_process_group_sync(pgid: i64) {
+    if pgid <= 0 {
+        return;
+    }
+    let neg_pgid = -(pgid as libc::pid_t);
+    unsafe {
+        libc::kill(neg_pgid, libc::SIGTERM);
+    }
+    let term_deadline = std::time::Instant::now() + Duration::from_millis(200);
+    while process_group_alive(pgid) && std::time::Instant::now() < term_deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if process_group_alive(pgid) {
         unsafe {
-            libc::kill(pgid, libc::SIGTERM);
+            libc::kill(neg_pgid, libc::SIGKILL);
         }
-        if tokio::time::timeout(Duration::from_millis(300), child.wait())
-            .await
-            .is_ok()
-        {
-            return;
-        }
-        unsafe {
-            libc::kill(pgid, libc::SIGKILL);
+        let kill_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while process_group_alive(pgid) && std::time::Instant::now() < kill_deadline {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+}
+
+async fn terminate_child_process_group(child: &mut tokio::process::Child) {
+    let pgid = child.id().map(|id| id as i64);
+    if let Some(pgid) = pgid {
+        let neg_pgid = -(pgid as libc::pid_t);
+        unsafe {
+            libc::kill(neg_pgid, libc::SIGTERM);
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(300), child.wait()).await;
+
+        // Even if the group leader exited on SIGTERM, descendants may ignore SIGTERM and survive.
+        // Force-kill the entire process group and verify no members remain before returning.
+        if process_group_alive(pgid) {
+            unsafe {
+                libc::kill(neg_pgid, libc::SIGKILL);
+            }
+            let _ = child.kill().await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while process_group_alive(pgid) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    } else {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
 }
 
 async fn handle_runs_cancel(

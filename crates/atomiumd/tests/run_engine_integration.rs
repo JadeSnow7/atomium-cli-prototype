@@ -999,3 +999,268 @@ async fn host_keychain_slot_switch_writes_back_refreshed_previous_account() {
         .unwrap();
     assert_eq!(current_kc, encode_agy_oauth_for_keychain(raw_a));
 }
+
+#[tokio::test]
+async fn codex_review_regressions_orphan_recovery_capture_lock_dirty_switch_and_descendant_kill() {
+    use atomium_core::{is_process_alive, process_start_time};
+    use std::os::unix::process::CommandExt;
+
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+
+    // --- 1. accounts.capture rejected while active run holds exclusive OAuth lease ---
+    let raw_v1 = br#"{"id_token_email":"lock@example.test","token":{"access_token":"tok-lock-1"}}"#;
+    let raw_v2 = br#"{"id_token_email":"lock@example.test","token":{"access_token":"tok-lock-2"}}"#;
+    let b64_v1 = base64::engine::general_purpose::STANDARD.encode(raw_v1);
+    let b64_v2 = base64::engine::general_purpose::STANDARD.encode(raw_v2);
+
+    let cap1 = client
+        .call(
+            json!(1),
+            "accounts.capture",
+            json!({
+                "profile_id": "acct_lock",
+                "display_name": "Lock Test",
+                "raw_secret_b64": b64_v1
+            }),
+        )
+        .await;
+    assert!(cap1.error.is_none());
+
+    let start_lock = client
+        .call(
+            json!(2),
+            "runs.start",
+            json!({
+                "profile_id": "acct_lock",
+                "program": "/bin/sleep",
+                "args": ["10"],
+                "use_seatbelt": false
+            }),
+        )
+        .await;
+    assert!(start_lock.error.is_none());
+    let run_lock: RunRecord = serde_json::from_value(start_lock.result.unwrap()).unwrap();
+
+    // Recapturing while run is active MUST be rejected with -32009 resource_conflict.
+    let cap_conflict = client
+        .call(
+            json!(3),
+            "accounts.capture",
+            json!({
+                "profile_id": "acct_lock",
+                "display_name": "Lock Test",
+                "raw_secret_b64": b64_v2
+            }),
+        )
+        .await;
+    assert_eq!(cap_conflict.error.expect("capture conflict").code, -32009);
+    assert_eq!(
+        srv.state.vault().read_blob("oauth_acct_lock").unwrap(),
+        raw_v1
+    );
+
+    let _ = client
+        .call(
+            json!(4),
+            "runs.cancel",
+            json!({ "run_id": run_lock.run_id }),
+        )
+        .await;
+
+    // --- 2. accounts.switch rejects DirtyReconcile target before touching host keychain ---
+    let kc_a = br#"{"id_token_email":"dirty-a@example.test","token":{"access_token":"dirty-a"}}"#;
+    let kc_b = br#"{"id_token_email":"dirty-b@example.test","token":{"access_token":"dirty-b"}}"#;
+    srv.state
+        .keychain()
+        .write_generic_password(
+            "gemini",
+            "antigravity",
+            &encode_agy_oauth_for_keychain(kc_a),
+        )
+        .unwrap();
+    let _ = client
+        .call(
+            json!(5),
+            "accounts.capture",
+            json!({
+                "profile_id": "dirty_a",
+                "display_name": "Dirty A",
+                "storage_mode": {
+                    "storage": "host_keychain_slot",
+                    "service": "gemini",
+                    "account": "antigravity"
+                }
+            }),
+        )
+        .await;
+    srv.state
+        .keychain()
+        .write_generic_password(
+            "gemini",
+            "antigravity",
+            &encode_agy_oauth_for_keychain(kc_b),
+        )
+        .unwrap();
+    let _ = client
+        .call(
+            json!(6),
+            "accounts.capture",
+            json!({
+                "profile_id": "dirty_b",
+                "display_name": "Dirty B",
+                "storage_mode": {
+                    "storage": "host_keychain_slot",
+                    "service": "gemini",
+                    "account": "antigravity"
+                }
+            }),
+        )
+        .await;
+    srv.state
+        .profiles()
+        .set_state("dirty_a", ProfileState::DirtyReconcile)
+        .unwrap();
+
+    let bad_switch = client
+        .call(
+            json!(7),
+            "accounts.switch",
+            json!({ "profile_id": "dirty_a" }),
+        )
+        .await;
+    assert_eq!(
+        bad_switch.error.expect("dirty switch rejected").code,
+        -32002
+    );
+    // Keychain slot must still hold kc_b untouched.
+    assert_eq!(
+        srv.state
+            .keychain()
+            .read_generic_password("gemini", "antigravity")
+            .unwrap()
+            .unwrap(),
+        encode_agy_oauth_for_keychain(kc_b)
+    );
+
+    // --- 3. runs.cancel kills descendant that ignores SIGTERM after leader exits ---
+    let pid_file = srv.dir.path().join("descendant.pid");
+    let wrapper_script = write_executable_script(
+        srv.dir.path(),
+        "stubborn-descendant.sh",
+        &format!(
+            r#"#!/bin/sh
+set -eu
+python3 - "{}" <<'PY' &
+import os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(sys.argv[1], "w") as f:
+    f.write(str(os.getpid()))
+time.sleep(30)
+PY
+# Wait for SIGTERM on wrapper leader (exits quickly while descendant ignores SIGTERM)
+trap 'exit 0' TERM
+sleep 30 &
+wait $!
+"#,
+            pid_file.display()
+        ),
+    );
+
+    let start_desc = client
+        .call(
+            json!(8),
+            "runs.start",
+            json!({
+                "profile_id": "acct_lock",
+                "program": wrapper_script.to_string_lossy(),
+                "args": [],
+                "use_seatbelt": false
+            }),
+        )
+        .await;
+    assert!(start_desc.error.is_none());
+    let run_desc: RunRecord = serde_json::from_value(start_desc.result.unwrap()).unwrap();
+
+    // Wait for descendant to write its PID file
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let desc_pid: i64 = loop {
+        if let Ok(text) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = text.trim().parse::<i64>() {
+                break pid;
+            }
+        }
+        assert!(Instant::now() < deadline, "descendant did not write PID");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let desc_start = process_start_time(desc_pid).expect("descendant start time");
+    assert!(is_process_alive(desc_pid, desc_start));
+
+    let cancel_desc = client
+        .call(
+            json!(9),
+            "runs.cancel",
+            json!({ "run_id": run_desc.run_id, "reason": "kill_descendants" }),
+        )
+        .await;
+    assert!(cancel_desc.error.is_none());
+    // Descendant MUST be dead before runs.cancel returned!
+    assert!(
+        !is_process_alive(desc_pid, desc_start),
+        "stubborn SIGTERM-ignoring descendant {desc_pid} must be SIGKILLed before cancel returns"
+    );
+
+    // --- 4. Daemon restart recovery kills orphaned process group persisted in task_runs ---
+    let orphan_dir = TempDirGuard::new("atmd-orphan");
+    let orphan_db = orphan_dir.path().join("d.sqlite");
+    let orphan_run_dir = orphan_dir.path().join("runs").join("run-orphan-1");
+    fs::create_dir_all(&orphan_run_dir).unwrap();
+
+    let mut orphan_child = Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .expect("spawn orphan sleep");
+    let orphan_pgid = orphan_child.id() as i64;
+    let orphan_start = process_start_time(orphan_pgid).expect("orphan start time");
+    assert!(is_process_alive(orphan_pgid, orphan_start));
+
+    {
+        let runs_store = atomium_core::RunStore::open(&orphan_db).unwrap();
+        runs_store
+            .upsert(&RunRecord {
+                run_id: "run-orphan-1".into(),
+                profile_id: "acct_orphan".into(),
+                agent_kind: "antigravity".into(),
+                program: "/bin/sleep".into(),
+                args: vec!["30".into()],
+                status: TaskStatus::Running,
+                exit_code: None,
+                proxy_port: None,
+                cleanup_verified: false,
+                token_refreshed: false,
+                snapshot_version: Some(1),
+                reason: None,
+                created_at_ms: 1_700_000_000_000,
+                updated_at_ms: 1_700_000_000_000,
+            })
+            .unwrap();
+        runs_store
+            .set_child_process("run-orphan-1", orphan_pgid, orphan_start)
+            .unwrap();
+    }
+
+    // Opening DaemonState on the same DB simulates replacement daemon startup recovery.
+    let recovered = atomiumd::DaemonState::open(&orphan_db).expect("recover daemon state");
+    let _ = orphan_child.wait(); // reap zombie in our test parent process
+    assert!(
+        !is_process_alive(orphan_pgid, orphan_start),
+        "orphaned process group must be terminated during daemon recovery"
+    );
+    assert!(
+        !orphan_run_dir.exists(),
+        "orphaned run directory must be cleaned up during daemon recovery"
+    );
+    let rec = recovered.runs().get("run-orphan-1").unwrap().unwrap();
+    assert_eq!(rec.status, TaskStatus::Interrupted);
+}
