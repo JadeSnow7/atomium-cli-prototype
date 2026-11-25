@@ -1,5 +1,5 @@
 use atomium_core::{
-    encode_agy_oauth_for_keychain, EncryptedVault, LeaseMode, LeaseRequest,
+    encode_agy_oauth_for_keychain, EncryptedVault, LeaseMode, LeaseRequest, WorkspaceBroker,
     AGY_DEFAULT_RELATIVE_PATH,
 };
 use atomium_protocol::{
@@ -2034,4 +2034,245 @@ async fn run_record_live_events_and_replay_redact_args_and_token_patterns() {
     }
     assert!(record_json.contains(&digest_marker(api_secret)));
     assert!(record_json.contains(&digest_marker(token_secret)));
+}
+
+#[tokio::test]
+async fn workspace_exclusive_lease_serializes_writers_and_recovers_orphans() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    capture_test_subscription(&mut client, "ws_owner_a").await;
+    capture_test_subscription(&mut client, "ws_owner_b").await;
+
+    for (ws_id, dir_name) in [("ws-lease-a", "host-a"), ("ws-lease-b", "host-b")] {
+        let host = srv.dir.path().join(dir_name);
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join("file.txt"), b"baseline").unwrap();
+        let imported = client
+            .call(
+                json!(format!("import-{ws_id}")),
+                "workspaces.import",
+                json!({
+                    "source_dir": host.to_string_lossy(),
+                    "workspace_id": ws_id
+                }),
+            )
+            .await;
+        assert!(imported.error.is_none(), "import err: {:?}", imported.error);
+    }
+
+    // First writer owns ws-lease-a.
+    let first = client
+        .call(
+            json!(1),
+            "runs.start",
+            json!({
+                "profile_id": "ws_owner_a",
+                "program": "/bin/sleep",
+                "args": ["2"],
+                "workspace_id": "ws-lease-a"
+            }),
+        )
+        .await;
+    assert!(first.error.is_none(), "first start err: {:?}", first.error);
+    let first_run: RunRecord = serde_json::from_value(first.result.unwrap()).unwrap();
+
+    // A different subscription cannot write the same workspace while the first run is active.
+    let conflict = client
+        .call(
+            json!(2),
+            "runs.start",
+            json!({
+                "profile_id": "ws_owner_b",
+                "program": "/bin/sh",
+                "args": ["-c", "true"],
+                "workspace_id": "ws-lease-a"
+            }),
+        )
+        .await;
+    assert_eq!(
+        conflict.error.expect("same workspace must conflict").code,
+        -32009
+    );
+
+    // A different workspace remains parallelizable.
+    let parallel = client
+        .call(
+            json!(3),
+            "runs.start",
+            json!({
+                "profile_id": "ws_owner_b",
+                "program": "/bin/sleep",
+                "args": ["5"],
+                "workspace_id": "ws-lease-b"
+            }),
+        )
+        .await;
+    assert!(
+        parallel.error.is_none(),
+        "parallel err: {:?}",
+        parallel.error
+    );
+    let parallel_run: RunRecord = serde_json::from_value(parallel.result.unwrap()).unwrap();
+
+    // Cancelling the parallel writer releases its workspace lease.
+    let cancel = client
+        .call(
+            json!(4),
+            "runs.cancel",
+            json!({ "run_id": parallel_run.run_id, "reason": "test complete" }),
+        )
+        .await;
+    assert!(cancel.error.is_none(), "cancel err: {:?}", cancel.error);
+    let after_cancel = client
+        .call(
+            json!(5),
+            "runs.start",
+            json!({
+                "profile_id": "ws_owner_b",
+                "program": "/bin/sh",
+                "args": ["-c", "true"],
+                "workspace_id": "ws-lease-b"
+            }),
+        )
+        .await;
+    assert!(
+        after_cancel.error.is_none(),
+        "workspace lease must be released after cancel: {:?}",
+        after_cancel.error
+    );
+    let after_cancel_run: RunRecord = serde_json::from_value(after_cancel.result.unwrap()).unwrap();
+    let after_cancel_final = wait_for_run_done(&mut client, &after_cancel_run.run_id).await;
+    assert_eq!(after_cancel_final.status, TaskStatus::Completed);
+
+    // Normal completion releases ws-lease-a, so the second subscription may use it afterwards.
+    let first_final = wait_for_run_done(&mut client, &first_run.run_id).await;
+    assert_eq!(first_final.status, TaskStatus::Completed);
+    let second_after_completion = client
+        .call(
+            json!(6),
+            "runs.start",
+            json!({
+                "profile_id": "ws_owner_b",
+                "program": "/bin/sh",
+                "args": ["-c", "true"],
+                "workspace_id": "ws-lease-a"
+            }),
+        )
+        .await;
+    assert!(
+        second_after_completion.error.is_none(),
+        "workspace lease must be released after completion: {:?}",
+        second_after_completion.error
+    );
+    let second_run: RunRecord =
+        serde_json::from_value(second_after_completion.result.unwrap()).unwrap();
+    let second_final = wait_for_run_done(&mut client, &second_run.run_id).await;
+    assert_eq!(second_final.status, TaskStatus::Completed);
+
+    // Simulate an orphaned workspace lease held by a dead PID. The existing zombie-lease
+    // self-healing path must reclaim it generically, including workspace resources.
+    let mut dead_child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let dead_pid = dead_child.id() as i64;
+    let _ = dead_child.wait().unwrap();
+    srv.state
+        .leases()
+        .acquire_all_with_holder(
+            "run-zombie-workspace",
+            vec![LeaseRequest {
+                resource_key: "workspace:ws-lease-a".into(),
+                mode: LeaseMode::Exclusive,
+            }],
+            300,
+            dead_pid,
+            424242,
+        )
+        .unwrap();
+
+    let list = client.call(json!(7), "subscriptions.list", json!({})).await;
+    assert!(list.error.is_none(), "list err: {:?}", list.error);
+    assert!(srv
+        .state
+        .leases()
+        .list_active_leases()
+        .unwrap()
+        .iter()
+        .all(|lease| lease.resource_key != "workspace:ws-lease-a"));
+
+    let after_reclaim = client
+        .call(
+            json!(8),
+            "runs.start",
+            json!({
+                "profile_id": "ws_owner_b",
+                "program": "/bin/sh",
+                "args": ["-c", "true"],
+                "workspace_id": "ws-lease-a"
+            }),
+        )
+        .await;
+    assert!(
+        after_reclaim.error.is_none(),
+        "orphaned workspace lease must be reclaimed: {:?}",
+        after_reclaim.error
+    );
+    let reclaimed_run: RunRecord = serde_json::from_value(after_reclaim.result.unwrap()).unwrap();
+    let reclaimed_final = wait_for_run_done(&mut client, &reclaimed_run.run_id).await;
+    assert_eq!(reclaimed_final.status, TaskStatus::Completed);
+}
+
+#[tokio::test]
+async fn daemon_startup_marks_failed_export_recovery_inconsistent_and_emits_event() {
+    let dir = TempDirGuard::new("atmd-export-recovery");
+    let db_path = dir.path().join("d.sqlite");
+    let broker_dir = dir.path().join("broker");
+    let host = dir.path().join("host");
+    fs::create_dir_all(&host).unwrap();
+    fs::write(host.join("a.txt"), b"original").unwrap();
+
+    let broker = WorkspaceBroker::open(&db_path, &broker_dir).unwrap();
+    let ws = broker.import_and_record(&host, None, None).unwrap();
+    let export_dir = broker_dir.join("exports").join("appr-startup-bad");
+    fs::create_dir_all(&export_dir).unwrap();
+    fs::write(host.join("a.txt"), b"partially committed").unwrap();
+    let missing_backup = export_dir.join("backup").join("a.txt");
+    let journal = serde_json::json!({
+        "phase": "committing",
+        "export_id": "appr-startup-bad",
+        "workspace_id": ws.workspace_id,
+        "target_dir": host.to_string_lossy(),
+        "operations": [{
+            "op": "write",
+            "final_path": host.join("a.txt").to_string_lossy(),
+            "temp_path": null,
+            "backup_path": missing_backup.to_string_lossy(),
+            "expected_sha256": null
+        }],
+        "done_ops": [0],
+        "post_verify_ok": null,
+        "error": null
+    });
+    fs::write(
+        export_dir.join("journal.json"),
+        serde_json::to_vec_pretty(&journal).unwrap(),
+    )
+    .unwrap();
+
+    let state = atomiumd::DaemonState::open(&db_path).expect("open recovering daemon");
+    assert!(state
+        .broker()
+        .workspace_export_inconsistency(&ws.workspace_id)
+        .unwrap()
+        .is_some());
+    let events = state.leases().query_events_after(0).unwrap();
+    assert!(events.iter().any(|event| {
+        event.run_id == "system"
+            && matches!(
+                &event.payload,
+                TaskEventPayload::PolicyDenied { category, detail }
+                    if category == "export_inconsistent" && detail.contains(&ws.workspace_id)
+            )
+    }));
 }

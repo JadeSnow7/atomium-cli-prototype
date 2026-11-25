@@ -551,6 +551,23 @@ impl DaemonState {
 
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
 
+        // 3. Roll back interrupted broker exports before accepting new work. If rollback itself
+        // fails, persist a system event and leave the workspace in export_inconsistent state.
+        for (workspace_id, reason) in broker.recover_interrupted_exports() {
+            let detail = format!(
+                "workspace {workspace_id} export recovery failed and is marked export_inconsistent: {reason}"
+            );
+            if let Ok(ev) = leases.append_event(
+                "system",
+                &TaskEventPayload::PolicyDenied {
+                    category: "export_inconsistent".into(),
+                    detail,
+                },
+            ) {
+                let _ = event_tx.send(ev);
+            }
+        }
+
         Ok(Self {
             leases,
             profiles,
@@ -1689,6 +1706,13 @@ async fn handle_runs_start(
                 mode: LeaseMode::Shared,
             });
         }
+    }
+
+    if let Some(ws_id) = &req.workspace_id {
+        lease_reqs.push(LeaseRequest {
+            resource_key: format!("workspace:{ws_id}"),
+            mode: LeaseMode::Exclusive,
+        });
     }
 
     state

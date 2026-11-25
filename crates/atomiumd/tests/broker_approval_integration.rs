@@ -328,6 +328,7 @@ async fn full_dual_role_broker_review_approval_and_atomic_export_loop() {
     let receipt: ExportResult =
         serde_json::from_value(resolve_val["export_result"].clone()).unwrap();
     assert!(receipt.exported);
+    assert_eq!(receipt.post_verify_ok, Some(true));
     assert_eq!(receipt.applied_added, 1);
     assert_eq!(receipt.applied_modified, 1);
 

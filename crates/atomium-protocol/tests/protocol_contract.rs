@@ -545,6 +545,7 @@ fn broker_and_approval_m3_types_roundtrip() {
         applied_added: 0,
         applied_modified: 1,
         applied_deleted: 0,
+        post_verify_ok: Some(true),
         exported_at_ms: 1002,
     };
     let v_exp = assert_json_roundtrip(&export);

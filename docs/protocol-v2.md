@@ -83,6 +83,8 @@ PresenceProof {
 | OAuth 捕获与刷新写回只接受结构合法的 agy JSON（`id_token_email` + `token` 对象），且刷新写回必须与快照原身份一致；身份变化或畸形载荷只拒绝写回并记录审计事件，不覆盖 Vault | 防止子进程用垃圾数据或其他账号凭据覆写已知良好的 Vault 快照，落实禁止自动换号红线 |
 | 隔离 `$HOME` 中投影 OAuth 的写回读取拒绝符号链接路径组件；运行首领进程正常退出后也会收尾终止整个进程组 | 防止子进程利用符号链接诱导守护进程读取宿主文件，或留下运行结束后的后台孤儿进程 |
 | `runs.start.allowed_egress_hosts` 只接受可解析的精确主机（可选端口）或通配符条目；畸形条目在 RPC 边界拒绝，直接构造代理时也会 fail closed。网关把十进制/八进制/十六进制等非规范 IPv4 数字形式按解析后的地址分类，拒绝用 `127.1`、整数或十六进制形式绕过非公网地址拦截 | 防止拼写错误的策略被静默放宽为无限制出网，并防止替代数字编码绕过回环、链路本地、CGNAT 或文档前缀拦截 |
+| `ExportResult` 新增可选字段 `post_verify_ok`；导出改为 `broker_dir/exports/<export_id>/journal.json` 记录的准备-提交-回滚流程，守护进程启动时自动恢复未完成导出。回滚失败的工作区进入 `export_inconsistent`，后续导出返回 `-32018` | 防止导出中途崩溃造成宿主工作区处于无审计、不可恢复的中间状态 |
+| 带 `workspace_id` 的运行在 `runs.start` 租约原子获取阶段同时获取 `workspace:<workspace_id>` Exclusive 租约；正常结束、取消、超时和僵尸租约回收路径都释放该租约 | 防止多个写入者并发修改同一 Broker 工作副本 |
 
 ## 5. v2 类型（已确定，按里程碑实现）
 
@@ -208,6 +210,7 @@ struct DeviceRecord { device_id: String, display_name: String, platform: String,
 | -32015 | 授权已过期或次数用尽 | v2 |
 | -32016 | 达到平台上限（例如同时只能运行 2 台 macOS VM） | v2 |
 | -32017 | 调用方未通过签名校验 | v2 |
+| -32018 | 工作区导出回滚失败，处于 `export_inconsistent` | 已用 |
 
 ## 8. 状态机
 

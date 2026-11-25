@@ -7,7 +7,7 @@ use atomium_protocol::{
 use rusqlite::params;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -62,6 +62,9 @@ pub enum BrokerError {
     #[error("already_exported: {0}")]
     AlreadyExported(String),
 
+    #[error("export_inconsistent: {0}")]
+    ExportInconsistent(String),
+
     #[error("baseline_conflict: {detail}")]
     BaselineConflict {
         detail: String,
@@ -82,6 +85,7 @@ impl BrokerError {
         match self {
             Self::BaselineConflict { .. } => -32010,
             Self::CandidateInvalidated(_) | Self::AlreadyExported(_) => -32011,
+            Self::ExportInconsistent(_) => -32018,
             Self::SymlinkRejected(_)
             | Self::SpecialFileRejected(_)
             | Self::PathTraversalRejected(_)
@@ -762,6 +766,270 @@ fn find_drifted_paths(expected: &[SnapshotFileEntry], actual: &[SnapshotFileEntr
     drifted
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ExportJournalOperation {
+    op: String,
+    final_path: String,
+    temp_path: Option<String>,
+    backup_path: Option<String>,
+    expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ExportJournal {
+    phase: String,
+    export_id: String,
+    workspace_id: String,
+    target_dir: String,
+    operations: Vec<ExportJournalOperation>,
+    done_ops: Vec<usize>,
+    post_verify_ok: Option<bool>,
+    error: Option<String>,
+}
+
+fn fsync_dir(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+fn fsync_parent(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn write_export_journal(export_dir: &Path, journal: &ExportJournal) -> std::io::Result<()> {
+    fs::create_dir_all(export_dir)?;
+    let journal_path = export_dir.join("journal.json");
+    let tmp_path = export_dir.join("journal.json.tmp");
+    let bytes = serde_json::to_vec_pretty(journal).map_err(std::io::Error::other)?;
+    {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp_path, &journal_path)?;
+    fsync_dir(export_dir)?;
+    Ok(())
+}
+
+fn read_export_journal(path: &Path) -> std::result::Result<ExportJournal, BrokerError> {
+    let bytes = fs::read(path)?;
+    serde_json::from_slice(&bytes).map_err(|e| BrokerError::Storage(e.to_string()))
+}
+
+fn copy_file_preserving_mode(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(src, dst)?;
+    let mode = fs::metadata(src)?.permissions();
+    fs::set_permissions(dst, mode)?;
+    File::open(dst)?.sync_all()?;
+    fsync_parent(dst)?;
+    Ok(())
+}
+
+fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
+    Ok(hex::encode(Sha256::digest(fs::read(path)?)))
+}
+
+fn copy_file_contents_create_new(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let bytes = fs::read(src)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(dst)?;
+    file.write_all(&bytes)?;
+    file.set_permissions(fs::metadata(src)?.permissions())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Restores a backup through a same-directory temporary file and atomic rename. Unlike a
+/// direct copy, rename replaces a maliciously swapped symlink itself instead of following it.
+fn restore_backup_preserving_mode(backup: &Path, final_path: &Path) -> std::io::Result<()> {
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("rollback final path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let temp_path = parent.join(format!(
+        ".atomium-rollback-{}.tmp",
+        uuid::Uuid::now_v7().simple()
+    ));
+    let copy_result = copy_file_contents_create_new(backup, &temp_path);
+    if let Err(err) = copy_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    if let Err(err) = fs::rename(&temp_path, final_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    fsync_parent(final_path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXPORT_COMMIT_FAIL_AFTER_OPS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn export_file_mode(existing_mode: Option<u32>, executable: bool) -> u32 {
+    if let Some(mode) = existing_mode {
+        let preserved = mode & 0o7777;
+        if executable {
+            let x_from_read = (preserved & 0o444) >> 2;
+            (preserved & !0o111) | if x_from_read == 0 { 0o111 } else { x_from_read }
+        } else {
+            preserved & !0o111
+        }
+    } else if executable {
+        0o755
+    } else {
+        0o644
+    }
+}
+
+fn digest_if_regular_file(path: &Path) -> std::result::Result<Option<String>, String> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot stat {}: {e}", path.display())),
+    };
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "export recovery path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    sha256_file_hex(path)
+        .map(Some)
+        .map_err(|e| format!("cannot digest {}: {e}", path.display()))
+}
+
+/// Infers whether a commit operation reached the host filesystem when a crash prevented the
+/// corresponding done_ops journal append. Rename and unlink are atomic, so the presence or
+/// digest of the final path and staged temporary path is sufficient to classify the operation;
+/// ambiguous states fail closed and mark the workspace inconsistent.
+fn infer_export_operation_state(op: &ExportJournalOperation) -> std::result::Result<bool, String> {
+    match op.op.as_str() {
+        "write" => {
+            if op
+                .temp_path
+                .as_deref()
+                .is_some_and(|temp| Path::new(temp).exists())
+            {
+                return Ok(false);
+            }
+            let final_path = Path::new(&op.final_path);
+            let final_digest = digest_if_regular_file(final_path)?;
+            if let (Some(expected), Some(actual)) = (&op.expected_sha256, &final_digest) {
+                if actual == expected {
+                    return Ok(true);
+                }
+            }
+            if let Some(backup) = &op.backup_path {
+                let backup_digest = digest_if_regular_file(Path::new(backup))?
+                    .ok_or_else(|| format!("write rollback backup is missing: {backup}"))?;
+                if final_digest.as_deref() == Some(backup_digest.as_str()) {
+                    return Ok(false);
+                }
+                return Err(format!(
+                    "cannot infer write operation state for {}; final path matches neither candidate nor backup",
+                    op.final_path
+                ));
+            }
+            match final_digest {
+                None => Ok(false),
+                Some(_) => Err(format!(
+                    "cannot infer added-file operation state for {}; unexpected final file",
+                    op.final_path
+                )),
+            }
+        }
+        "delete" => {
+            let backup = op
+                .backup_path
+                .as_deref()
+                .ok_or_else(|| format!("delete operation has no backup path: {}", op.final_path))?;
+            let backup_digest = digest_if_regular_file(Path::new(backup))?
+                .ok_or_else(|| format!("delete rollback backup is missing: {backup}"))?;
+            match digest_if_regular_file(Path::new(&op.final_path))? {
+                None => Ok(true),
+                Some(actual) if actual == backup_digest => Ok(false),
+                Some(_) => Err(format!(
+                    "cannot infer delete operation state for {}; final path differs from backup",
+                    op.final_path
+                )),
+            }
+        }
+        other => Err(format!("unknown export journal operation: {other}")),
+    }
+}
+
+fn rollback_export_journal(journal: &ExportJournal) -> std::result::Result<(), String> {
+    if journal
+        .done_ops
+        .iter()
+        .any(|index| *index >= journal.operations.len())
+    {
+        return Err("journal done_op index is out of range".to_string());
+    }
+    let recorded_done: BTreeSet<usize> = journal.done_ops.iter().copied().collect();
+    let mut completed_ops = Vec::new();
+    for (index, op) in journal.operations.iter().enumerate() {
+        let completed = if recorded_done.contains(&index) {
+            true
+        } else {
+            infer_export_operation_state(op)
+                .map_err(|e| format!("cannot recover journal op {index}: {e}"))?
+        };
+        if completed {
+            completed_ops.push(index);
+        }
+    }
+
+    for index in completed_ops.iter().rev() {
+        let op = journal
+            .operations
+            .get(*index)
+            .ok_or_else(|| format!("journal done_op index {index} is out of range"))?;
+        let final_path = PathBuf::from(&op.final_path);
+        let result = if let Some(backup) = &op.backup_path {
+            restore_backup_preserving_mode(Path::new(backup), &final_path)
+                .map_err(|e| e.to_string())
+        } else if op.op == "write" {
+            match fs::remove_file(&final_path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
+        } else {
+            Err("delete operation has no backup to restore".to_string())
+        };
+        result.map_err(|e| format!("rollback op {index} {} failed: {e}", op.final_path))?;
+        fsync_parent(&final_path)
+            .map_err(|e| format!("rollback could not fsync parent for {}: {e}", op.final_path))?;
+    }
+    // Staged temp files are host-directory mutations too. Remove any that were never renamed,
+    // including when the process crashed after prepare but before the first commit operation.
+    for op in &journal.operations {
+        if let Some(temp) = &op.temp_path {
+            match fs::remove_file(temp) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(format!(
+                        "rollback could not remove staged temp file {temp}: {e}"
+                    ))
+                }
+            }
+            fsync_parent(Path::new(temp))
+                .map_err(|e| format!("rollback could not fsync temp parent for {temp}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Persistent SQLite + filesystem Host Workspace Broker.
 pub struct WorkspaceBroker {
     db_path: PathBuf,
@@ -813,6 +1081,12 @@ impl WorkspaceBroker {
                 workspace_id     TEXT NOT NULL,
                 receipt_json     TEXT NOT NULL,
                 exported_at_ms   INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS workspace_export_inconsistencies (
+                workspace_id     TEXT PRIMARY KEY,
+                reason           TEXT NOT NULL,
+                created_at_ms    INTEGER NOT NULL
             );
             "#,
         )?;
@@ -1193,6 +1467,91 @@ impl WorkspaceBroker {
         Ok(items)
     }
 
+    pub fn workspace_export_inconsistency(
+        &self,
+        workspace_id: &str,
+    ) -> std::result::Result<Option<String>, BrokerError> {
+        let conn = SecureSqliteConnection::open(&self.db_path)
+            .map_err(|e| BrokerError::Storage(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT reason FROM workspace_export_inconsistencies WHERE workspace_id = ?1")
+            .map_err(|e| BrokerError::Storage(e.to_string()))?;
+        let mut rows = stmt
+            .query(params![workspace_id])
+            .map_err(|e| BrokerError::Storage(e.to_string()))?;
+        if let Some(row) = rows
+            .next()
+            .map_err(|e| BrokerError::Storage(e.to_string()))?
+        {
+            Ok(Some(
+                row.get::<_, String>(0)
+                    .map_err(|e| BrokerError::Storage(e.to_string()))?,
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn mark_workspace_export_inconsistent(
+        &self,
+        workspace_id: &str,
+        reason: &str,
+    ) -> std::result::Result<(), BrokerError> {
+        let conn = SecureSqliteConnection::open(&self.db_path)
+            .map_err(|e| BrokerError::Storage(e.to_string()))?;
+        conn.execute(
+            r#"INSERT INTO workspace_export_inconsistencies (workspace_id, reason, created_at_ms)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(workspace_id) DO UPDATE SET reason = excluded.reason, created_at_ms = excluded.created_at_ms"#,
+            params![workspace_id, reason, now_ms()],
+        )
+        .map_err(|e| BrokerError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Recover interrupted export journals at daemon startup. Prepared/committing journals are
+    /// rolled back; rollback failure marks the workspace inconsistent and blocks future exports.
+    pub fn recover_interrupted_exports(&self) -> Vec<(String, String)> {
+        let mut inconsistent = Vec::new();
+        let exports_root = self.broker_dir.join("exports");
+        let Ok(entries) = fs::read_dir(&exports_root) else {
+            return inconsistent;
+        };
+        for entry in entries.flatten() {
+            let export_dir = entry.path();
+            if !export_dir.is_dir() {
+                continue;
+            }
+            let journal_path = export_dir.join("journal.json");
+            if !journal_path.exists() {
+                continue;
+            }
+            let Ok(mut journal) = read_export_journal(&journal_path) else {
+                continue;
+            };
+            if !matches!(
+                journal.phase.as_str(),
+                "preparing" | "prepared" | "committing"
+            ) {
+                continue;
+            }
+            match rollback_export_journal(&journal) {
+                Ok(()) => {
+                    journal.phase = "rolled_back".into();
+                    journal.error = None;
+                }
+                Err(reason) => {
+                    journal.phase = "inconsistent".into();
+                    journal.error = Some(reason.clone());
+                    let _ = self.mark_workspace_export_inconsistent(&journal.workspace_id, &reason);
+                    inconsistent.push((journal.workspace_id.clone(), reason));
+                }
+            }
+            let _ = write_export_journal(&export_dir, &journal);
+        }
+        inconsistent
+    }
+
     /// Re-verifies candidate integrity and host target baseline digest before applying approved
     /// changes atomically (temp file + fsync + rename). Aborts with `BrokerError::BaselineConflict`
     /// and zero partial writes if any host file changed since import.
@@ -1217,6 +1576,13 @@ impl WorkspaceBroker {
                     candidate.workspace_id
                 ))
             })?;
+
+        if let Some(reason) = self.workspace_export_inconsistency(&candidate.workspace_id)? {
+            return Err(BrokerError::ExportInconsistent(format!(
+                "workspace {} requires manual reconciliation: {reason}",
+                candidate.workspace_id
+            )));
+        }
 
         match candidate.status {
             CandidateStatus::Frozen => {}
@@ -1315,17 +1681,25 @@ impl WorkspaceBroker {
             });
         }
 
-        // 3. Pre-validate every change path and stage all Added/Modified files to temp files + fsync.
-        struct StagedWrite {
-            temp_path: PathBuf,
-            final_path: PathBuf,
+        // 3. Prepare all writes and backups, then persist a crash-recovery journal before
+        // mutating the host target. Temp files remain on the same filesystem as their final
+        // destination so each commit step is an atomic rename.
+        if approval_id.is_empty()
+            || approval_id.contains('/')
+            || approval_id.contains('\\')
+            || approval_id.contains("..")
+        {
+            return Err(BrokerError::PathTraversalRejected(approval_id.to_string()));
         }
-
-        let mut staged: Vec<StagedWrite> = Vec::new();
-        let mut deletions: Vec<PathBuf> = Vec::new();
+        let export_dir = self.broker_dir.join("exports").join(approval_id);
+        let backup_root = export_dir.join("backup");
+        let mut operations: Vec<ExportJournalOperation> = Vec::new();
         let mut touched_dirs: BTreeSet<PathBuf> = BTreeSet::new();
 
-        let stage_res = (|| -> std::result::Result<(), BrokerError> {
+        // Plan every operation before mutating the host target. The initial journal is
+        // fsynced before prepare writes begin, so even a crash halfway through prepare leaves
+        // enough information to remove staged temporary files.
+        let plan_res = (|| -> std::result::Result<(), BrokerError> {
             for entry in &candidate.diff.entries {
                 let rel = validate_relative_path(&entry.relative_path)?;
                 let final_path = canonical_target.join(&rel);
@@ -1335,6 +1709,7 @@ impl WorkspaceBroker {
                             entry.relative_path.clone(),
                         ));
                     }
+                    touched_dirs.insert(parent.to_path_buf());
                 }
 
                 match entry.kind {
@@ -1342,69 +1717,333 @@ impl WorkspaceBroker {
                         let parent = final_path.parent().ok_or_else(|| {
                             BrokerError::PathTraversalRejected(entry.relative_path.clone())
                         })?;
-                        fs::create_dir_all(parent)?;
-                        let src_path = frozen_dir.join(&rel);
-                        let bytes = fs::read(&src_path)?;
-
-                        let tmp_name =
-                            format!(".atomium-export-{}.tmp", uuid::Uuid::now_v7().simple());
-                        let temp_path = parent.join(tmp_name);
-                        let mut f = File::create(&temp_path)?;
-                        f.write_all(&bytes)?;
-                        let mode = if entry.candidate_executable.unwrap_or(false) {
-                            0o755
-                        } else {
-                            0o644
+                        let expected_sha256 = entry.candidate_sha256.clone().ok_or_else(|| {
+                            BrokerError::DigestMismatch(format!(
+                                "candidate diff entry {} lacks candidate_sha256",
+                                entry.relative_path
+                            ))
+                        })?;
+                        let existing_meta = match fs::symlink_metadata(&final_path) {
+                            Ok(meta) => Some(meta),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(e) => return Err(BrokerError::Io(e)),
                         };
-                        f.set_permissions(fs::Permissions::from_mode(mode))?;
-                        f.sync_all()?;
-                        drop(f);
-
-                        touched_dirs.insert(parent.to_path_buf());
-                        staged.push(StagedWrite {
-                            temp_path,
-                            final_path,
+                        let backup_path = if let Some(meta) = &existing_meta {
+                            if !meta.file_type().is_file() {
+                                return Err(BrokerError::InvalidDirectory(format!(
+                                    "export target is not a regular file: {}",
+                                    entry.relative_path
+                                )));
+                            }
+                            Some(backup_root.join(&rel))
+                        } else {
+                            None
+                        };
+                        let temp_path = parent.join(format!(
+                            ".atomium-export-{}.tmp",
+                            uuid::Uuid::now_v7().simple()
+                        ));
+                        operations.push(ExportJournalOperation {
+                            op: "write".into(),
+                            final_path: final_path.to_string_lossy().into_owned(),
+                            temp_path: Some(temp_path.to_string_lossy().into_owned()),
+                            backup_path: backup_path
+                                .map(|path| path.to_string_lossy().into_owned()),
+                            expected_sha256: Some(expected_sha256),
                         });
                     }
                     FileChangeKind::Deleted => {
-                        if let Some(parent) = final_path.parent() {
-                            touched_dirs.insert(parent.to_path_buf());
+                        let meta = fs::symlink_metadata(&final_path).map_err(|e| {
+                            BrokerError::InvalidDirectory(format!(
+                                "cannot stat deletion target {}: {e}",
+                                entry.relative_path
+                            ))
+                        })?;
+                        if !meta.file_type().is_file() {
+                            return Err(BrokerError::InvalidDirectory(format!(
+                                "deletion target is not a regular file: {}",
+                                entry.relative_path
+                            )));
                         }
-                        deletions.push(final_path);
+                        let backup_path = backup_root.join(&rel);
+                        operations.push(ExportJournalOperation {
+                            op: "delete".into(),
+                            final_path: final_path.to_string_lossy().into_owned(),
+                            temp_path: None,
+                            backup_path: Some(backup_path.to_string_lossy().into_owned()),
+                            expected_sha256: None,
+                        });
+                    }
+                }
+            }
+            Ok(())
+        })();
+        plan_res?;
+
+        let mut journal = ExportJournal {
+            phase: "preparing".into(),
+            export_id: approval_id.to_string(),
+            workspace_id: candidate.workspace_id.clone(),
+            target_dir: canonical_target.to_string_lossy().into_owned(),
+            operations,
+            done_ops: Vec::new(),
+            post_verify_ok: None,
+            error: None,
+        };
+        write_export_journal(&export_dir, &journal)?;
+
+        let prepare_res = (|| -> std::result::Result<(), BrokerError> {
+            fs::create_dir_all(&backup_root)?;
+            for (entry, op) in candidate.diff.entries.iter().zip(journal.operations.iter()) {
+                let rel = validate_relative_path(&entry.relative_path)?;
+                let final_path = canonical_target.join(&rel);
+                match entry.kind {
+                    FileChangeKind::Added | FileChangeKind::Modified => {
+                        let parent = final_path.parent().ok_or_else(|| {
+                            BrokerError::PathTraversalRejected(entry.relative_path.clone())
+                        })?;
+                        fs::create_dir_all(parent)?;
+
+                        if let Some(backup) = &op.backup_path {
+                            copy_file_preserving_mode(&final_path, Path::new(backup))?;
+                        }
+
+                        let src_path = frozen_dir.join(&rel);
+                        let bytes = fs::read(&src_path)?;
+                        let expected_sha256 = op.expected_sha256.as_deref().ok_or_else(|| {
+                            BrokerError::DigestMismatch(format!(
+                                "journal write operation lacks expected sha256: {}",
+                                entry.relative_path
+                            ))
+                        })?;
+                        let actual_sha256 = hex::encode(Sha256::digest(&bytes));
+                        if actual_sha256 != expected_sha256 {
+                            return Err(BrokerError::DigestMismatch(format!(
+                                "frozen file digest mismatch for {}: expected {}, actual {}",
+                                entry.relative_path, expected_sha256, actual_sha256
+                            )));
+                        }
+
+                        let temp_path =
+                            PathBuf::from(op.temp_path.as_deref().ok_or_else(|| {
+                                BrokerError::Storage(format!(
+                                    "journal write operation lacks temp_path: {}",
+                                    op.final_path
+                                ))
+                            })?);
+                        let mut f = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&temp_path)?;
+                        f.write_all(&bytes)?;
+                        let existing_mode = match fs::symlink_metadata(&final_path) {
+                            Ok(meta) if meta.file_type().is_file() => {
+                                Some(meta.permissions().mode())
+                            }
+                            Ok(_) => {
+                                return Err(BrokerError::InvalidDirectory(format!(
+                                    "export target is not a regular file: {}",
+                                    entry.relative_path
+                                )))
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(e) => return Err(BrokerError::Io(e)),
+                        };
+                        let mode = export_file_mode(
+                            existing_mode,
+                            entry.candidate_executable.unwrap_or(false),
+                        );
+                        f.set_permissions(fs::Permissions::from_mode(mode))?;
+                        f.sync_all()?;
+                        drop(f);
+                        fsync_parent(&temp_path)?;
+                    }
+                    FileChangeKind::Deleted => {
+                        let backup = op.backup_path.as_deref().ok_or_else(|| {
+                            BrokerError::Storage(format!(
+                                "journal delete operation lacks backup_path: {}",
+                                op.final_path
+                            ))
+                        })?;
+                        copy_file_preserving_mode(&final_path, Path::new(backup))?;
                     }
                 }
             }
             Ok(())
         })();
 
-        if let Err(err) = stage_res {
-            for item in &staged {
-                let _ = fs::remove_file(&item.temp_path);
-            }
-            return Err(err);
-        }
-
-        // 4. Atomically rename staged files into place, then remove deleted files.
-        for item in &staged {
-            if let Err(err) = fs::rename(&item.temp_path, &item.final_path) {
-                for rem in &staged {
-                    let _ = fs::remove_file(&rem.temp_path);
+        if let Err(err) = prepare_res {
+            journal.error = Some(err.to_string());
+            match rollback_export_journal(&journal) {
+                Ok(()) => {
+                    journal.phase = "rolled_back".into();
+                    let _ = write_export_journal(&export_dir, &journal);
+                    return Err(err);
                 }
-                return Err(BrokerError::Io(err));
-            }
-        }
-        for del_path in &deletions {
-            if del_path.exists() {
-                fs::remove_file(del_path)?;
-            }
-        }
-        for dir in touched_dirs {
-            if let Ok(d) = File::open(&dir) {
-                let _ = d.sync_all();
+                Err(reason) => {
+                    journal.phase = "inconsistent".into();
+                    journal.error = Some(reason.clone());
+                    let _ = write_export_journal(&export_dir, &journal);
+                    let _ =
+                        self.mark_workspace_export_inconsistent(&candidate.workspace_id, &reason);
+                    return Err(BrokerError::ExportInconsistent(format!(
+                        "workspace {} export prepare failed and rollback failed: {reason}",
+                        candidate.workspace_id
+                    )));
+                }
             }
         }
 
-        // 5. Mark candidate exported and persist export receipt.
+        journal.phase = "prepared".into();
+        write_export_journal(&export_dir, &journal)?;
+        journal.phase = "committing".into();
+        write_export_journal(&export_dir, &journal)?;
+
+        // 4. Commit one operation at a time. Every completed operation is appended to the
+        // fsynced journal before the next operation starts, so startup recovery can reverse
+        // exactly the host mutations that completed.
+        let mut commit_error: Option<BrokerError> = None;
+        for index in 0..journal.operations.len() {
+            #[cfg(test)]
+            if EXPORT_COMMIT_FAIL_AFTER_OPS
+                .with(|limit| limit.get())
+                .is_some_and(|limit| journal.done_ops.len() == limit)
+            {
+                commit_error = Some(BrokerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected export commit failure",
+                )));
+                break;
+            }
+
+            let op = journal.operations[index].clone();
+            let final_path = PathBuf::from(&op.final_path);
+            let execution = match op.op.as_str() {
+                "write" => {
+                    let temp_path = op.temp_path.as_deref().ok_or_else(|| {
+                        BrokerError::Storage(format!(
+                            "journal write operation lacks temp_path: {}",
+                            op.final_path
+                        ))
+                    })?;
+                    fs::rename(temp_path, &final_path).map_err(BrokerError::Io)
+                }
+                "delete" => match fs::remove_file(&final_path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(BrokerError::Io(e)),
+                },
+                other => Err(BrokerError::Storage(format!(
+                    "unknown export journal operation: {other}"
+                ))),
+            };
+
+            if let Err(err) = execution {
+                commit_error = Some(err);
+                break;
+            }
+
+            journal.done_ops.push(index);
+            if let Err(err) = write_export_journal(&export_dir, &journal) {
+                commit_error = Some(BrokerError::Io(err));
+                break;
+            }
+            if let Err(err) = fsync_parent(&final_path) {
+                commit_error = Some(BrokerError::Io(err));
+                break;
+            }
+        }
+
+        if let Some(err) = commit_error {
+            journal.error = Some(err.to_string());
+            match rollback_export_journal(&journal) {
+                Ok(()) => {
+                    journal.phase = "rolled_back".into();
+                    let _ = write_export_journal(&export_dir, &journal);
+                    for op in &journal.operations {
+                        if let Some(temp) = &op.temp_path {
+                            let _ = fs::remove_file(temp);
+                        }
+                    }
+                    for dir in &touched_dirs {
+                        let _ = fsync_dir(dir);
+                    }
+                    return Err(err);
+                }
+                Err(reason) => {
+                    journal.phase = "inconsistent".into();
+                    journal.error = Some(reason.clone());
+                    let _ = write_export_journal(&export_dir, &journal);
+                    let _ =
+                        self.mark_workspace_export_inconsistent(&candidate.workspace_id, &reason);
+                    return Err(BrokerError::ExportInconsistent(format!(
+                        "workspace {} export failed and rollback failed: {reason}",
+                        candidate.workspace_id
+                    )));
+                }
+            }
+        }
+
+        journal.phase = "committed".into();
+        write_export_journal(&export_dir, &journal)?;
+
+        // 5. Post-commit verification: re-scan affected files and compare their SHA-256 values.
+        let mut post_verify_ok = true;
+        for op in &journal.operations {
+            let final_path = PathBuf::from(&op.final_path);
+            let ok = match op.op.as_str() {
+                "write" => match (&op.expected_sha256, sha256_file_hex(&final_path)) {
+                    (Some(expected), Ok(actual)) => &actual == expected,
+                    _ => false,
+                },
+                "delete" => !final_path.exists(),
+                _ => false,
+            };
+            if !ok {
+                post_verify_ok = false;
+                break;
+            }
+        }
+        journal.post_verify_ok = Some(post_verify_ok);
+
+        if !post_verify_ok {
+            let verify_err = BrokerError::DigestMismatch(
+                "post-export verification failed; attempting rollback".into(),
+            );
+            journal.error = Some(verify_err.to_string());
+            match rollback_export_journal(&journal) {
+                Ok(()) => {
+                    journal.phase = "rolled_back".into();
+                    let _ = write_export_journal(&export_dir, &journal);
+                    for dir in &touched_dirs {
+                        let _ = fsync_dir(dir);
+                    }
+                    return Err(verify_err);
+                }
+                Err(reason) => {
+                    journal.phase = "inconsistent".into();
+                    journal.error = Some(reason.clone());
+                    let _ = write_export_journal(&export_dir, &journal);
+                    let _ =
+                        self.mark_workspace_export_inconsistent(&candidate.workspace_id, &reason);
+                    return Err(BrokerError::ExportInconsistent(format!(
+                        "workspace {} post-export verification failed and rollback failed: {reason}",
+                        candidate.workspace_id
+                    )));
+                }
+            }
+        }
+
+        // Successful exports retain the journal as a receipt artifact; backup copies are no
+        // longer needed. Remove only the broker-created backup subtree, never host data.
+        let _ = fs::remove_dir_all(&backup_root);
+        let _ = fsync_dir(&export_dir);
+        write_export_journal(&export_dir, &journal)?;
+        for dir in &touched_dirs {
+            let _ = fsync_dir(dir);
+        }
+
+        // 6. Mark candidate exported and persist export receipt only after verification.
         let exported_at_ms = now_ms();
         candidate.status = CandidateStatus::Exported;
         self.upsert_candidate(&candidate)?;
@@ -1421,6 +2060,7 @@ impl WorkspaceBroker {
             applied_added: candidate.diff.added_files,
             applied_modified: candidate.diff.modified_files,
             applied_deleted: candidate.diff.deleted_files,
+            post_verify_ok: journal.post_verify_ok,
             exported_at_ms,
         };
         self.save_export_receipt(&receipt)?;
@@ -1490,4 +2130,312 @@ fn validate_broker_id(kind: &str, id: &str) -> std::result::Result<(), BrokerErr
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod export_recovery_tests {
+    use super::*;
+    use atomium_protocol::WorkspaceImportLimits;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(prefix: &str) -> Self {
+            let id = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "atomium-broker-{prefix}-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn open_broker(root: &Path) -> WorkspaceBroker {
+        WorkspaceBroker::open(root.join("atomium.sqlite"), root.join("broker")).unwrap()
+    }
+
+    fn host_tree_digest(path: &Path) -> String {
+        let (scanned, _, _) = scan_directory_tree(path, &WorkspaceImportLimits::default()).unwrap();
+        let entries: Vec<SnapshotFileEntry> = scanned.into_iter().map(|s| s.entry).collect();
+        compute_tree_digest(&entries)
+    }
+
+    fn freeze_single_file_workspace(
+        root: &Path,
+        name: &str,
+        baseline: &[u8],
+        updated: &[u8],
+    ) -> (
+        WorkspaceBroker,
+        WorkspaceSnapshot,
+        atomium_protocol::CandidateSnapshot,
+        PathBuf,
+    ) {
+        let host = root.join("host");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join(name), baseline).unwrap();
+        let broker = open_broker(root);
+        let ws = broker.import_and_record(&host, None, None).unwrap();
+        fs::write(Path::new(&ws.working_dir).join(name), updated).unwrap();
+        let (candidate, _) = broker
+            .freeze_candidate(&ws.workspace_id, None, None, None)
+            .unwrap();
+        (broker, ws, candidate, host)
+    }
+
+    #[test]
+    fn export_preserves_existing_permissions_and_can_remove_executable_bit() {
+        let root = TestDir::new("permissions");
+        let host = root.path.join("host");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join("secret.txt"), b"old secret file contents").unwrap();
+        fs::write(host.join("tool.sh"), b"#!/bin/sh\necho old\n").unwrap();
+        fs::set_permissions(host.join("secret.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(host.join("tool.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let broker = open_broker(&root.path);
+        let ws = broker.import_and_record(&host, None, None).unwrap();
+        let working = PathBuf::from(&ws.working_dir);
+        fs::write(working.join("secret.txt"), b"new secret file contents").unwrap();
+        fs::write(working.join("tool.sh"), b"#!/bin/sh\necho new\n").unwrap();
+        fs::set_permissions(working.join("tool.sh"), fs::Permissions::from_mode(0o644)).unwrap();
+
+        let (candidate, _) = broker
+            .freeze_candidate(&ws.workspace_id, None, None, None)
+            .unwrap();
+        let receipt = broker
+            .verify_and_export_candidate(
+                "appr-permissions",
+                &candidate.candidate_id,
+                &candidate.candidate_digest,
+                Some(&candidate.baseline_digest),
+                Some(&candidate.patch_digest),
+                &host,
+            )
+            .unwrap();
+        assert_eq!(receipt.post_verify_ok, Some(true));
+        assert_eq!(
+            fs::metadata(host.join("secret.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(host.join("tool.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn injected_nth_commit_failure_rolls_host_back_to_baseline_digest() {
+        let root = TestDir::new("rollback");
+        let host = root.path.join("host");
+        fs::create_dir_all(&host).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(host.join(name), format!("old-{name}")).unwrap();
+        }
+        let broker = open_broker(&root.path);
+        let ws = broker.import_and_record(&host, None, None).unwrap();
+        let working = PathBuf::from(&ws.working_dir);
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(working.join(name), format!("new-{name}")).unwrap();
+        }
+        let (candidate, _) = broker
+            .freeze_candidate(&ws.workspace_id, None, None, None)
+            .unwrap();
+
+        EXPORT_COMMIT_FAIL_AFTER_OPS.with(|limit| limit.set(Some(1)));
+        let result = broker.verify_and_export_candidate(
+            "appr-injected-failure",
+            &candidate.candidate_id,
+            &candidate.candidate_digest,
+            Some(&candidate.baseline_digest),
+            Some(&candidate.patch_digest),
+            &host,
+        );
+        EXPORT_COMMIT_FAIL_AFTER_OPS.with(|limit| limit.set(None));
+
+        assert!(result.is_err(), "injected commit failure must fail export");
+        assert_eq!(host_tree_digest(&host), candidate.baseline_digest);
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            assert_eq!(
+                fs::read_to_string(host.join(name)).unwrap(),
+                format!("old-{name}")
+            );
+        }
+    }
+
+    #[test]
+    fn startup_recovery_rolls_back_prepared_journal() {
+        let root = TestDir::new("startup-recovery");
+        let (broker, ws, _candidate, host) =
+            freeze_single_file_workspace(&root.path, "a.txt", b"original", b"updated");
+        let export_dir = broker.broker_dir.join("exports").join("appr-crash");
+        let backup = export_dir.join("backup").join("a.txt");
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        fs::write(&backup, b"original").unwrap();
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(host.join("a.txt"), b"partially committed").unwrap();
+        let stale_temp = host.join(".atomium-export-stale.tmp");
+        fs::write(&stale_temp, b"uncommitted temp bytes").unwrap();
+
+        let journal = ExportJournal {
+            phase: "prepared".into(),
+            export_id: "appr-crash".into(),
+            workspace_id: ws.workspace_id.clone(),
+            target_dir: host.to_string_lossy().into_owned(),
+            operations: vec![ExportJournalOperation {
+                op: "write".into(),
+                final_path: host.join("a.txt").to_string_lossy().into_owned(),
+                temp_path: Some(stale_temp.to_string_lossy().into_owned()),
+                backup_path: Some(backup.to_string_lossy().into_owned()),
+                expected_sha256: None,
+            }],
+            done_ops: vec![0],
+            post_verify_ok: None,
+            error: None,
+        };
+        write_export_journal(&export_dir, &journal).unwrap();
+
+        let inconsistent = broker.recover_interrupted_exports();
+        assert!(inconsistent.is_empty());
+        assert_eq!(fs::read(host.join("a.txt")).unwrap(), b"original");
+        assert!(!stale_temp.exists());
+        assert_eq!(
+            fs::metadata(host.join("a.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        let recovered = read_export_journal(&export_dir.join("journal.json")).unwrap();
+        assert_eq!(recovered.phase, "rolled_back");
+    }
+
+    #[test]
+    fn startup_recovery_infers_commit_operations_missing_from_done_ops() {
+        let root = TestDir::new("infer-done-ops");
+        let host = root.path.join("host");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join("a.txt"), b"original-a").unwrap();
+        fs::write(host.join("b.txt"), b"original-b").unwrap();
+        let broker = open_broker(&root.path);
+        let ws = broker.import_and_record(&host, None, None).unwrap();
+
+        let export_dir = broker.broker_dir.join("exports").join("appr-infer-crash");
+        let backup_a = export_dir.join("backup").join("a.txt");
+        let backup_b = export_dir.join("backup").join("b.txt");
+        fs::create_dir_all(backup_a.parent().unwrap()).unwrap();
+        fs::write(&backup_a, b"original-a").unwrap();
+        fs::write(&backup_b, b"original-b").unwrap();
+
+        // Simulate a crash after the write rename and delete unlink completed, but before the
+        // done_ops journal append was fsynced. Recovery must infer both mutations from disk.
+        fs::write(host.join("a.txt"), b"updated-a").unwrap();
+        fs::remove_file(host.join("b.txt")).unwrap();
+        let expected_a = hex::encode(Sha256::digest(b"updated-a"));
+        let missing_temp = host.join(".atomium-export-inferred.tmp");
+        let journal = ExportJournal {
+            phase: "committing".into(),
+            export_id: "appr-infer-crash".into(),
+            workspace_id: ws.workspace_id.clone(),
+            target_dir: host.to_string_lossy().into_owned(),
+            operations: vec![
+                ExportJournalOperation {
+                    op: "write".into(),
+                    final_path: host.join("a.txt").to_string_lossy().into_owned(),
+                    temp_path: Some(missing_temp.to_string_lossy().into_owned()),
+                    backup_path: Some(backup_a.to_string_lossy().into_owned()),
+                    expected_sha256: Some(expected_a),
+                },
+                ExportJournalOperation {
+                    op: "delete".into(),
+                    final_path: host.join("b.txt").to_string_lossy().into_owned(),
+                    temp_path: None,
+                    backup_path: Some(backup_b.to_string_lossy().into_owned()),
+                    expected_sha256: None,
+                },
+            ],
+            done_ops: Vec::new(),
+            post_verify_ok: None,
+            error: None,
+        };
+        write_export_journal(&export_dir, &journal).unwrap();
+
+        let inconsistent = broker.recover_interrupted_exports();
+        assert!(inconsistent.is_empty());
+        assert_eq!(fs::read(host.join("a.txt")).unwrap(), b"original-a");
+        assert_eq!(fs::read(host.join("b.txt")).unwrap(), b"original-b");
+        let recovered = read_export_journal(&export_dir.join("journal.json")).unwrap();
+        assert_eq!(recovered.phase, "rolled_back");
+    }
+
+    #[test]
+    fn rollback_failure_marks_workspace_inconsistent_and_rejects_next_export() {
+        let root = TestDir::new("inconsistent");
+        let (broker, ws, candidate, host) =
+            freeze_single_file_workspace(&root.path, "a.txt", b"original", b"updated");
+        let export_dir = broker.broker_dir.join("exports").join("appr-bad-rollback");
+        fs::create_dir_all(&export_dir).unwrap();
+        let missing_backup = export_dir.join("backup").join("missing.txt");
+        let journal = ExportJournal {
+            phase: "committing".into(),
+            export_id: "appr-bad-rollback".into(),
+            workspace_id: ws.workspace_id.clone(),
+            target_dir: host.to_string_lossy().into_owned(),
+            operations: vec![ExportJournalOperation {
+                op: "write".into(),
+                final_path: host.join("a.txt").to_string_lossy().into_owned(),
+                temp_path: None,
+                backup_path: Some(missing_backup.to_string_lossy().into_owned()),
+                expected_sha256: None,
+            }],
+            done_ops: vec![0],
+            post_verify_ok: None,
+            error: None,
+        };
+        write_export_journal(&export_dir, &journal).unwrap();
+
+        let inconsistent = broker.recover_interrupted_exports();
+        assert_eq!(inconsistent.len(), 1);
+        assert_eq!(inconsistent[0].0, ws.workspace_id);
+        assert!(broker
+            .workspace_export_inconsistency(&ws.workspace_id)
+            .unwrap()
+            .is_some());
+
+        let err = broker
+            .verify_and_export_candidate(
+                "appr-after-inconsistent",
+                &candidate.candidate_id,
+                &candidate.candidate_digest,
+                Some(&candidate.baseline_digest),
+                Some(&candidate.patch_digest),
+                &host,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, BrokerError::ExportInconsistent(_)),
+            "expected ExportInconsistent, got {err:?}"
+        );
+    }
 }

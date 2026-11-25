@@ -120,6 +120,14 @@
 - **尽力而为**：`sk-...`、`ya29....`、`AIza...`、`Bearer ...`、JWT 三段式和高熵 base64 串使用模式匹配补充拦截。模式匹配不是协议级保证，不能替代凭据不进入 Box 的设计。
 - 单行日志和每流持久化总量都有上限；`--token`、`--api-key`、`--password`、`--secret` 等参数值无论用 `=` 还是分开书写，持久化时都必须脱敏。子进程实际收到的 argv 不变。
 
+### 7.3 工作区导出一致性语义
+
+- 每个 Broker 工作区同一时间只允许一个写入型 run；`workspace:<workspace_id>` 是 Exclusive 租约，和其他租约在同一事务中原子获取。
+- 导出前先复核 frozen candidate 与宿主目标目录的 baseline digest；基线冲突时不写入任何宿主文件。
+- 导出分为 prepare / commit / verify：先写临时文件并备份将被替换或删除的宿主文件，再把操作日志 fsync 到 `broker_dir/exports/<export_id>/journal.json`；commit 每完成一步就追加 `done_ops`；完成后重新计算受影响文件的 SHA-256 并写入 `post_verify_ok`。
+- 守护进程启动时自动回滚仍处于 `preparing`、`prepared` 或 `committing` 的 journal。若崩溃发生在宿主 `rename`/`unlink` 已完成、但 `done_ops` 尚未落盘的窗口，恢复流程会根据 staged temp、最终文件和备份 digest 推断实际完成状态；无法确定或回滚失败会把工作区标记为 `export_inconsistent`，发出审计事件，并拒绝后续导出（`-32018`）。该状态需要人工核对宿主目录后才能恢复。
+- 修改已有文件时保留宿主文件原有权限位，只按候选状态调整执行位；新建文件使用 `0644` / `0755`，不改变 owner。
+
 ## 8. 并行会话卖点
 
 | 场景 | 可行性 | 前提 |

@@ -452,6 +452,8 @@ pub struct ExportResult {
     pub applied_added: u32,
     pub applied_modified: u32,
     pub applied_deleted: u32,
+    #[serde(default)]
+    pub post_verify_ok: Option<bool>,
     pub exported_at_ms: i64,
 }
 
