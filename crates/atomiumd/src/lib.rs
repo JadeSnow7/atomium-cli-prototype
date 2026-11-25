@@ -14,7 +14,9 @@ use atomium_protocol::{
     RunStartRequest, SubscriptionActivateRequest, SubscriptionCaptureRequest, SubscriptionSummary,
     TaskEvent, TaskEventPayload, TaskStatus, WorkspaceImportRequest,
 };
-use atomium_runtime::{build_seatbelt_command_with_extra_read_paths, SeatbeltConfig};
+use atomium_runtime::{
+    build_seatbelt_command_with_extra_read_paths, KeychainPolicy, SeatbeltConfig,
+};
 use base64::Engine;
 use rand::RngCore;
 use std::collections::HashMap;
@@ -1434,20 +1436,14 @@ async fn handle_runs_start(
     let canon_cache = fs::canonicalize(&run_cache).unwrap_or_else(|_| run_cache.clone());
 
     let mut cmd = if use_seatbelt {
-        let block_keychain = matches!(
-            &profile.credential,
-            CredentialSpec::OauthSnapshot {
-                mode: OAuthStorageMode::IsolatedFile { .. },
-                ..
-            }
-        );
+        let keychain_policy = KeychainPolicy::for_credential(&profile.credential);
         let cfg = SeatbeltConfig {
             workspace_dir: canon_ws.clone(),
             run_home_dir: canon_home.clone(),
             run_tmp_dir: canon_tmp.clone(),
             run_cache_dir: canon_cache.clone(),
             allowed_proxy_port: Some(proxy_port),
-            block_keychain,
+            keychain_policy,
             timezone: profile.locale_policy.timezone.clone(),
             lang: profile.locale_policy.lang.clone(),
         };

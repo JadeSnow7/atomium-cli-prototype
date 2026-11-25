@@ -1,11 +1,30 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use atomium_protocol::{CapabilitiesReport, ProbeEvidence};
+use atomium_protocol::{CapabilitiesReport, CredentialSpec, OAuthStorageMode, ProbeEvidence};
 use std::path::{Path, PathBuf};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 
 use crate::backend::RuntimeBackend;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeychainPolicy {
+    #[default]
+    Deny,
+    AllowLegacyHostSlot,
+}
+
+impl KeychainPolicy {
+    pub fn for_credential(credential: &CredentialSpec) -> Self {
+        match credential {
+            CredentialSpec::OauthSnapshot {
+                mode: OAuthStorageMode::HostKeychainSlot { .. },
+                ..
+            } => Self::AllowLegacyHostSlot,
+            _ => Self::Deny,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SeatbeltConfig {
@@ -15,8 +34,8 @@ pub struct SeatbeltConfig {
     pub run_cache_dir: PathBuf,
     /// 若为 Some(port)，仅放行 127.0.0.1:<port>；为 None 则完全断网
     pub allowed_proxy_port: Option<u16>,
-    /// OAuth isolatedFile 模式下阻断 Keychain，强制 CLI 回退读 $HOME 凭据文件
-    pub block_keychain: bool,
+    /// Keychain 默认阻断；仅已弃用的 HostKeychainSlot 兼容模式显式放行
+    pub keychain_policy: KeychainPolicy,
     /// 手动设置的时区；None 表示跟随本机（不注入 TZ）
     pub timezone: Option<String>,
     /// 手动设置的语言；None 表示跟随本机（不注入 LANG / LC_ALL）
@@ -46,7 +65,7 @@ pub fn render_sbpl_with_extra_read_paths(
         String::new()
     } else {
         let mut buf =
-            String::from("\n; 显式放行只读可执行路径\n(allow file-read* file-map-executable\n");
+            String::from("\n; 显式放行只读可执行路径\n(allow file-read* file-read-metadata file-map-executable\n");
         for p in extra_read_paths {
             let esc = escape_sbpl(p);
             buf.push_str(&format!("    (literal \"{esc}\")\n"));
@@ -68,8 +87,9 @@ pub fn render_sbpl_with_extra_read_paths(
         None => "; network completely disabled (mode A)".to_string(),
     };
 
-    let keychain_rule = if cfg.block_keychain {
-        r#"
+    let keychain_rule = match cfg.keychain_policy {
+        KeychainPolicy::Deny => {
+            r#"
 (deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))
 (deny file-read* file-write*
     (subpath "/Library/Keychains")
@@ -78,8 +98,9 @@ pub fn render_sbpl_with_extra_read_paths(
     (regex #"^/Users/[^/]+/\.codex(/|$)")
 )
 "#
-    } else {
-        r#"
+        }
+        KeychainPolicy::AllowLegacyHostSlot => {
+            r#"
 ; HostKeychainSlot 模式：在 (deny default) 基线下显式放行 Keychain 访问
 (allow mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))
 (allow file-read* file-write*
@@ -87,6 +108,7 @@ pub fn render_sbpl_with_extra_read_paths(
     (regex #"^/Users/[^/]+/Library/Keychains(/|$)")
 )
 "#
+        }
     };
 
     format!(
@@ -100,7 +122,22 @@ pub fn render_sbpl_with_extra_read_paths(
 (allow process-info-pidinfo (target self))
 (allow ipc-posix-sem*)
 (allow sysctl-read)
-(allow file-read-metadata)
+; 主机身份/定位相关 sysctl 即使未来扩展允许列表也始终拒绝
+(deny sysctl-read
+    (sysctl-name "kern.hostname")
+    (sysctl-name "kern.hostid")
+    (sysctl-name "kern.uuid")
+    (sysctl-name "kern.hostuuid")
+    (sysctl-name "kern.bootsessionuuid")
+    (sysctl-name "kern.bootuuid")
+    (sysctl-name "kern.kernelcacheuuid")
+    (sysctl-name "kern.filesetuuid")
+    (sysctl-name "kern.apfsprebootuuid")
+    (sysctl-name "kern.bootargs")
+    (sysctl-name "hw.uuid")
+    (sysctl-name "hw.serial")
+    (sysctl-name "hw.serialnumber")
+)
 (allow mach-lookup
     (global-name "com.apple.system.logger")
     (global-name "com.apple.system.notification_center")
@@ -125,6 +162,48 @@ pub fn render_sbpl_with_extra_read_paths(
     (literal "/dev/random")
     (literal "/private/etc/ssl")
     (subpath "/private/etc/ssl")
+)
+; file-read* 不隐含 metadata；只对标准系统/工具链根及其父目录、隔离目录开放 stat/readlink 元数据
+(allow file-read-metadata
+    (literal "/")
+    (literal "/System")
+    (literal "/Library")
+    (literal "/Library/Apple")
+    (literal "/Library/Apple/System")
+    (literal "/Library/Apple/System/Library")
+    (literal "/Library/Developer")
+    (literal "/Library/Developer/CommandLineTools")
+    (literal "/private")
+    (literal "/private/etc")
+    (literal "/private/var")
+    (literal "/private/var/db")
+    (literal "/usr")
+    (literal "/usr/lib")
+    (literal "/usr/bin")
+    (literal "/usr/share")
+    (literal "/usr/local")
+    (literal "/bin")
+    (literal "/opt")
+    (literal "/opt/homebrew")
+    (literal "/Applications")
+    (literal "/Applications/Xcode.app")
+    (literal "/Applications/Xcode.app/Contents")
+    (literal "/Applications/Xcode.app/Contents/Developer")
+    (subpath "/System")
+    (subpath "/Library/Apple/System/Library")
+    (subpath "/private/var/db/timezone")
+    (subpath "/usr/lib")
+    (subpath "/usr/bin")
+    (subpath "/bin")
+    (subpath "/usr/share")
+    (subpath "/Library/Developer/CommandLineTools")
+    (subpath "/Applications/Xcode.app/Contents/Developer")
+    (subpath "/opt/homebrew")
+    (subpath "/usr/local")
+    (subpath "{ws}")
+    (subpath "{home}")
+    (subpath "{tmp}")
+    (subpath "{cache}")
 )
 (allow file-map-executable
     (subpath "/System")
@@ -248,7 +327,7 @@ impl RuntimeBackend for MacOsSeatbeltBackend {
             run_tmp_dir: std::fs::canonicalize(&tmp)?,
             run_cache_dir: std::fs::canonicalize(&cache)?,
             allowed_proxy_port: None,
-            block_keychain: true,
+            keychain_policy: KeychainPolicy::Deny,
             timezone: Some("UTC".into()),
             lang: Some("en_US.UTF-8".into()),
         };
