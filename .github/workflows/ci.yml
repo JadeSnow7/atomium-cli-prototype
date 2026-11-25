@@ -104,6 +104,14 @@ jobs:
         if: runner.os == 'macOS'
         run: swift build --disable-sandbox --package-path native-helpers/macos-browser-host
 
+      - name: Build macOS box host helper
+        if: runner.os == 'macOS'
+        run: swift build --disable-sandbox --package-path native-helpers/macos-box-host
+
+      - name: Test macOS box host helper
+        if: runner.os == 'macOS'
+        run: swift test --disable-sandbox --package-path native-helpers/macos-box-host
+
   ts-js-workspace:
     name: TS/JS Workspace (${{ matrix.os }})
     strategy:

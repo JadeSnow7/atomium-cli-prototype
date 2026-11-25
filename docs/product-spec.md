@@ -1,6 +1,6 @@
 # Atomium 产品规格与决策记录
 
-状态：**已确认**（2026-11-24）。本文是产品方向的唯一依据，取代已删除的 `AGENT-ISOLATION.md` 与 `docs/migration-blueprint.md`。协议细节见 [protocol-v2.md](protocol-v2.md)。
+状态：**已确认**（2026-11-24）。本文是产品方向的唯一依据，取代已删除的 `AGENT-ISOLATION.md` 与 `docs/migration-blueprint.md`。协议细节见 [protocol-v2.md](protocol-v2.md)，首个原型见 [prototypes/s1-native-gui-box.md](prototypes/s1-native-gui-box.md)。
 
 ## 0. 一句话定位
 
@@ -13,6 +13,8 @@
 | D-01 | 商业路线采用"开源获客 + 企业变现"（C 路线）。开发者沙盒与个人隐私工作站作为免费层与入口 | 隔离底座正被 OS 厂商与 Docker 商品化；企业"安全地用 AI"是付费方，并与 AI 安全并购热区重合 | 已确认 |
 | D-02 | 市场顺序：先在中国开源获客，再到全球做企业变现。**中英双语同步开源**；品牌与法律实体从第一天按全球设计 | 中文用户最看重"隐私与隔离"；长期融资走美元 | 已确认 |
 | D-03 | 中国市场叙事锚定"国产 AI 应用的隐私顾虑"与"企业数据合规"；不提供任何地区或身份伪装能力 | 避免产品被定型为"规避风控工具"，从而影响美元融资和全球企业叙事 | 已确认 |
+| D-04 | **GUI 优先**。S1 原型在 macOS 26.6.2 (`25G83`) 实测判定 **no-go**（跨 UID 原生窗口 `onscreen=0` 且透明无渲染、`user/<uid>` Background 域无法拉起 `.app`、Electron 无法嵌套外层 Seatbelt），**GUI 旗舰路线回退到 L2 Mac VM**；独立 Box 用户 + 加固版 Seatbelt 用于 L1 CLI Box | 跨会话/跨 UID 启动原生 GUI 在 macOS 26 上受 WindowServer、LaunchServices 与嵌套 Seatbelt 三重阻断；L2 VM 具备完整独立 WindowServer 与硬件身份 | 已确认（**S1 已验证：L1-GUI no-go，切换 L2 VM**） |
+| D-05 | 窗口模式：L1 CLI 采用宿主终端附着；GUI 档位基于 L2 Mac VM 窗口（后续在 M6 评估单应用窗口无缝投射与可信颜色边框）；"每个 Box 一个专属桌面（Space）"只作为实验功能 | macOS 没有公开 API 可以把窗口放到指定 Space，且跨 UID 原生窗口无法上屏合成 | 已确认 |
 | D-06 | 端角色：桌面是完整执行环境（顺序 macOS → Windows → Linux）；移动端是控制端（顺序 iOS → Android）；Linux 容器后期经 VM 引入 | iOS、Android 都不允许第三方 App 运行 VM 或任意代码 | 已确认 |
 | D-07 | 原"多账号轮换"改为"**订阅管理与 Agent 编排**"，行为与协议同步修改，红线见 §2 | 原表述存在服务条款风险 | 已确认，协议已落地（v1.1） |
 | D-08 | 删除"按代理对齐时区/语言"。时区和语言改为手动设置（跟随本机（默认）/ UTC / 自定义） | 只承诺不泄露本机信息，不承诺伪装成别人 | 已确认，协议已落地（v1.1） |
@@ -39,6 +41,7 @@
 | 档位 | macOS 实现 | 适用场景 | 主要约束 |
 | --- | --- | --- | --- |
 | **L1 CLI Box** | 独立 Box 用户 + Seatbelt（加固版 SBPL：sysctl 白名单、拒绝 `/Users/<host>` 与 `IOPlatformSerialNumber`/`IOPlatformUUID`、收窄元数据规则）+ 网关；守护进程须以独立 LaunchAgent/LaunchDaemon 运行以切断终端 `responsible_pid` TCC 继承 | Claude Code、Codex、Gemini CLI、agy 等命令行工具 | 共享内核；`sandbox-exec` 已被 Apple 弃用，需要锁定版本并持续验证 |
+| **L1-GUI 原生窗口 Box**（S1 已证伪 `no-go`） | 独立隐藏 Box 用户在当前登录会话启动 `.app` | **不推进产品化** | macOS 26.6.2 实测：V1 窗口 `onscreen=0` 且透明无内容、泄露宿主剪贴板与终端 TCC；`asuser` Background 域断开 WindowServer 且 `runningboardd` 拒绝启动（Code 125）；Electron 内置 Seatbelt 禁止外层 `sandbox-exec` 嵌套（exit 5） |
 | **L2 Mac VM Box**（GUI 旗舰） | Virtualization.framework + APFS 克隆 + vsock guestd + VirtioFS 授权挂载 + 用户态网卡 | Claude Desktop、ChatGPT/Codex App、Cursor、千问/豆包/Kimi 等桌面 GUI 应用；不可信仓库；全系统安装（brew） | 同时最多 2 台 macOS VM；EULA 限定开发或个人非商用；单台约 30–50GB 磁盘、4–8GB 内存 |
 | **L3 Linux Box**（后期） | Apple Containerization / Container machine | 需要 Linux 或 docker 的任务 | Linux VM 不计入 macOS VM 的 2 台上限 |
 
@@ -74,10 +77,17 @@
 | **Portal** | Box 与宿主交互的唯一通道：`fs.share`、`fs.review`、`fs.pick`、`clipboard.*`、`url.open`、`port.expose`、`notify`、`git.credential`、`ssh.sign`、`mcp.bridge` |
 | **Device** | 已配对的控制端设备及其公钥 |
 
-## 6. 隐私防护口径
+## 6. 隐私防护口径（含 macOS 26.6.2 `25G83` S1/S2 实测结果）
 
-| 信息 | L1 CLI | L1-GUI | L2 VM |
+| 信息 | L1 CLI | L1-GUI（S1 判定 `no-go`，仅存档实测口径） | L2 VM |
 | --- | --- | --- | --- |
+| 宿主用户名、HOME 路径 | **已强制**（独立 Box 用户 + Seatbelt `(deny file-read* (subpath "/Users/<host>"))`）；目录服务 `RealName` 与 `who` **本机可见**（S2f 实测：阻断 opendirectoryd 会破坏用户查询，如实标注） | 独立 Box 用户下 `RealName`、`who` **本机可见**；不套 Seatbelt 时 `/Users/<host>` 默认 `0755` 顶层目录可读（S2a 实测） | 独立 |
+| 主机名、型号 | **已强制 / 待 M5 全量白名单收口**（S2f 实测 `(deny sysctl-read (sysctl-name "kern.hostname"))` 可拦截 `kern.hostname`，需在 M5 同步覆盖 `hw.model`；`scutil ComputerName` **本机可见**） | **本机可见**（Electron 应用因内置 Chromium Seatbelt 禁止嵌套外层 `sandbox-exec`，套补丁触发 `SIGTRAP` exit 5） | 独立 |
+| 序列号、硬件 UUID | **已强制**（S2f 实测默认普通用户可读；叠加 `(deny iokit-get-properties (iokit-property "IOPlatformSerialNumber") (iokit-property "IOPlatformUUID"))` 在 macOS 26.6.2 实测完全隐藏） | **本机可见**（`ioreg` 与 IOKit 默认可读；Electron 无法套外层 `sandbox-exec` 补丁） | 新的 `VZMacMachineIdentifier` |
+| 宿主文件 | **已强制**（独立组 `atombox` 非 `staff` + Seatbelt 拒绝 `/Users/<host>` 与非授权 `/tmp`） | **不充分**：S2a 实测仅靠非 `staff` 组无法阻断 `0755` 的 `/Users/<host>` 顶层列举、可读子目录（如 `~/Downloads`）与 `/tmp` 下 `0644` 文件 | 不可见 |
+| Keychain、TCC | Keychain **已强制**（S2b 实测宿主 Keychain `EACCES`）；TCC **需独立守护进程强制**（S2d 实测从宿主终端派生的进程会经 `responsible_pid` 继承终端 TCC 授权，`atomiumd` 须作为独立 LaunchAgent/LaunchDaemon 运行） | Keychain 独立；V1 下经 `responsible_pid` 继承宿主终端截屏/辅助功能/麦克风授权（S2d 实测失败） | 独立 |
+| 剪贴板 | **已强制**（`launchctl asuser` 命名空间下 S2c 实测与宿主剪贴板隔离，加 Seatbelt 拒绝 pasteboard mach 服务） | **悖论**：V1 共享宿主 `gui/<uid>` bootstrap 直接泄露宿主剪贴板（S2c 失败）；`asuser` 隔离剪贴板后无法连接 WindowServer | 默认不共享（经 Portal 桥接） |
+| 网络（局域网、本机端口） | 只能连 loopback 上的网关（M5 Gateway v2 拦截本机与私网） | **未强制**（S2g 实测公网、局域网网关、宿主 `127.0.0.1` 端口与 DNS 均直连可达） | 用户态网卡强制 |
 | 定位 | 拒绝相关 mach 服务 | TCC 默认拒绝 | VM 内无定位 |
 | 时区、语言 | 手动设置，**仅默认值** | 同左 | 系统设置，真实生效 |
 
@@ -103,6 +113,7 @@
 | --- | --- | --- |
 | 不同 Harness × 不同 Profile（CLI） | 已可行。现有实测：两个 agy 账号并行，零串号 | 每个会话一个 L1 Box |
 | 同一 Profile × 多个会话 | v1.1 尚不支持（OAuth 互斥租约） | 凭据注入：token 由宿主统一刷新 |
+| 同一 GUI 应用 × 多个账号 | 经 L2 Mac VM 可行（最多 2 台并发） | S1 实测跨用户原生窗口在 macOS 26 `no-go`；每个 GUI 实例运行在独立 Mac VM |
 | Mac VM | 最多 2 台 | 系统限制 |
 | 同一项目多会话 | 可行 | 每个会话一份 APFS 克隆的工作副本，经 Broker 审阅后合并；冲突由 `baseline_conflict` 检测 |
 
@@ -144,7 +155,8 @@
 
 | 阶段 | 交付 | 验收标准 |
 | --- | --- | --- |
-| M5 CLI Box + Gateway v2 | Box 实体与持久层；独立守护进程（切断终端 `responsible_pid` TCC 继承）；可断开重连的交互终端；Gateway v2（直连、拦截本机与私网、询问）；SBPL 加固；`url.open` / `port.expose`；前 4 个应用画像 | `npm i -g @openai/codex`、`claude /login` 可用；隐私探针受控项全部拒绝 |
+| **M4 验证与准入** | S1 原型（已完成，判定 `no-go`）；启动 Apple entitlement 申请；协议 v1.1（已完成） | S1 实测证据与 `no-go` 报告已归档，GUI 旗舰切换至 L2 Mac VM |
+| M5 CLI Box + Gateway v2 | Box 实体与持久层；独立守护进程（切断终端 `responsible_pid` TCC 继承）；可断开重连的交互终端；Gateway v2（直连、拦截本机与私网、询问）；SBPL 加固（含 S2f 已验证的 `kern.hostname`、`iokit-property` 与 `/Users/<host>` 拒绝规则）；`url.open` / `port.expose`；前 4 个应用画像 | `npm i -g @openai/codex`、`claude /login` 可用；隐私探针受控项全部拒绝 |
 | M6 GUI 旗舰（L2 VM） | L2 Mac VM 产品化（Virtualization.framework + APFS 克隆 + vsock guestd + VirtioFS 授权挂载）；用户态网卡 + TLS 注入加"登录即封存"；DLP v0；SwiftUI 菜单栏应用 | 演示脚本端到端跑通；VM Box 内搜不到真 token |
 | M7 手机控制端 | 端到端加密中继；iOS 审批签名；守护进程只接受已签名的客户端 | 宿主上的恶意进程无法批准；手机撤销后在途连接立即断开 |
 | M8 企业与 Windows | 管理控制台、MDM、SIEM；Windows 执行端 | 同一份策略在两个平台上的探针结果一致 |

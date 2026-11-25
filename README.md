@@ -4,6 +4,7 @@
 
 - 产品方向与决策记录：[docs/product-spec.md](docs/product-spec.md)
 - 控制协议（v1.1 已实现，v2 已确定）：[docs/protocol-v2.md](docs/protocol-v2.md)
+- 当前原型 S1（原生窗口 GUI Box）：[docs/prototypes/s1-native-gui-box.md](docs/prototypes/s1-native-gui-box.md)
 - 开发状态与验收基线：[DEVELOPMENT-STATUS.md](DEVELOPMENT-STATUS.md)
 - 订阅管理快速上手：[docs/subscription-quickstart.md](docs/subscription-quickstart.md)
 
@@ -35,7 +36,7 @@ pnpm run daemon:dev
 | `crates/atomium-gateway` | 每次运行独立的、需要鉴权的 fail-closed 出网代理 |
 | `crates/atomiumd` | JSON-RPC 2.0 守护进程（`subscriptions.*` / `runs.*` / `events.*` / `workspaces.*` / `candidates.*` / `approvals.*`） |
 | `crates/atomium-cli` | 瘦 CLI（`doctor` / `probe` / `daemon` / `profile` / `subscription` / `run` / `workspace` / `candidate` / `approval`） |
-| `native-helpers/` | macOS 原生 helper（Swift） |
+| `native-helpers/` | macOS 原生 helper（Swift）。S1 原型将新增 `macos-box-host` |
 | `packages/protocol-types` | 自动生成的 TS 绑定（不要手改 `src/generated/`） |
 | `packages/atomium-client` | 共享的 TS RPC 客户端与 Tauri / WebSocket 传输 |
 | `packages/agent-drivers` | Node 版 Agent 驱动；其中 `account-auth/` 是遗留实现，已被 Rust 守护进程取代 |

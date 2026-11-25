@@ -13,7 +13,7 @@ pnpm run daemon:dev        # cargo run -p atomiumd (0600 Unix socket, default $T
 pnpm run doctor            # macOS Seatbelt boundary probe, writes evidence to ./out
 pnpm run gen:protocol      # regenerate TS bindings from crates/atomium-protocol
 pnpm run check:protocol-sync
-swift build --disable-sandbox --package-path native-helpers/<helper>   # macos-browser-host
+swift build --disable-sandbox --package-path native-helpers/<helper>   # macos-browser-host, macos-box-host
 ```
 
 Rust-only changes: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
@@ -60,4 +60,4 @@ Runtime env overrides for the daemon: `ATOMIUM_SOCKET`, `ATOMIUM_DB`, `ATOMIUM_V
 - The user runs any command that needs `sudo` (for example, creating the Box user for the S1 prototype). Confirm before deleting accounts or directories.
 - `legacy/` and `packages/agent-drivers/src/account-auth/` are archived. New code must not depend on them.
 
-Current status and the roadmap are in `DEVELOPMENT-STATUS.md` and `docs/product-spec.md`.
+Current status and the roadmap (S1 native GUI Box prototype, then M5 CLI Box + Gateway v2) are in `DEVELOPMENT-STATUS.md` and `docs/prototypes/`.
