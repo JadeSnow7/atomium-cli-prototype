@@ -208,10 +208,10 @@ test('typed RPC helpers send expected methods, unwrap envelopes, and handle BigI
       switch (req.method) {
         case 'daemon.ping':
           return reply({ ok: true, service: 'atomiumd', version: '0.2.0', transport: 'unix-socket-0600' });
-        case 'accounts.list':
-          return reply({ accounts: [{ profile_id: 'acct_a', state: 'active' }] });
-        case 'accounts.switch':
-          return reply({ switched: true, profile_id: req.params.profile_id, mode: 'isolated_file', previous_profile_id: null, previous_writeback: false });
+        case 'subscriptions.list':
+          return reply({ subscriptions: [{ profile_id: 'acct_a', state: 'active' }] });
+        case 'subscriptions.activate':
+          return reply({ activated: true, profile_id: req.params.profile_id, mode: 'isolated_file', previous_profile_id: null, previous_writeback: false });
         case 'runs.list':
           return reply({ runs: [{ run_id: 'run-1', status: 'running' }] });
         case 'runs.start':
@@ -242,8 +242,8 @@ test('typed RPC helpers send expected methods, unwrap envelopes, and handle BigI
 
   const client = new AtomiumClient(transport);
   assert.equal((await client.ping()).service, 'atomiumd');
-  assert.equal((await client.listAccounts()).length, 1);
-  assert.equal((await client.switchAccount('acct_a')).switched, true);
+  assert.equal((await client.listSubscriptions()).length, 1);
+  assert.equal((await client.activateSubscription('acct_a')).activated, true);
   assert.equal((await client.listRuns()).length, 1);
   // BigInt timeout_ms must serialize cleanly without throwing
   const started = await client.startRun({
@@ -251,17 +251,16 @@ test('typed RPC helpers send expected methods, unwrap envelopes, and handle BigI
     program: '/bin/echo',
     args: ['hi'],
     env: {},
-    workspace_dir: null,
+    workspace_id: null,
     upstream_proxy_addr: null,
     allowed_egress_hosts: [],
-    use_seatbelt: false,
     timeout_ms: 5000n,
   });
   assert.equal(started.run_id, 'run-2');
   assert.equal((await client.cancelRun('run-2', 'test')).status, 'stopped');
   assert.equal((await client.importWorkspace({ source_dir: '/tmp/repo', workspace_id: null, limits: { max_files: 10, max_total_bytes: 1024n, max_file_bytes: 512n } })).workspace_id, 'ws-1');
   assert.equal((await client.listWorkspaces()).length, 1);
-  assert.equal((await client.freezeCandidate({ workspace_id: 'ws-1', run_id: null, run_workspace_dir: null, limits: null })).candidate_id, 'cand-1');
+  assert.equal((await client.freezeCandidate({ workspace_id: 'ws-1', run_id: null, limits: null })).candidate_id, 'cand-1');
   assert.equal((await client.listCandidates('ws-1')).length, 1);
   assert.equal((await client.getCandidate({ candidate_digest: 'sha256:cand' })).candidate_id, 'cand-1');
   assert.equal((await client.requestApproval({ candidate_id: 'cand-1', candidate_digest: 'sha256:cand', run_id: null, action_kind: null, target_dir: null, summary: null })).approval_id, 'appr-1');

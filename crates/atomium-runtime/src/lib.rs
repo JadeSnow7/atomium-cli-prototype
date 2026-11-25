@@ -23,8 +23,8 @@ mod tests {
             run_cache_dir: PathBuf::from("/tmp/cache"),
             allowed_proxy_port: Some(43210),
             block_keychain: true,
-            timezone: "UTC".into(),
-            lang: "en_US.UTF-8".into(),
+            timezone: Some("UTC".into()),
+            lang: Some("en_US.UTF-8".into()),
         };
         let sbpl = render_sbpl(&cfg);
         assert!(sbpl.contains("(deny default)"));

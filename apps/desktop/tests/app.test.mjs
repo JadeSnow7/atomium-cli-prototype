@@ -94,7 +94,7 @@ test('Desktop App renders initial status bar, socket input, connect button, and 
   assert.match(html, /Events received: 0/);
 });
 
-test('Desktop App renders populated accounts, parallel runs, live events, and candidate diff/approval panel', () => {
+test('Desktop App renders populated subscriptions, parallel runs, live events, and candidate diff/approval panel', () => {
   const React = require('react');
   const { renderToStaticMarkup } = require('react-dom/server');
   const { App } = loadDesktopModules();
@@ -105,7 +105,7 @@ test('Desktop App renders populated accounts, parallel runs, live events, and ca
         status: 'open',
         ping: { ok: true, service: 'atomiumd', version: '0.2.0', transport: 'unix-socket-0600' },
         cursor: 12,
-        accounts: [
+        subscriptions: [
           {
             profile_id: 'acct_alpha',
             display_name: 'Alpha Isolated',
@@ -114,7 +114,7 @@ test('Desktop App renders populated accounts, parallel runs, live events, and ca
             storage_mode: { storage: 'isolated_file', relative_home_path: '.gemini/antigravity-cli/antigravity-oauth-token' },
             snapshot_version: 2n,
             content_digest: 'sha256:aaaa111122223333',
-            proxy_id: 'proxy-us-1',
+            upstream_proxy_id: null,
             active_host_slot: false,
             active_leases: ['profile:acct_alpha:oauth (run=run-1, pid=4242)'],
           },
@@ -126,7 +126,7 @@ test('Desktop App renders populated accounts, parallel runs, live events, and ca
             storage_mode: { storage: 'host_keychain_slot', service: 'gemini', account: 'antigravity' },
             snapshot_version: 1n,
             content_digest: 'sha256:bbbb',
-            proxy_id: 'proxy-jp-1',
+            upstream_proxy_id: 'corp-proxy',
             active_host_slot: true,
             active_leases: [],
           },
@@ -213,7 +213,7 @@ test('Desktop App renders populated accounts, parallel runs, live events, and ca
   // Status bar
   assert.match(html, /atomiumd v0\.2\.0 \(unix-socket-0600\)/);
   assert.match(html, /after_seq: 12/);
-  // Accounts & Leases
+  // Subscriptions & Leases
   assert.match(html, /acct_alpha/);
   assert.match(html, /isolated_file/);
   assert.match(html, /dirty_reconcile/);
@@ -232,12 +232,12 @@ test('Desktop App renders populated accounts, parallel runs, live events, and ca
   assert.match(html, /Reject/);
 });
 
-test('panelController actions handle switch, start/cancel run, live events, export receipt, and baseline_conflict', async () => {
+test('panelController actions handle host-slot activation, start/cancel run, live events, export receipt, and baseline_conflict', async () => {
   const {
     createInitialPanelState,
     applyTaskEvent,
     refreshDashboard,
-    switchAccountAction,
+    activateSubscriptionAction,
     startRunAction,
     cancelRunAction,
     resolveApprovalAction,
@@ -246,12 +246,12 @@ test('panelController actions handle switch, start/cancel run, live events, expo
   let failWithConflict = false;
   const { client, sent } = createMockClient({
     'daemon.ping': () => ({ ok: true, service: 'atomiumd', version: '0.2.0', transport: 'unix-socket-0600' }),
-    'accounts.list': () => ({ accounts: [{ profile_id: 'acct_a', state: 'active' }] }),
+    'subscriptions.list': () => ({ subscriptions: [{ profile_id: 'acct_a', state: 'active' }] }),
     'runs.list': () => ({ runs: [{ run_id: 'run-1', status: 'running' }] }),
     'workspaces.list': () => ({ workspaces: [{ workspace_id: 'ws-1', working_dir: '/tmp/ws/working' }] }),
     'candidates.list': () => ({ candidates: [{ candidate_id: 'cand-1', status: 'frozen' }] }),
     'approvals.list': () => ({ approvals: [{ approval_id: 'appr-1', candidate_digest: 'sha256:c1' }] }),
-    'accounts.switch': (p) => ({ switched: true, profile_id: p.profile_id, mode: 'host_keychain_slot', previous_profile_id: 'acct_old', previous_writeback: true }),
+    'subscriptions.activate': (p) => ({ activated: true, profile_id: p.profile_id, mode: 'host_keychain_slot', previous_profile_id: 'acct_old', previous_writeback: true }),
     'runs.start': (p) => ({ run_id: 'run-2', profile_id: p.profile_id, status: 'running', proxy_port: 55555 }),
     'runs.cancel': (p) => ({ run_id: p.run_id, status: 'stopped', cleanup_verified: true }),
     'approvals.resolve': (p) => {
@@ -296,14 +296,14 @@ test('panelController actions handle switch, start/cancel run, live events, expo
   // 1. Dashboard refresh populates all 6 slices
   const snap = await refreshDashboard(client);
   assert.equal(snap.ping.version, '0.2.0');
-  assert.equal(snap.accounts.length, 1);
+  assert.equal(snap.subscriptions.length, 1);
   assert.equal(snap.runs.length, 1);
   assert.equal(snap.workspaces.length, 1);
   assert.equal(snap.candidates.length, 1);
   assert.equal(snap.approvals.length, 1);
 
-  // 2. Account switch
-  const swNotice = await switchAccountAction(client, 'acct_a');
+  // 2. HostKeychainSlot compat activation
+  const swNotice = await activateSubscriptionAction(client, 'acct_a');
   assert.equal(swNotice.kind, 'ok');
   assert.match(swNotice.detail, /previous token written back/);
 
@@ -312,13 +312,16 @@ test('panelController actions handle switch, start/cancel run, live events, expo
     profileId: 'acct_a',
     program: '/bin/sh',
     argsText: '-c "echo hello world"',
-    workspaceDir: '/tmp/ws/working',
+    workspaceId: 'ws-1',
     allowHostsText: 'api.openai.com, example.com',
   });
   assert.equal(started.record.run_id, 'run-2');
   const startCall = sent.find((f) => f.method === 'runs.start');
   assert.deepEqual(startCall.params.args, ['-c', 'echo hello world']);
   assert.deepEqual(startCall.params.allowed_egress_hosts, ['api.openai.com', 'example.com']);
+  assert.equal(startCall.params.workspace_id, 'ws-1');
+  assert.equal('workspace_dir' in startCall.params, false);
+  assert.equal('use_seatbelt' in startCall.params, false);
 
   const cancelled = await cancelRunAction(client, 'run-2');
   assert.equal(cancelled.record.status, 'stopped');

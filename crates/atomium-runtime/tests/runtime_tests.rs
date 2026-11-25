@@ -11,8 +11,8 @@ fn sample_cfg(allowed_proxy_port: Option<u16>, block_keychain: bool) -> Seatbelt
         run_cache_dir: PathBuf::from("/tmp/atomium-cache"),
         allowed_proxy_port,
         block_keychain,
-        timezone: "UTC".into(),
-        lang: "en_US.UTF-8".into(),
+        timezone: Some("UTC".into()),
+        lang: Some("en_US.UTF-8".into()),
     }
 }
 
@@ -71,8 +71,8 @@ fn render_sbpl_escapes_quotes_and_backslashes_in_paths() {
         run_cache_dir: PathBuf::from(r#"/tmp/cache"e\f"#),
         allowed_proxy_port: None,
         block_keychain: false,
-        timezone: "UTC".into(),
-        lang: "en_US.UTF-8".into(),
+        timezone: Some("UTC".into()),
+        lang: Some("en_US.UTF-8".into()),
     };
     let sbpl = render_sbpl(&cfg);
     assert!(sbpl.contains(r#"(subpath "/tmp/ws\"quote\\slash")"#));

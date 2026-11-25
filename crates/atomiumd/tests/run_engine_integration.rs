@@ -3,7 +3,7 @@ use atomium_core::{
     AGY_DEFAULT_RELATIVE_PATH,
 };
 use atomium_protocol::{
-    AccountSummary, ApprovalRequest, JsonRpcRequest, JsonRpcResponse, ProfileState, RunRecord,
+    ApprovalRequest, JsonRpcRequest, JsonRpcResponse, ProfileState, RunRecord, SubscriptionSummary,
     TaskEvent, TaskEventPayload, TaskStatus,
 };
 use base64::Engine;
@@ -61,8 +61,29 @@ impl ServerHandle {
         Self::start_with_paths(dir, db_path, sock_path).await
     }
 
+    /// Daemon without the dev escape hatch: isolation is mandatory.
+    async fn start_isolated() -> Self {
+        let dir = TempDirGuard::new("atmd-iso");
+        let db_path = dir.path().join("d.sqlite");
+        let sock_path = dir.path().join("d.sock");
+        Self::start_with_mode(dir, db_path, sock_path, false).await
+    }
+
     async fn start_with_paths(dir: TempDirGuard, db_path: PathBuf, sock_path: PathBuf) -> Self {
-        let state = Arc::new(atomiumd::DaemonState::open(&db_path).expect("open daemon state"));
+        Self::start_with_mode(dir, db_path, sock_path, true).await
+    }
+
+    async fn start_with_mode(
+        dir: TempDirGuard,
+        db_path: PathBuf,
+        sock_path: PathBuf,
+        unsandboxed_dev_mode: bool,
+    ) -> Self {
+        let state = Arc::new(
+            atomiumd::DaemonState::open(&db_path)
+                .expect("open daemon state")
+                .with_unsandboxed_dev_mode(unsandboxed_dev_mode),
+        );
         let listener = atomiumd::bind_socket(&sock_path).expect("bind socket");
         let server_state = state.clone();
         let task = tokio::spawn(async move {
@@ -182,7 +203,7 @@ async fn wait_for_run_done(client: &mut RpcClient, run_id: &str) -> RunRecord {
 }
 
 #[tokio::test]
-async fn dual_distinct_isolated_file_accounts_run_concurrently_without_contamination() {
+async fn dual_distinct_isolated_file_subscriptions_run_concurrently_without_contamination() {
     let srv = ServerHandle::start().await;
     let mut client = RpcClient::connect(&srv.sock_path).await;
 
@@ -197,12 +218,12 @@ async fn dual_distinct_isolated_file_accounts_run_concurrently_without_contamina
     let cap_a = client
         .call(
             json!(1),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "acct_a",
                 "display_name": "Alice",
                 "raw_secret_b64": wrapped_a_b64,
-                "proxy_id": "proxy-a"
+                "upstream_proxy_id": "proxy-a"
             }),
         )
         .await;
@@ -211,12 +232,12 @@ async fn dual_distinct_isolated_file_accounts_run_concurrently_without_contamina
     let cap_b = client
         .call(
             json!(2),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "acct_b",
                 "display_name": "Bob",
                 "raw_secret_b64": wrapped_b_b64,
-                "proxy_id": "proxy-b"
+                "upstream_proxy_id": "proxy-b"
             }),
         )
         .await;
@@ -273,8 +294,7 @@ PY
             json!({
                 "profile_id": "acct_a",
                 "program": mock_agy.to_string_lossy(),
-                "args": [],
-                "use_seatbelt": false
+                "args": []
             }),
         )
         .await;
@@ -288,8 +308,7 @@ PY
             json!({
                 "profile_id": "acct_b",
                 "program": mock_agy.to_string_lossy(),
-                "args": [],
-                "use_seatbelt": false
+                "args": []
             }),
         )
         .await;
@@ -349,7 +368,7 @@ async fn token_refresh_automatically_writes_back_to_vault_and_bumps_snapshot_ver
     let cap = client
         .call(
             json!(1),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "acct_ref",
                 "display_name": "Refresh User",
@@ -358,7 +377,7 @@ async fn token_refresh_automatically_writes_back_to_vault_and_bumps_snapshot_ver
         )
         .await;
     assert!(cap.error.is_none());
-    let summary_v1: AccountSummary = serde_json::from_value(cap.result.unwrap()).unwrap();
+    let summary_v1: SubscriptionSummary = serde_json::from_value(cap.result.unwrap()).unwrap();
     assert_eq!(summary_v1.snapshot_version, Some(1));
 
     // Script simulates agy refreshing its projected OAuth file in place.
@@ -383,8 +402,7 @@ printf '%s' '{}' > "$TOKEN_FILE"
             json!({
                 "profile_id": "acct_ref",
                 "program": refresh_script.to_string_lossy(),
-                "args": [],
-                "use_seatbelt": false
+                "args": []
             }),
         )
         .await;
@@ -401,13 +419,13 @@ printf '%s' '{}' > "$TOKEN_FILE"
     let vault_bytes = srv.state.vault().read_blob("oauth_acct_ref").unwrap();
     assert_eq!(vault_bytes, raw_v2);
 
-    let list_resp = client.call(json!(3), "accounts.list", json!({})).await;
-    let accounts: Vec<AccountSummary> =
-        serde_json::from_value(list_resp.result.unwrap()["accounts"].clone()).unwrap();
-    assert_eq!(accounts.len(), 1);
-    assert_eq!(accounts[0].snapshot_version, Some(2));
+    let list_resp = client.call(json!(3), "subscriptions.list", json!({})).await;
+    let subscriptions: Vec<SubscriptionSummary> =
+        serde_json::from_value(list_resp.result.unwrap()["subscriptions"].clone()).unwrap();
+    assert_eq!(subscriptions.len(), 1);
+    assert_eq!(subscriptions[0].snapshot_version, Some(2));
     assert_eq!(
-        accounts[0].content_digest.as_deref(),
+        subscriptions[0].content_digest.as_deref(),
         Some(EncryptedVault::digest_hex(raw_v2).as_str())
     );
 
@@ -429,8 +447,7 @@ grep -q 'tok-v2-refreshed' "$HOME/{AGY_DEFAULT_RELATIVE_PATH}"
             json!({
                 "profile_id": "acct_ref",
                 "program": verify_script.to_string_lossy(),
-                "args": [],
-                "use_seatbelt": false
+                "args": []
             }),
         )
         .await;
@@ -451,7 +468,7 @@ async fn same_account_exclusion_rejects_overlap_and_zombie_lease_marks_dirty_rec
     let cap = client
         .call(
             json!(1),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "acct_solo",
                 "display_name": "Solo",
@@ -469,8 +486,7 @@ async fn same_account_exclusion_rejects_overlap_and_zombie_lease_marks_dirty_rec
             json!({
                 "profile_id": "acct_solo",
                 "program": "/bin/sleep",
-                "args": ["10"],
-                "use_seatbelt": false
+                "args": ["10"]
             }),
         )
         .await;
@@ -485,8 +501,7 @@ async fn same_account_exclusion_rejects_overlap_and_zombie_lease_marks_dirty_rec
             json!({
                 "profile_id": "acct_solo",
                 "program": "/bin/echo",
-                "args": ["nope"],
-                "use_seatbelt": false
+                "args": ["nope"]
             }),
         )
         .await;
@@ -527,12 +542,12 @@ async fn same_account_exclusion_rejects_overlap_and_zombie_lease_marks_dirty_rec
         )
         .unwrap();
 
-    // Calling accounts.list triggers stale lease reclamation -> marks profile DirtyReconcile, preserves Vault.
-    let list_resp = client.call(json!(5), "accounts.list", json!({})).await;
-    let accounts: Vec<AccountSummary> =
-        serde_json::from_value(list_resp.result.unwrap()["accounts"].clone()).unwrap();
-    assert_eq!(accounts[0].state, ProfileState::DirtyReconcile);
-    assert!(accounts[0].active_leases.is_empty());
+    // Calling subscriptions.list triggers stale lease reclamation -> marks profile DirtyReconcile, preserves Vault.
+    let list_resp = client.call(json!(5), "subscriptions.list", json!({})).await;
+    let subscriptions: Vec<SubscriptionSummary> =
+        serde_json::from_value(list_resp.result.unwrap()["subscriptions"].clone()).unwrap();
+    assert_eq!(subscriptions[0].state, ProfileState::DirtyReconcile);
+    assert!(subscriptions[0].active_leases.is_empty());
 
     // Vault blob was NOT overwritten.
     assert_eq!(srv.state.vault().read_blob("oauth_acct_solo").unwrap(), raw);
@@ -545,8 +560,7 @@ async fn same_account_exclusion_rejects_overlap_and_zombie_lease_marks_dirty_rec
             json!({
                 "profile_id": "acct_solo",
                 "program": "/bin/echo",
-                "args": ["blocked"],
-                "use_seatbelt": false
+                "args": ["blocked"]
             }),
         )
         .await;
@@ -588,7 +602,7 @@ async fn runs_cancel_immediately_closes_inflight_egress_tcp_connection_and_clean
     client
         .call(
             json!(1),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "acct_cancel",
                 "display_name": "Cancel Test",
@@ -629,8 +643,7 @@ PY
                 "profile_id": "acct_cancel",
                 "program": hold_script.to_string_lossy(),
                 "args": [],
-                "upstream_proxy_addr": upstream_addr.to_string(),
-                "use_seatbelt": false
+                "upstream_proxy_addr": upstream_addr.to_string()
             }),
         )
         .await;
@@ -722,7 +735,7 @@ async fn events_subscribe_streams_live_and_catches_up_after_disconnect_without_l
     controller
         .call(
             json!(1),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "acct_stream",
                 "display_name": "Stream User",
@@ -753,8 +766,7 @@ async fn events_subscribe_streams_live_and_catches_up_after_disconnect_without_l
             json!({
                 "profile_id": "acct_stream",
                 "program": script.to_string_lossy(),
-                "args": [],
-                "use_seatbelt": false
+                "args": []
             }),
         )
         .await;
@@ -813,7 +825,7 @@ async fn events_subscribe_streams_live_and_catches_up_after_disconnect_without_l
     let lines: Vec<String> = all_events
         .iter()
         .filter_map(|e| match &e.payload {
-            TaskEventPayload::LogLine { line, .. } => Some(line.clone()),
+            TaskEventPayload::LogLine { stream, line } if stream != "atomium" => Some(line.clone()),
             _ => None,
         })
         .collect();
@@ -836,7 +848,11 @@ async fn pending_approvals_persist_across_daemon_restart_and_enforce_digest() {
 
     // Instance 1 registers a pending approval and shuts down.
     {
-        let state1 = Arc::new(atomiumd::DaemonState::open(&db_path).expect("open state1"));
+        let state1 = Arc::new(
+            atomiumd::DaemonState::open(&db_path)
+                .expect("open state1")
+                .with_unsandboxed_dev_mode(true),
+        );
         let listener1 = atomiumd::bind_socket(&sock1).expect("bind sock1");
         let srv1_state = state1.clone();
         let t1 = tokio::spawn(async move {
@@ -934,7 +950,7 @@ async fn host_keychain_slot_switch_writes_back_refreshed_previous_account() {
     let cap_a = client
         .call(
             json!(1),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "kc_a",
                 "display_name": "KC A",
@@ -960,7 +976,7 @@ async fn host_keychain_slot_switch_writes_back_refreshed_previous_account() {
     let cap_b = client
         .call(
             json!(2),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "kc_b",
                 "display_name": "KC B",
@@ -985,11 +1001,15 @@ async fn host_keychain_slot_switch_writes_back_refreshed_previous_account() {
         .unwrap();
 
     let sw = client
-        .call(json!(3), "accounts.switch", json!({ "profile_id": "kc_a" }))
+        .call(
+            json!(3),
+            "subscriptions.activate",
+            json!({ "profile_id": "kc_a" }),
+        )
         .await;
     assert!(sw.error.is_none(), "switch err: {:?}", sw.error);
     let sw_res = sw.result.unwrap();
-    assert_eq!(sw_res["switched"], json!(true));
+    assert_eq!(sw_res["activated"], json!(true));
     assert_eq!(sw_res["previous_profile_id"], json!("kc_b"));
     assert_eq!(sw_res["previous_writeback"], json!(true));
 
@@ -1012,7 +1032,7 @@ async fn codex_review_regressions_orphan_recovery_capture_lock_dirty_switch_and_
     let srv = ServerHandle::start().await;
     let mut client = RpcClient::connect(&srv.sock_path).await;
 
-    // --- 1. accounts.capture rejected while active run holds exclusive OAuth lease ---
+    // --- 1. subscriptions.capture rejected while active run holds exclusive OAuth lease ---
     let raw_v1 = br#"{"id_token_email":"lock@example.test","token":{"access_token":"tok-lock-1"}}"#;
     let raw_v2 = br#"{"id_token_email":"lock@example.test","token":{"access_token":"tok-lock-2"}}"#;
     let b64_v1 = base64::engine::general_purpose::STANDARD.encode(raw_v1);
@@ -1021,7 +1041,7 @@ async fn codex_review_regressions_orphan_recovery_capture_lock_dirty_switch_and_
     let cap1 = client
         .call(
             json!(1),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "acct_lock",
                 "display_name": "Lock Test",
@@ -1038,8 +1058,7 @@ async fn codex_review_regressions_orphan_recovery_capture_lock_dirty_switch_and_
             json!({
                 "profile_id": "acct_lock",
                 "program": "/bin/sleep",
-                "args": ["10"],
-                "use_seatbelt": false
+                "args": ["10"]
             }),
         )
         .await;
@@ -1050,7 +1069,7 @@ async fn codex_review_regressions_orphan_recovery_capture_lock_dirty_switch_and_
     let cap_conflict = client
         .call(
             json!(3),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "acct_lock",
                 "display_name": "Lock Test",
@@ -1072,7 +1091,7 @@ async fn codex_review_regressions_orphan_recovery_capture_lock_dirty_switch_and_
         )
         .await;
 
-    // --- 2. accounts.switch rejects DirtyReconcile target before touching host keychain ---
+    // --- 2. subscriptions.activate rejects DirtyReconcile target before touching host keychain ---
     let kc_a = br#"{"id_token_email":"dirty-a@example.test","token":{"access_token":"dirty-a"}}"#;
     let kc_b = br#"{"id_token_email":"dirty-b@example.test","token":{"access_token":"dirty-b"}}"#;
     srv.state
@@ -1086,7 +1105,7 @@ async fn codex_review_regressions_orphan_recovery_capture_lock_dirty_switch_and_
     let _ = client
         .call(
             json!(5),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "dirty_a",
                 "display_name": "Dirty A",
@@ -1109,7 +1128,7 @@ async fn codex_review_regressions_orphan_recovery_capture_lock_dirty_switch_and_
     let _ = client
         .call(
             json!(6),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "dirty_b",
                 "display_name": "Dirty B",
@@ -1129,7 +1148,7 @@ async fn codex_review_regressions_orphan_recovery_capture_lock_dirty_switch_and_
     let bad_switch = client
         .call(
             json!(7),
-            "accounts.switch",
+            "subscriptions.activate",
             json!({ "profile_id": "dirty_a" }),
         )
         .await;
@@ -1178,8 +1197,7 @@ wait $!
             json!({
                 "profile_id": "acct_lock",
                 "program": wrapper_script.to_string_lossy(),
-                "args": [],
-                "use_seatbelt": false
+                "args": []
             }),
         )
         .await;
@@ -1267,4 +1285,159 @@ wait $!
     );
     let rec = recovered.runs().get("run-orphan-1").unwrap().unwrap();
     assert_eq!(rec.status, TaskStatus::Interrupted);
+}
+
+async fn capture_test_subscription(client: &mut RpcClient, profile_id: &str) {
+    let raw = br#"{"auth_method":"consumer","id_token_email":"iso@example.test","token":{"access_token":"tok-iso"}}"#;
+    let cap = client
+        .call(
+            json!("cap"),
+            "subscriptions.capture",
+            json!({
+                "profile_id": profile_id,
+                "display_name": "Isolation probe",
+                "raw_secret_b64": base64::engine::general_purpose::STANDARD.encode(raw)
+            }),
+        )
+        .await;
+    assert!(cap.error.is_none(), "capture err: {:?}", cap.error);
+}
+
+#[tokio::test]
+async fn runs_start_rejects_unknown_workspace_id_and_ignores_legacy_host_path() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    capture_test_subscription(&mut client, "ws_probe").await;
+
+    let unknown = client
+        .call(
+            json!(1),
+            "runs.start",
+            json!({
+                "profile_id": "ws_probe",
+                "program": "/bin/sh",
+                "args": ["-c", "true"],
+                "workspace_id": "ws-does-not-exist"
+            }),
+        )
+        .await;
+    assert_eq!(
+        unknown.error.expect("unknown workspace must fail").code,
+        -32004
+    );
+
+    // The removed `workspace_dir` field must not grant access to an arbitrary host directory.
+    let host_dir = srv.dir.path().join("host-private");
+    fs::create_dir_all(&host_dir).unwrap();
+    let mut sub = RpcClient::connect(&srv.sock_path).await;
+    let _ = sub
+        .call(json!("sub"), "events.subscribe", json!({ "after_seq": 0 }))
+        .await;
+    let started = client
+        .call(
+            json!(2),
+            "runs.start",
+            json!({
+                "profile_id": "ws_probe",
+                "program": "/bin/sh",
+                "args": ["-c", "pwd"],
+                "workspace_dir": host_dir.to_string_lossy()
+            }),
+        )
+        .await;
+    assert!(started.error.is_none(), "start err: {:?}", started.error);
+    let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+    let final_rec = wait_for_run_done(&mut client, &run.run_id).await;
+    assert_eq!(final_rec.status, TaskStatus::Completed);
+
+    let mut cwd = None;
+    while cwd.is_none() {
+        let ev = sub.next_push_event().await;
+        if let TaskEventPayload::LogLine { stream, line } = ev.payload {
+            if ev.run_id == run.run_id && stream == "stdout" {
+                cwd = Some(line);
+            }
+        }
+    }
+    let cwd = cwd.unwrap();
+    assert!(
+        cwd.contains(&run.run_id) && !cwd.contains("host-private"),
+        "run must use its private workspace, got cwd={cwd}"
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test]
+async fn runs_start_refuses_without_isolation_backend_outside_dev_mode() {
+    let srv = ServerHandle::start_isolated().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    capture_test_subscription(&mut client, "iso_probe").await;
+
+    let resp = client
+        .call(
+            json!(1),
+            "runs.start",
+            json!({ "profile_id": "iso_probe", "program": "/bin/true", "use_seatbelt": false }),
+        )
+        .await;
+    assert_eq!(
+        resp.error.expect("must refuse unsandboxed run").code,
+        -32003
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runs_start_caller_cannot_disable_seatbelt_on_macos() {
+    let srv = ServerHandle::start_isolated().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    capture_test_subscription(&mut client, "iso_probe").await;
+
+    let canary = srv.dir.path().join("host-canary.txt");
+    fs::write(&canary, "HOST_CANARY_MUST_NOT_LEAK").unwrap();
+    let canary = fs::canonicalize(&canary).unwrap();
+
+    let mut sub = RpcClient::connect(&srv.sock_path).await;
+    let _ = sub
+        .call(json!("sub"), "events.subscribe", json!({ "after_seq": 0 }))
+        .await;
+    let started = client
+        .call(
+            json!(1),
+            "runs.start",
+            json!({
+                "profile_id": "iso_probe",
+                "program": "/bin/cat",
+                "args": [canary.to_string_lossy()],
+                "use_seatbelt": false
+            }),
+        )
+        .await;
+    assert!(started.error.is_none(), "start err: {:?}", started.error);
+    let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+    let final_rec = wait_for_run_done(&mut client, &run.run_id).await;
+    assert_ne!(
+        final_rec.exit_code,
+        Some(0),
+        "sandboxed cat must fail: {final_rec:?}"
+    );
+
+    let mut stdout_lines = Vec::new();
+    loop {
+        let ev = sub.next_push_event().await;
+        if ev.run_id != run.run_id {
+            continue;
+        }
+        match ev.payload {
+            TaskEventPayload::LogLine { stream, line } if stream == "stdout" => {
+                stdout_lines.push(line)
+            }
+            TaskEventPayload::StatusChanged { status, .. } if status == final_rec.status => break,
+            _ => {}
+        }
+    }
+    assert!(
+        stdout_lines.iter().all(|l| !l.contains("HOST_CANARY")),
+        "host canary leaked through legacy use_seatbelt=false: {stdout_lines:?}"
+    );
 }

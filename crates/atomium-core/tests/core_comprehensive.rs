@@ -43,16 +43,12 @@ fn make_profile(id: &str, cred: CredentialSpec, state: ProfileState) -> Identity
         agent_kind: "antigravity".into(),
         credential: cred,
         egress: EgressBinding {
-            proxy_id: "proxy-us-1".into(),
-            expected_country: "US".into(),
-            expected_region: Some("CA".into()),
+            upstream_proxy_id: None,
             fail_closed: true,
-            exclusive_proxy_use: true,
         },
         locale_policy: LocalePolicy {
-            timezone: "America/Los_Angeles".into(),
-            lang: "en_US.UTF-8".into(),
-            auto_align_with_proxy: false,
+            timezone: Some("America/Los_Angeles".into()),
+            lang: Some("en_US.UTF-8".into()),
         },
         state,
     }

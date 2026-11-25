@@ -1,6 +1,4 @@
 import type {
-  AccountCaptureRequest,
-  AccountSummary,
   ApprovalCreateRequest,
   ApprovalRequest,
   ApprovalResolveRequest,
@@ -11,6 +9,8 @@ import type {
   JsonRpcResponse,
   RunRecord,
   RunStartRequest,
+  SubscriptionCaptureRequest,
+  SubscriptionSummary,
   TaskEvent,
   WorkspaceImportRequest,
   WorkspaceSnapshot,
@@ -24,8 +24,9 @@ export interface DaemonPingResult {
   transport: string;
 }
 
-export interface AccountSwitchResult {
-  switched: boolean;
+/** Result of the deprecated HostKeychainSlot compat activation. */
+export interface SubscriptionActivateResult {
+  activated: boolean;
   profile_id: string;
   mode: string;
   relative_home_path?: string;
@@ -144,17 +145,22 @@ export class AtomiumClient {
     return this.call<DaemonPingResult>("daemon.ping");
   }
 
-  async listAccounts(): Promise<AccountSummary[]> {
-    const res = await this.call<{ accounts: AccountSummary[] }>("accounts.list");
-    return res.accounts ?? [];
+  async listSubscriptions(): Promise<SubscriptionSummary[]> {
+    const res = await this.call<{ subscriptions: SubscriptionSummary[] }>("subscriptions.list");
+    return res.subscriptions ?? [];
   }
 
-  async captureAccount(req: AccountCaptureRequest): Promise<AccountSummary> {
-    return this.call<AccountSummary>("accounts.capture", req as unknown as Record<string, unknown>);
+  async captureSubscription(req: SubscriptionCaptureRequest): Promise<SubscriptionSummary> {
+    return this.call<SubscriptionSummary>(
+      "subscriptions.capture",
+      req as unknown as Record<string, unknown>,
+    );
   }
 
-  async switchAccount(profileId: string): Promise<AccountSwitchResult> {
-    return this.call<AccountSwitchResult>("accounts.switch", { profile_id: profileId });
+  async activateSubscription(profileId: string): Promise<SubscriptionActivateResult> {
+    return this.call<SubscriptionActivateResult>("subscriptions.activate", {
+      profile_id: profileId,
+    });
   }
 
   async listRuns(): Promise<RunRecord[]> {

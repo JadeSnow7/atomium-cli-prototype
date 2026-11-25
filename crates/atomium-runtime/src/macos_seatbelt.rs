@@ -17,8 +17,10 @@ pub struct SeatbeltConfig {
     pub allowed_proxy_port: Option<u16>,
     /// OAuth isolatedFile 模式下阻断 Keychain，强制 CLI 回退读 $HOME 凭据文件
     pub block_keychain: bool,
-    pub timezone: String,
-    pub lang: String,
+    /// 手动设置的时区；None 表示跟随本机（不注入 TZ）
+    pub timezone: Option<String>,
+    /// 手动设置的语言；None 表示跟随本机（不注入 LANG / LC_ALL）
+    pub lang: Option<String>,
 }
 
 fn escape_sbpl(path: &Path) -> String {
@@ -195,9 +197,13 @@ pub fn build_seatbelt_command_with_extra_read_paths(
         "CLANG_MODULE_CACHE_PATH",
         cfg.run_cache_dir.join("clang-module-cache"),
     );
-    cmd.env("TZ", &cfg.timezone);
-    cmd.env("LANG", &cfg.lang);
-    cmd.env("LC_ALL", &cfg.lang);
+    if let Some(tz) = &cfg.timezone {
+        cmd.env("TZ", tz);
+    }
+    if let Some(lang) = &cfg.lang {
+        cmd.env("LANG", lang);
+        cmd.env("LC_ALL", lang);
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -243,8 +249,8 @@ impl RuntimeBackend for MacOsSeatbeltBackend {
             run_cache_dir: std::fs::canonicalize(&cache)?,
             allowed_proxy_port: None,
             block_keychain: true,
-            timezone: "UTC".into(),
-            lang: "en_US.UTF-8".into(),
+            timezone: Some("UTC".into()),
+            lang: Some("en_US.UTF-8".into()),
         };
 
         let mut evidences = Vec::new();

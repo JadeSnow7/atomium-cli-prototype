@@ -51,7 +51,11 @@ impl ServerHandle {
         let dir = TempDirGuard::new("atmd-broker");
         let db_path = dir.path().join("d.sqlite");
         let sock_path = dir.path().join("d.sock");
-        let state = Arc::new(atomiumd::DaemonState::open(&db_path).expect("open daemon state"));
+        let state = Arc::new(
+            atomiumd::DaemonState::open(&db_path)
+                .expect("open daemon state")
+                .with_unsandboxed_dev_mode(true),
+        );
         let listener = atomiumd::bind_socket(&sock_path).expect("bind socket");
         let task = tokio::spawn(async move {
             let _ = atomiumd::serve_listener(listener, state).await;
@@ -519,7 +523,7 @@ async fn freeze_blocked_while_run_active_and_cancel_blocks_stale_approval() {
     let cap = client
         .call(
             json!(1),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "broker_worker",
                 "display_name": "Broker Worker",
@@ -551,8 +555,7 @@ async fn freeze_blocked_while_run_active_and_cancel_blocks_stale_approval() {
                 "profile_id": "broker_worker",
                 "program": "/bin/sleep",
                 "args": ["15"],
-                "workspace_dir": ws.working_dir,
-                "use_seatbelt": false
+                "workspace_id": ws.workspace_id
             }),
         )
         .await;

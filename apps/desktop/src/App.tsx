@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState } from "react";
 import { AtomiumClient, TauriIpcTransport, type TransportState } from "@atomium/client";
-import { AccountsPanel } from "./components/AccountsPanel";
 import { ReviewApprovalPanel } from "./components/ReviewApprovalPanel";
 import { RunsEventsPanel } from "./components/RunsEventsPanel";
+import { SubscriptionsPanel } from "./components/SubscriptionsPanel";
 import {
+  activateSubscriptionAction,
   applyTaskEvent,
   cancelRunAction,
   createInitialPanelState,
@@ -11,7 +12,6 @@ import {
   requestCandidateApprovalAction,
   resolveApprovalAction,
   startRunAction,
-  switchAccountAction,
   type DesktopPanelState,
   type RunLaunchForm,
 } from "./panelController";
@@ -39,10 +39,10 @@ export function App({ initialState, injectedClient = null }: AppProps = {}) {
   }));
   const [busy, setBusy] = useState(false);
   const [launchForm, setLaunchForm] = useState<RunLaunchForm>(() => ({
-    profileId: initialState?.accounts?.[0]?.profile_id ?? "",
+    profileId: initialState?.subscriptions?.[0]?.profile_id ?? "",
     program: "/bin/sh",
     argsText: '-c "echo hello from atomium"',
-    workspaceDir: initialState?.workspaces?.[0]?.working_dir ?? "",
+    workspaceId: initialState?.workspaces?.[0]?.workspace_id ?? "",
     allowHostsText: "",
   }));
 
@@ -65,7 +65,7 @@ export function App({ initialState, injectedClient = null }: AppProps = {}) {
       ...prev,
       ping: snap.ping,
       cursor: Math.max(prev.cursor, client.cursor),
-      accounts: snap.accounts,
+      subscriptions: snap.subscriptions,
       runs: snap.runs,
       workspaces: snap.workspaces,
       candidates: snap.candidates,
@@ -73,8 +73,8 @@ export function App({ initialState, injectedClient = null }: AppProps = {}) {
     }));
     setLaunchForm((prev) => ({
       ...prev,
-      profileId: prev.profileId || snap.accounts[0]?.profile_id || "",
-      workspaceDir: prev.workspaceDir || snap.workspaces[0]?.working_dir || "",
+      profileId: prev.profileId || snap.subscriptions[0]?.profile_id || "",
+      workspaceId: prev.workspaceId || snap.workspaces[0]?.workspace_id || "",
     }));
   }
 
@@ -174,12 +174,12 @@ export function App({ initialState, injectedClient = null }: AppProps = {}) {
     }
   }
 
-  async function handleSwitchAccount(profileId: string) {
+  async function handleActivateHostSlot(profileId: string) {
     const client = clientRef.current;
     if (!client) return;
     setBusy(true);
     try {
-      const notice = await switchAccountAction(client, profileId);
+      const notice = await activateSubscriptionAction(client, profileId);
       await syncFromDaemon(client);
       setState((prev) => ({ ...prev, notice }));
     } finally {
@@ -310,14 +310,14 @@ export function App({ initialState, injectedClient = null }: AppProps = {}) {
       ) : null}
 
       <div className="panel-grid">
-        <AccountsPanel
-          accounts={state.accounts}
+        <SubscriptionsPanel
+          subscriptions={state.subscriptions}
           busy={busy}
-          onSwitchAccount={(pid) => void handleSwitchAccount(pid)}
+          onActivateHostSlot={(pid) => void handleActivateHostSlot(pid)}
         />
 
         <RunsEventsPanel
-          accounts={state.accounts}
+          subscriptions={state.subscriptions}
           workspaces={state.workspaces}
           runs={state.runs}
           events={state.events}

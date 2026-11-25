@@ -47,19 +47,21 @@ pub enum OAuthStorageMode {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct EgressBinding {
-    pub proxy_id: String,
-    pub expected_country: String,
-    pub expected_region: Option<String>,
+    /// 可选的企业上游代理引用；None 表示由 Atomium 网关按策略直连
+    #[serde(default)]
+    pub upstream_proxy_id: Option<String>,
     pub fail_closed: bool,
-    pub exclusive_proxy_use: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct LocalePolicy {
-    pub timezone: String,
-    pub lang: String,
-    pub auto_align_with_proxy: bool,
+    /// 手动设置的时区；None 表示跟随本机
+    #[serde(default)]
+    pub timezone: Option<String>,
+    /// 手动设置的语言（LANG / LC_ALL）；None 表示跟随本机
+    #[serde(default)]
+    pub lang: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
@@ -170,11 +172,12 @@ pub struct RunStartRequest {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
-    pub workspace_dir: Option<String>,
+    /// Broker 导入的工作区；None 表示使用本次运行私有的空工作目录
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     pub upstream_proxy_addr: Option<String>,
     #[serde(default)]
     pub allowed_egress_hosts: Vec<String>,
-    pub use_seatbelt: Option<bool>,
     pub timeout_ms: Option<i64>,
 }
 
@@ -187,29 +190,31 @@ pub struct RunCancelRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
-pub struct AccountCaptureRequest {
+pub struct SubscriptionCaptureRequest {
     pub profile_id: String,
     pub display_name: String,
     pub agent_kind: Option<String>,
     pub storage_mode: Option<OAuthStorageMode>,
     pub raw_secret_b64: Option<String>,
     pub source_file_path: Option<String>,
-    pub proxy_id: Option<String>,
-    pub expected_country: Option<String>,
-    pub expected_region: Option<String>,
+    #[serde(default)]
+    pub upstream_proxy_id: Option<String>,
+    #[serde(default)]
     pub timezone: Option<String>,
+    #[serde(default)]
     pub lang: Option<String>,
 }
 
+/// 仅用于已弃用的 HostKeychainSlot 兼容模式：把指定订阅写入宿主 Keychain 槽位
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
-pub struct AccountSwitchRequest {
+pub struct SubscriptionActivateRequest {
     pub profile_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
-pub struct AccountSummary {
+pub struct SubscriptionSummary {
     pub profile_id: String,
     pub display_name: String,
     pub agent_kind: String,
@@ -217,7 +222,7 @@ pub struct AccountSummary {
     pub storage_mode: Option<OAuthStorageMode>,
     pub snapshot_version: Option<i64>,
     pub content_digest: Option<String>,
-    pub proxy_id: String,
+    pub upstream_proxy_id: Option<String>,
     pub active_host_slot: bool,
     pub active_leases: Vec<String>,
 }
@@ -385,8 +390,6 @@ pub struct CandidateFreezeRequest {
     #[serde(default)]
     pub run_id: Option<String>,
     #[serde(default)]
-    pub run_workspace_dir: Option<String>,
-    #[serde(default)]
     pub limits: Option<WorkspaceImportLimits>,
 }
 
@@ -464,9 +467,9 @@ mod tests {
         RunRecord::export_all().unwrap();
         RunStartRequest::export_all().unwrap();
         RunCancelRequest::export_all().unwrap();
-        AccountCaptureRequest::export_all().unwrap();
-        AccountSwitchRequest::export_all().unwrap();
-        AccountSummary::export_all().unwrap();
+        SubscriptionCaptureRequest::export_all().unwrap();
+        SubscriptionActivateRequest::export_all().unwrap();
+        SubscriptionSummary::export_all().unwrap();
         JsonRpcRequest::export_all().unwrap();
         JsonRpcResponse::export_all().unwrap();
         CapabilitiesReport::export_all().unwrap();

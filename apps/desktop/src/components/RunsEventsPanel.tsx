@@ -1,7 +1,7 @@
 import React from "react";
 import type {
-  AccountSummary,
   RunRecord,
+  SubscriptionSummary,
   TaskEvent,
   WorkspaceSnapshot,
 } from "@atomium/protocol-types";
@@ -12,7 +12,7 @@ import {
 } from "../panelController";
 
 export interface RunsEventsPanelProps {
-  accounts: AccountSummary[];
+  subscriptions: SubscriptionSummary[];
   workspaces: WorkspaceSnapshot[];
   runs: RunRecord[];
   events: TaskEvent[];
@@ -38,7 +38,7 @@ function runStatusClass(status: RunRecord["status"]): string {
 }
 
 export function RunsEventsPanel({
-  accounts,
+  subscriptions,
   workspaces,
   runs,
   events,
@@ -92,7 +92,7 @@ export function RunsEventsPanel({
               onChange={(e) => onChangeLaunchForm({ profileId: e.target.value })}
             >
               <option value="">-- select profile --</option>
-              {accounts.map((a) => (
+              {subscriptions.map((a) => (
                 <option key={a.profile_id} value={a.profile_id}>
                   {a.profile_id} ({a.state})
                 </option>
@@ -123,18 +123,18 @@ export function RunsEventsPanel({
           </div>
 
           <div className="form-field">
-            <label htmlFor="run-workspace-input">Workspace Working Dir (optional)</label>
+            <label htmlFor="run-workspace-input">Brokered Workspace ID (optional)</label>
             <input
               id="run-workspace-input"
               className="mono"
               list="broker-workspaces-list"
-              value={launchForm.workspaceDir}
-              onChange={(e) => onChangeLaunchForm({ workspaceDir: e.target.value })}
-              placeholder="default isolated workspace"
+              value={launchForm.workspaceId}
+              onChange={(e) => onChangeLaunchForm({ workspaceId: e.target.value })}
+              placeholder="default private run workspace"
             />
             <datalist id="broker-workspaces-list">
               {workspaces.map((ws) => (
-                <option key={ws.workspace_id} value={ws.working_dir}>
+                <option key={ws.workspace_id} value={ws.workspace_id}>
                   {ws.workspace_id} ({ws.source_dir})
                 </option>
               ))}

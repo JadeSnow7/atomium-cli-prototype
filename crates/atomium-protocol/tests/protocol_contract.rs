@@ -1,10 +1,10 @@
 use atomium_protocol::{
-    AccountCaptureRequest, AccountSummary, AccountSwitchRequest, ApprovalCreateRequest,
-    ApprovalRequest, ApprovalResolveRequest, CandidateDiffSummary, CandidateFreezeRequest,
-    CandidateSnapshot, CandidateStatus, CapabilitiesReport, CredentialSpec, EgressBinding,
-    ExportResult, FileChangeKind, FileDiffEntry, IdentityProfile, JsonRpcError, JsonRpcRequest,
-    JsonRpcResponse, LocalePolicy, OAuthStorageMode, ProbeEvidence, ProfileState, RunCancelRequest,
-    RunRecord, RunStartRequest, SnapshotFileEntry, TaskEvent, TaskEventPayload, TaskStatus,
+    ApprovalCreateRequest, ApprovalRequest, ApprovalResolveRequest, CandidateDiffSummary,
+    CandidateFreezeRequest, CandidateSnapshot, CandidateStatus, CapabilitiesReport, CredentialSpec,
+    EgressBinding, ExportResult, FileChangeKind, FileDiffEntry, IdentityProfile, JsonRpcError,
+    JsonRpcRequest, JsonRpcResponse, LocalePolicy, OAuthStorageMode, ProbeEvidence, ProfileState,
+    RunCancelRequest, RunRecord, RunStartRequest, SnapshotFileEntry, SubscriptionActivateRequest,
+    SubscriptionCaptureRequest, SubscriptionSummary, TaskEvent, TaskEventPayload, TaskStatus,
     WorkspaceImportLimits, WorkspaceImportRequest, WorkspaceSnapshot,
 };
 use serde_json::json;
@@ -24,19 +24,15 @@ where
 
 fn base_egress() -> EgressBinding {
     EgressBinding {
-        proxy_id: "proxy-us-west".into(),
-        expected_country: "US".into(),
-        expected_region: Some("CA".into()),
+        upstream_proxy_id: Some("corp-proxy".into()),
         fail_closed: true,
-        exclusive_proxy_use: false,
     }
 }
 
 fn base_locale() -> LocalePolicy {
     LocalePolicy {
-        timezone: "America/Los_Angeles".into(),
-        lang: "en_US.UTF-8".into(),
-        auto_align_with_proxy: true,
+        timezone: Some("America/Los_Angeles".into()),
+        lang: Some("en_US.UTF-8".into()),
     }
 }
 
@@ -60,7 +56,11 @@ fn identity_profile_and_credential_specs_wire_format_and_roundtrip() {
     assert_eq!(v_api["credential"]["vault_secret_id"], "sec-1");
     assert_eq!(v_api["credential"]["model_alias"], "sonnet");
     assert_eq!(v_api["credential"]["max_concurrent_runs"], 4);
-    assert_eq!(v_api["egress"]["expected_region"], "CA");
+    assert_eq!(v_api["egress"]["upstream_proxy_id"], "corp-proxy");
+    assert!(v_api["egress"].get("expected_country").is_none());
+    assert!(v_api["locale_policy"]
+        .get("auto_align_with_proxy")
+        .is_none());
     assert_eq!(v_api["state"], "active");
 
     let adc_profile = IdentityProfile {
@@ -73,10 +73,13 @@ fn identity_profile_and_credential_specs_wire_format_and_roundtrip() {
             env_flag_name: "GOOGLE_APPLICATION_CREDENTIALS".into(),
         },
         egress: EgressBinding {
-            expected_region: None,
+            upstream_proxy_id: None,
             ..base_egress()
         },
-        locale_policy: base_locale(),
+        locale_policy: LocalePolicy {
+            timezone: None,
+            lang: None,
+        },
         state: ProfileState::NeedsReauth,
     };
     let v_adc = assert_json_roundtrip(&adc_profile);
@@ -353,7 +356,7 @@ fn capabilities_report_and_probe_evidence_roundtrip() {
 }
 
 #[test]
-fn run_and_account_rpc_types_roundtrip() {
+fn run_and_subscription_rpc_types_roundtrip() {
     let rec = RunRecord {
         run_id: "run-123".into(),
         profile_id: "acct_a".into(),
@@ -379,10 +382,9 @@ fn run_and_account_rpc_types_roundtrip() {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "true".into()],
         env: HashMap::from([("FOO".into(), "bar".into())]),
-        workspace_dir: None,
+        workspace_id: Some("ws-1".into()),
         upstream_proxy_addr: Some("127.0.0.1:7890".into()),
         allowed_egress_hosts: vec!["*.googleapis.com".into()],
-        use_seatbelt: Some(false),
         timeout_ms: Some(5000),
     };
     let v_start = assert_json_roundtrip(&start);
@@ -394,31 +396,33 @@ fn run_and_account_rpc_types_roundtrip() {
     };
     assert_json_roundtrip(&cancel);
 
-    let capture = AccountCaptureRequest {
+    assert_eq!(v_start["workspace_id"], "ws-1");
+    assert!(v_start.get("use_seatbelt").is_none());
+    assert!(v_start.get("workspace_dir").is_none());
+
+    let capture = SubscriptionCaptureRequest {
         profile_id: "acct_a".into(),
-        display_name: "Account A".into(),
+        display_name: "Subscription A".into(),
         agent_kind: Some("antigravity".into()),
         storage_mode: Some(OAuthStorageMode::IsolatedFile {
             relative_home_path: ".gemini/antigravity-cli/antigravity-oauth-token".into(),
         }),
         raw_secret_b64: None,
         source_file_path: Some("/tmp/oauth.json".into()),
-        proxy_id: Some("proxy-us-1".into()),
-        expected_country: Some("US".into()),
-        expected_region: None,
+        upstream_proxy_id: None,
         timezone: Some("UTC".into()),
         lang: Some("en_US.UTF-8".into()),
     };
     assert_json_roundtrip(&capture);
 
-    let switch = AccountSwitchRequest {
+    let activate = SubscriptionActivateRequest {
         profile_id: "acct_b".into(),
     };
-    assert_json_roundtrip(&switch);
+    assert_json_roundtrip(&activate);
 
-    let summary = AccountSummary {
+    let summary = SubscriptionSummary {
         profile_id: "acct_a".into(),
-        display_name: "Account A".into(),
+        display_name: "Subscription A".into(),
         agent_kind: "antigravity".into(),
         state: ProfileState::Active,
         storage_mode: Some(OAuthStorageMode::IsolatedFile {
@@ -426,7 +430,7 @@ fn run_and_account_rpc_types_roundtrip() {
         }),
         snapshot_version: Some(2),
         content_digest: Some("deadbeef".into()),
-        proxy_id: "proxy-us-1".into(),
+        upstream_proxy_id: None,
         active_host_slot: false,
         active_leases: vec![],
     };
@@ -465,7 +469,6 @@ fn broker_and_approval_m3_types_roundtrip() {
     let freeze = CandidateFreezeRequest {
         workspace_id: "ws-1".into(),
         run_id: Some("run-1".into()),
-        run_workspace_dir: None,
         limits: None,
     };
     assert_json_roundtrip(&freeze);

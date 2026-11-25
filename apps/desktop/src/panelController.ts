@@ -1,10 +1,10 @@
 import type {
-  AccountSummary,
   ApprovalRequest,
   CandidateSnapshot,
   ExportResult,
   OAuthStorageMode,
   RunRecord,
+  SubscriptionSummary,
   TaskEvent,
   WorkspaceSnapshot,
 } from "@atomium/protocol-types";
@@ -27,7 +27,7 @@ export interface RunLaunchForm {
   profileId: string;
   program: string;
   argsText: string;
-  workspaceDir: string;
+  workspaceId: string;
   allowHostsText: string;
 }
 
@@ -36,7 +36,7 @@ export interface DesktopPanelState {
   socketPath: string;
   ping: DaemonPingResult | null;
   cursor: number;
-  accounts: AccountSummary[];
+  subscriptions: SubscriptionSummary[];
   runs: RunRecord[];
   workspaces: WorkspaceSnapshot[];
   candidates: CandidateSnapshot[];
@@ -53,7 +53,7 @@ export function createInitialPanelState(socketPath = "/tmp/atomiumd.sock"): Desk
     socketPath,
     ping: null,
     cursor: 0,
-    accounts: [],
+    subscriptions: [],
     runs: [],
     workspaces: [],
     candidates: [],
@@ -183,7 +183,7 @@ export function applyTaskEvent(prev: DesktopPanelState, ev: TaskEvent): DesktopP
 
 export interface DashboardSnapshot {
   ping: DaemonPingResult;
-  accounts: AccountSummary[];
+  subscriptions: SubscriptionSummary[];
   runs: RunRecord[];
   workspaces: WorkspaceSnapshot[];
   candidates: CandidateSnapshot[];
@@ -191,30 +191,30 @@ export interface DashboardSnapshot {
 }
 
 export async function refreshDashboard(client: AtomiumClient): Promise<DashboardSnapshot> {
-  const [ping, accounts, runs, workspaces, candidates, approvals] = await Promise.all([
+  const [ping, subscriptions, runs, workspaces, candidates, approvals] = await Promise.all([
     client.ping(),
-    client.listAccounts(),
+    client.listSubscriptions(),
     client.listRuns(),
     client.listWorkspaces(),
     client.listCandidates(),
     client.listApprovals(),
   ]);
-  return { ping, accounts, runs, workspaces, candidates, approvals };
+  return { ping, subscriptions, runs, workspaces, candidates, approvals };
 }
 
-export async function switchAccountAction(
+export async function activateSubscriptionAction(
   client: AtomiumClient,
   profileId: string,
 ): Promise<FeedbackNotice> {
   try {
-    const res = await client.switchAccount(profileId);
+    const res = await client.activateSubscription(profileId);
     return {
       kind: "ok",
-      title: `Switched account to ${res.profile_id}`,
+      title: `Activated host slot for ${res.profile_id}`,
       detail: `mode=${res.mode}${res.previous_writeback ? " (previous token written back to Vault)" : ""}`,
     };
   } catch (err) {
-    return errorToNotice("Account switch failed", err);
+    return errorToNotice("Subscription activation failed", err);
   }
 }
 
@@ -240,10 +240,9 @@ export async function startRunAction(
       program: form.program.trim(),
       args: parseArgsLine(form.argsText),
       env: {},
-      workspace_dir: form.workspaceDir.trim() ? form.workspaceDir.trim() : null,
+      workspace_id: form.workspaceId.trim() ? form.workspaceId.trim() : null,
       upstream_proxy_addr: null,
       allowed_egress_hosts: parseAllowHosts(form.allowHostsText),
-      use_seatbelt: null,
       timeout_ms: null,
     });
     return {

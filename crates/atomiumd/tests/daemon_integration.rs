@@ -82,7 +82,11 @@ impl ServerHandle {
         let dir = TempDirGuard::new("atmd");
         let db_path = dir.path().join("d.sqlite");
         let sock_path = dir.path().join("d.sock");
-        let state = Arc::new(atomiumd::DaemonState::open(&db_path).expect("open daemon state"));
+        let state = Arc::new(
+            atomiumd::DaemonState::open(&db_path)
+                .expect("open daemon state")
+                .with_unsandboxed_dev_mode(true),
+        );
         let listener = atomiumd::bind_socket(&sock_path).expect("bind socket");
         let server_state = state.clone();
         let task = tokio::spawn(async move {
@@ -169,16 +173,12 @@ fn sample_profile(id: &str, display_name: &str) -> IdentityProfile {
             content_digest: "sha256:deadbeef".into(),
         },
         egress: EgressBinding {
-            proxy_id: "proxy-us-1".into(),
-            expected_country: "US".into(),
-            expected_region: Some("us-west".into()),
+            upstream_proxy_id: None,
             fail_closed: true,
-            exclusive_proxy_use: true,
         },
         locale_policy: LocalePolicy {
-            timezone: "America/Los_Angeles".into(),
-            lang: "en_US.UTF-8".into(),
-            auto_align_with_proxy: false,
+            timezone: Some("America/Los_Angeles".into()),
+            lang: Some("en_US.UTF-8".into()),
         },
         state: ProfileState::Active,
     }

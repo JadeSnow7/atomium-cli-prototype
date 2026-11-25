@@ -160,16 +160,12 @@ mod tests {
                 content_digest: digest,
             },
             egress: EgressBinding {
-                proxy_id: "direct-disabled".into(),
-                expected_country: "US".into(),
-                expected_region: None,
+                upstream_proxy_id: None,
                 fail_closed: true,
-                exclusive_proxy_use: true,
             },
             locale_policy: LocalePolicy {
-                timezone: "America/Los_Angeles".into(),
-                lang: "en_US.UTF-8".into(),
-                auto_align_with_proxy: false,
+                timezone: Some("America/Los_Angeles".into()),
+                lang: Some("en_US.UTF-8".into()),
             },
             state: ProfileState::Active,
         };

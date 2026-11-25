@@ -8,10 +8,10 @@ use atomium_core::{
 };
 use atomium_gateway::{spawn_run_proxy_with_policy, EgressProxyHandle};
 use atomium_protocol::{
-    AccountCaptureRequest, AccountSummary, AccountSwitchRequest, ApprovalCreateRequest,
-    ApprovalRequest, ApprovalResolveRequest, CandidateFreezeRequest, CandidateStatus,
-    CredentialSpec, EgressBinding, IdentityProfile, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
-    LocalePolicy, OAuthStorageMode, ProfileState, RunCancelRequest, RunRecord, RunStartRequest,
+    ApprovalCreateRequest, ApprovalRequest, ApprovalResolveRequest, CandidateFreezeRequest,
+    CandidateStatus, CredentialSpec, EgressBinding, IdentityProfile, JsonRpcError, JsonRpcRequest,
+    JsonRpcResponse, LocalePolicy, OAuthStorageMode, ProfileState, RunCancelRequest, RunRecord,
+    RunStartRequest, SubscriptionActivateRequest, SubscriptionCaptureRequest, SubscriptionSummary,
     TaskEvent, TaskEventPayload, TaskStatus, WorkspaceImportRequest,
 };
 use atomium_runtime::{build_seatbelt_command_with_extra_read_paths, SeatbeltConfig};
@@ -96,6 +96,7 @@ pub struct DaemonState {
     event_tx: broadcast::Sender<TaskEvent>,
     active_runs: Mutex<HashMap<String, ActiveRunControl>>,
     broker_lock: Mutex<()>,
+    unsandboxed_dev_mode: bool,
 }
 
 impl DaemonState {
@@ -170,7 +171,15 @@ impl DaemonState {
             event_tx,
             active_runs: Mutex::new(HashMap::new()),
             broker_lock: Mutex::new(()),
+            unsandboxed_dev_mode: false,
         })
+    }
+
+    /// 开发/测试专用：允许 runs.start 在没有隔离后端时直接以干净环境运行子进程。
+    /// 只能由守护进程启动方开启（`ATOMIUM_DEV_UNSANDBOXED=1`），RPC 调用方无法请求。
+    pub fn with_unsandboxed_dev_mode(mut self, enabled: bool) -> Self {
+        self.unsandboxed_dev_mode = enabled;
+        self
     }
 
     pub async fn register_pending_approval(&self, req: ApprovalRequest) {
@@ -264,11 +273,11 @@ impl DaemonState {
         Ok(true)
     }
 
-    fn build_account_summary(
+    fn build_subscription_summary(
         &self,
         profile: &IdentityProfile,
         active_leases: &[atomium_core::ActiveLease],
-    ) -> AccountSummary {
+    ) -> SubscriptionSummary {
         let (storage_mode, snapshot_version, content_digest, active_host_slot) =
             match &profile.credential {
                 CredentialSpec::OauthSnapshot {
@@ -300,15 +309,9 @@ impl DaemonState {
 
         let oauth_key = format!("profile:{}:oauth", profile.id);
         let cred_key = format!("profile:{}:cred", profile.id);
-        let proxy_key = format!("proxy:{}", profile.egress.proxy_id);
         let held: Vec<String> = active_leases
             .iter()
-            .filter(|l| {
-                l.resource_key == oauth_key
-                    || l.resource_key == cred_key
-                    || (l.resource_key == proxy_key
-                        && l.affinity_owner.as_deref() == Some(profile.id.as_str()))
-            })
+            .filter(|l| l.resource_key == oauth_key || l.resource_key == cred_key)
             .map(|l| {
                 format!(
                     "{} (run={}, pid={})",
@@ -317,7 +320,7 @@ impl DaemonState {
             })
             .collect();
 
-        AccountSummary {
+        SubscriptionSummary {
             profile_id: profile.id.clone(),
             display_name: profile.display_name.clone(),
             agent_kind: profile.agent_kind.clone(),
@@ -325,7 +328,7 @@ impl DaemonState {
             storage_mode,
             snapshot_version,
             content_digest,
-            proxy_id: profile.egress.proxy_id.clone(),
+            upstream_proxy_id: profile.egress.upstream_proxy_id.clone(),
             active_host_slot,
             active_leases: held,
         }
@@ -413,7 +416,13 @@ pub async fn run_daemon() -> Result<()> {
             DaemonState::open_with_providers(&db_path, &vault_dir, &runs_dir, &provider, keychain)?
         };
 
-        Arc::new(state)
+        let unsandboxed_dev_mode = std::env::var("ATOMIUM_DEV_UNSANDBOXED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if unsandboxed_dev_mode {
+            tracing::warn!("ATOMIUM_DEV_UNSANDBOXED=1: runs execute WITHOUT an isolation backend");
+        }
+        Arc::new(state.with_unsandboxed_dev_mode(unsandboxed_dev_mode))
     };
 
     tracing::info!(
@@ -658,9 +667,9 @@ pub async fn dispatch(
             },
             Err(e) => (err(-32602, format!("invalid profile params: {e}")), vec![]),
         },
-        "accounts.capture" => {
-            match serde_json::from_value::<AccountCaptureRequest>(req.params.clone()) {
-                Ok(capture_req) => match handle_accounts_capture(state, capture_req) {
+        "subscriptions.capture" => {
+            match serde_json::from_value::<SubscriptionCaptureRequest>(req.params.clone()) {
+                Ok(capture_req) => match handle_subscriptions_capture(state, capture_req) {
                     Ok(summary) => (
                         ok(serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null)),
                         vec![],
@@ -668,23 +677,29 @@ pub async fn dispatch(
                     Err((code, msg)) => (err(code, msg), vec![]),
                 },
                 Err(e) => (
-                    err(-32602, format!("invalid accounts.capture params: {e}")),
+                    err(-32602, format!("invalid subscriptions.capture params: {e}")),
                     vec![],
                 ),
             }
         }
-        "accounts.list" => match handle_accounts_list(state) {
-            Ok(accounts) => (ok(serde_json::json!({ "accounts": accounts })), vec![]),
+        "subscriptions.list" => match handle_subscriptions_list(state) {
+            Ok(subscriptions) => (
+                ok(serde_json::json!({ "subscriptions": subscriptions })),
+                vec![],
+            ),
             Err(e) => (err(-32000, e.to_string()), vec![]),
         },
-        "accounts.switch" => {
-            match serde_json::from_value::<AccountSwitchRequest>(req.params.clone()) {
-                Ok(switch_req) => match handle_accounts_switch(state, switch_req) {
+        "subscriptions.activate" => {
+            match serde_json::from_value::<SubscriptionActivateRequest>(req.params.clone()) {
+                Ok(activate_req) => match handle_subscriptions_activate(state, activate_req) {
                     Ok(res) => (ok(res), vec![]),
                     Err((code, msg)) => (err(code, msg), vec![]),
                 },
                 Err(e) => (
-                    err(-32602, format!("invalid accounts.switch params: {e}")),
+                    err(
+                        -32602,
+                        format!("invalid subscriptions.activate params: {e}"),
+                    ),
                     vec![],
                 ),
             }
@@ -907,10 +922,10 @@ pub async fn dispatch(
     }
 }
 
-fn handle_accounts_capture(
+fn handle_subscriptions_capture(
     state: &DaemonState,
-    req: AccountCaptureRequest,
-) -> std::result::Result<AccountSummary, (i32, String)> {
+    req: SubscriptionCaptureRequest,
+) -> std::result::Result<SubscriptionSummary, (i32, String)> {
     validate_identifier("profile_id", &req.profile_id).map_err(|e| (-32602, e.to_string()))?;
     if req.display_name.trim().is_empty() {
         return Err((-32602, "display_name must not be empty".into()));
@@ -971,7 +986,7 @@ fn handle_accounts_capture(
         .acquire_all(&capture_run_id, capture_leases, 30)
         .map_err(|e| (-32009, e.to_string()))?;
 
-    let capture_res = (|| -> std::result::Result<AccountSummary, (i32, String)> {
+    let capture_res = (|| -> std::result::Result<SubscriptionSummary, (i32, String)> {
         let existing = state
             .profiles
             .get(&req.profile_id)
@@ -1001,18 +1016,12 @@ fn handle_accounts_capture(
                 content_digest,
             },
             egress: EgressBinding {
-                proxy_id: req
-                    .proxy_id
-                    .unwrap_or_else(|| format!("proxy-{}", req.profile_id)),
-                expected_country: req.expected_country.unwrap_or_else(|| "US".into()),
-                expected_region: req.expected_region,
+                upstream_proxy_id: req.upstream_proxy_id,
                 fail_closed: true,
-                exclusive_proxy_use: false,
             },
             locale_policy: LocalePolicy {
-                timezone: req.timezone.unwrap_or_else(|| "UTC".into()),
-                lang: req.lang.unwrap_or_else(|| "en_US.UTF-8".into()),
-                auto_align_with_proxy: false,
+                timezone: req.timezone,
+                lang: req.lang,
             },
             state: ProfileState::Active,
         };
@@ -1031,26 +1040,26 @@ fn handle_accounts_capture(
             .leases
             .list_active_leases()
             .map_err(|e| (-32000, e.to_string()))?;
-        Ok(state.build_account_summary(&profile, &leases))
+        Ok(state.build_subscription_summary(&profile, &leases))
     })();
 
     let _ = state.leases.release_all(&capture_run_id);
     capture_res
 }
 
-fn handle_accounts_list(state: &DaemonState) -> Result<Vec<AccountSummary>> {
+fn handle_subscriptions_list(state: &DaemonState) -> Result<Vec<SubscriptionSummary>> {
     let _ = state.leases.reclaim_stale_leases(Some(&state.profiles))?;
     let profiles = state.profiles.list()?;
     let active_leases = state.leases.list_active_leases()?;
     Ok(profiles
         .iter()
-        .map(|p| state.build_account_summary(p, &active_leases))
+        .map(|p| state.build_subscription_summary(p, &active_leases))
         .collect())
 }
 
-fn handle_accounts_switch(
+fn handle_subscriptions_activate(
     state: &DaemonState,
-    req: AccountSwitchRequest,
+    req: SubscriptionActivateRequest,
 ) -> std::result::Result<serde_json::Value, (i32, String)> {
     let _ = state
         .leases
@@ -1067,7 +1076,7 @@ fn handle_accounts_switch(
         return Err((
             -32002,
             format!(
-                "profile {} cannot be switched while in state {:?}",
+                "profile {} cannot be activated while in state {:?}",
                 target.id, target.state
             ),
         ));
@@ -1087,7 +1096,7 @@ fn handle_accounts_switch(
 
     match mode {
         OAuthStorageMode::IsolatedFile { relative_home_path } => Ok(serde_json::json!({
-            "switched": true,
+            "activated": true,
             "profile_id": target.id,
             "mode": "isolated_file",
             "relative_home_path": relative_home_path,
@@ -1120,13 +1129,13 @@ fn handle_accounts_switch(
                 }
             }
 
-            let switch_run_id = format!("switch-{}", uuid::Uuid::now_v7());
+            let activate_run_id = format!("activate-{}", uuid::Uuid::now_v7());
             state
                 .leases
-                .acquire_all(&switch_run_id, lease_reqs, 30)
+                .acquire_all(&activate_run_id, lease_reqs, 30)
                 .map_err(|e| (-32009, e.to_string()))?;
 
-            let switch_result = (|| -> std::result::Result<serde_json::Value, (i32, String)> {
+            let activate_result = (|| -> std::result::Result<serde_json::Value, (i32, String)> {
                 let mut previous_writeback = false;
                 if let Some(prev) = &prev_id {
                     if prev != &target.id {
@@ -1152,7 +1161,7 @@ fn handle_accounts_switch(
                     .map_err(|e| (-32000, e.to_string()))?;
 
                 Ok(serde_json::json!({
-                    "switched": true,
+                    "activated": true,
                     "profile_id": target.id,
                     "mode": "host_keychain_slot",
                     "previous_profile_id": prev_id,
@@ -1160,8 +1169,8 @@ fn handle_accounts_switch(
                 }))
             })();
 
-            let _ = state.leases.release_all(&switch_run_id);
-            switch_result
+            let _ = state.leases.release_all(&activate_run_id);
+            activate_result
         }
     }
 }
@@ -1195,21 +1204,32 @@ async fn handle_runs_start(
         ));
     }
 
-    #[cfg(not(target_os = "macos"))]
-    if req.use_seatbelt == Some(true) {
+    // Isolation is decided by the daemon, never by the RPC caller.
+    let use_seatbelt = cfg!(target_os = "macos") && !state.unsandboxed_dev_mode;
+    if !use_seatbelt && !state.unsandboxed_dev_mode {
         return Err((
             -32003,
-            "macOS Seatbelt backend is unsupported on this OS".into(),
+            "no isolation backend available on this OS; refusing to run unsandboxed".into(),
         ));
     }
 
+    // Only Broker-imported workspaces may be mounted into a run; arbitrary host paths are rejected.
+    let brokered_workspace_dir = match &req.workspace_id {
+        Some(ws_id) => {
+            let ws = state
+                .broker
+                .get_workspace(ws_id)
+                .map_err(|e| (e.rpc_code(), e.to_string()))?
+                .ok_or_else(|| (-32004, format!("workspace_id not found: {ws_id}")))?;
+            Some(PathBuf::from(ws.working_dir))
+        }
+        None => None,
+    };
+
     let run_id = format!("run-{}", uuid::Uuid::now_v7());
 
-    // 1. Atomically acquire multi-resource leases (Profile OAuth Exclusive + Proxy Affinity).
-    let mut lease_reqs = vec![LeaseRequest {
-        resource_key: format!("proxy:{}", profile.egress.proxy_id),
-        mode: LeaseMode::Affinity(profile.id.clone()),
-    }];
+    // 1. Atomically acquire multi-resource leases (Profile OAuth Exclusive / credential Shared).
+    let mut lease_reqs = Vec::new();
     match &profile.credential {
         CredentialSpec::OauthSnapshot { mode, .. } => {
             lease_reqs.push(LeaseRequest {
@@ -1249,12 +1269,9 @@ async fn handle_runs_start(
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
         }
 
-        let workspace_dir = match &req.workspace_dir {
-            Some(ws) => {
-                let p = PathBuf::from(ws);
-                fs::create_dir_all(&p)?;
-                p
-            }
+        let workspace_dir = match &brokered_workspace_dir {
+            Some(p) if p.is_dir() => p.clone(),
+            Some(p) => return Err(anyhow!("brokered working_dir is missing: {}", p.display())),
             None => default_ws.clone(),
         };
 
@@ -1382,12 +1399,18 @@ async fn handle_runs_start(
         },
     );
 
-    // 5. Build child command (Seatbelt on macOS when enabled, or clean isolated env).
-    let use_seatbelt = if cfg!(target_os = "macos") {
-        req.use_seatbelt.unwrap_or(true)
-    } else {
-        false
-    };
+    if !use_seatbelt {
+        let _ = state.emit_event(
+            &run_id,
+            &TaskEventPayload::LogLine {
+                stream: "atomium".into(),
+                line: "WARNING: ATOMIUM_DEV_UNSANDBOXED dev mode, run has no isolation backend"
+                    .into(),
+            },
+        );
+    }
+
+    // 5. Build child command (Seatbelt on macOS, or clean env in unsandboxed dev mode).
 
     let mut extra_env: Vec<(String, String)> = vec![
         ("HTTP_PROXY".into(), proxy_url.clone()),
@@ -1458,9 +1481,13 @@ async fn handle_runs_start(
         c.env("HOME", &canon_home);
         c.env("TMPDIR", &canon_tmp);
         c.env("XDG_CACHE_HOME", &canon_cache);
-        c.env("TZ", &profile.locale_policy.timezone);
-        c.env("LANG", &profile.locale_policy.lang);
-        c.env("LC_ALL", &profile.locale_policy.lang);
+        if let Some(tz) = &profile.locale_policy.timezone {
+            c.env("TZ", tz);
+        }
+        if let Some(lang) = &profile.locale_policy.lang {
+            c.env("LANG", lang);
+            c.env("LC_ALL", lang);
+        }
         for (k, v) in &extra_env {
             c.env(k, v);
         }
@@ -1976,10 +2003,7 @@ async fn handle_candidates_freeze(
             )
         })?;
 
-    let target_working = match &req.run_workspace_dir {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(&workspace.working_dir),
-    };
+    let target_working = PathBuf::from(&workspace.working_dir);
     let canon_working =
         fs::canonicalize(&target_working).unwrap_or_else(|_| target_working.clone());
 
@@ -2016,12 +2040,7 @@ async fn handle_candidates_freeze(
 
     let (candidate, invalidated_ids) = state
         .broker
-        .freeze_candidate(
-            &req.workspace_id,
-            req.run_workspace_dir.as_deref().map(Path::new),
-            req.run_id,
-            req.limits,
-        )
+        .freeze_candidate(&req.workspace_id, None, req.run_id, req.limits)
         .map_err(broker_err_to_rpc)?;
 
     // Invalidate any pending approvals bound to superseded candidates immediately.
