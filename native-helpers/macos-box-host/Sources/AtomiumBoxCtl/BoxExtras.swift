@@ -103,21 +103,24 @@ enum BoxExtras {
             try fm.removeItem(atPath: kcPath)
         }
 
-        func runSecurityAsBox(_ secArgs: [String], redacted: [String]? = nil) throws -> ProcessResult {
+        func runSecurityAsBox(_ secArgs: [String], redacted: [String]? = nil, stdinData: Data? = nil) throws -> ProcessResult {
             let prefix = ["/bin/launchctl", "asuser", String(uid), "/usr/bin/sudo", "-u", identifier.shortName, "-H"]
                 + LaunchctlCommandBuilder.boxEnvironmentPrefix(id: identifier)
                 + ["/usr/bin/security"]
             let spec = CommandSpec(
                 executable: "/usr/bin/sudo",
                 arguments: prefix + secArgs,
-                redactedArguments: redacted.map { prefix + $0 }
+                redactedArguments: redacted.map { prefix + $0 },
+                stdinData: stdinData
             )
             return try ProcessRunner.runWithTimeout(spec, timeoutSeconds: 8.0, environment: env, currentDirectoryPath: identifier.homeDirectory)
         }
 
+        let createKeychain = SecurityCommandBuilder.createKeychain(keychainPath: kcPath, password: secret)
         let createRes = try runSecurityAsBox(
-            ["create-keychain", "-p", secret, kcPath],
-            redacted: ["create-keychain", "-p", "<REDACTED>", kcPath]
+            createKeychain.arguments,
+            redacted: createKeychain.redactedArguments,
+            stdinData: createKeychain.stdinData
         )
         guard createRes.succeeded else {
             throw BoxCLIError.commandFailed("security create-keychain", createRes.stderr)
@@ -127,9 +130,11 @@ enum BoxExtras {
         _ = try runSecurityAsBox(["login-keychain", "-d", "user", "-s", kcPath])
         _ = try runSecurityAsBox(["set-keychain-settings", kcPath])
 
+        let unlockKeychain = SecurityCommandBuilder.unlockKeychain(keychainPath: kcPath, password: secret)
         let unlockRes = try runSecurityAsBox(
-            ["unlock-keychain", "-p", secret, kcPath],
-            redacted: ["unlock-keychain", "-p", "<REDACTED>", kcPath]
+            unlockKeychain.arguments,
+            redacted: unlockKeychain.redactedArguments,
+            stdinData: unlockKeychain.stdinData
         )
         let listRes = try runSecurityAsBox(["list-keychains", "-d", "user"])
 

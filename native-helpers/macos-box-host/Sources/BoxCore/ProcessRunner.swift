@@ -37,8 +37,12 @@ public enum ProcessRunner {
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
+        let stdinPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        if spec.stdinData != nil {
+            process.standardInput = stdinPipe
+        }
 
         let outBox = OSAllocatedUnfairLock(initialState: Data())
         let errBox = OSAllocatedUnfairLock(initialState: Data())
@@ -59,6 +63,11 @@ public enum ProcessRunner {
         }
 
         try process.run()
+        if let stdinData = spec.stdinData {
+            let input = stdinPipe.fileHandleForWriting
+            input.write(stdinData)
+            input.closeFile()
+        }
         process.waitUntilExit()
         group.wait()
 
@@ -88,8 +97,12 @@ public enum ProcessRunner {
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
+        let stdinPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        if spec.stdinData != nil {
+            process.standardInput = stdinPipe
+        }
 
         let outBox = OSAllocatedUnfairLock(initialState: Data())
         let errBox = OSAllocatedUnfairLock(initialState: Data())
@@ -110,6 +123,11 @@ public enum ProcessRunner {
         }
 
         try process.run()
+        if let stdinData = spec.stdinData {
+            let input = stdinPipe.fileHandleForWriting
+            input.write(stdinData)
+            input.closeFile()
+        }
 
         let deadline = Date().addingTimeInterval(max(0.2, timeoutSeconds))
         var timedOut = false

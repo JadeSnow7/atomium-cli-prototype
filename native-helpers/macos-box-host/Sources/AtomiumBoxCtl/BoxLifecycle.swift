@@ -114,9 +114,9 @@ enum BoxLifecycle {
         return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
-    static func ensureGroup(name: String, minGid: UInt32) throws -> UInt32 {
+    static func ensureGroupWithStatus(name: String, minGid: UInt32) throws -> (gid: UInt32, created: Bool) {
         if let existing = readGroupGid(name) {
-            return existing
+            return (existing, false)
         }
         let groupsResult = try ProcessRunner.run(DsclCommandBuilder.listGroupIds())
         guard groupsResult.succeeded else {
@@ -128,7 +128,11 @@ enum BoxLifecycle {
         guard createResult.succeeded else {
             throw BoxCLIError.commandFailed("dseditgroup create \(name)", createResult.stderr)
         }
-        return newGid
+        return (newGid, true)
+    }
+
+    static func ensureGroup(name: String, minGid: UInt32) throws -> UInt32 {
+        try ensureGroupWithStatus(name: name, minGid: minGid).gid
     }
 
     static func provision(boxId rawBoxId: String) throws -> BoxEvidence {
@@ -139,7 +143,30 @@ enum BoxLifecycle {
             throw BoxCLIError.alreadyExists("User \(identifier.shortName) already exists")
         }
 
-        let primaryGid = try ensureGroup(name: BoxConstants.primaryGroupName, minGid: BoxConstants.minGid)
+        let primaryGroup = try ensureGroupWithStatus(name: BoxConstants.primaryGroupName, minGid: BoxConstants.minGid)
+        let primaryGid = primaryGroup.gid
+        var createdDirectoryRecords: [PrototypeDirectoryRecord] = []
+
+        func appendDirectoryRecord(path: String, created: Bool) throws {
+            if let record = try directoryRecordIfCreated(path: path, created: created) {
+                createdDirectoryRecords.append(record)
+            }
+        }
+
+        let runtimeRootCreated = try ensureDirectoryOwned(
+            path: BoxConstants.sharedRuntimeRootDirectory,
+            uid: 0,
+            gid: 0,
+            mode: 0o755
+        )
+        try appendDirectoryRecord(path: BoxConstants.sharedRuntimeRootDirectory, created: runtimeRootCreated)
+        let runtimeBoxesCreated = try ensureDirectoryOwned(
+            path: BoxConstants.runtimeDirectory,
+            uid: 0,
+            gid: 0,
+            mode: 0o755
+        )
+        try appendDirectoryRecord(path: BoxConstants.runtimeDirectory, created: runtimeBoxesCreated)
 
         let usersResult = try ProcessRunner.run(DsclCommandBuilder.listUserUniqueIds())
         guard usersResult.succeeded else {
@@ -162,7 +189,13 @@ enum BoxLifecycle {
             throw BoxCLIError.commandFailed(passwdCmd.displayShellCommand, passwdResult.stderr)
         }
 
+        let secretDirCreated = try ensureDirectoryOwned(path: BoxConstants.secretDirectory, uid: 0, gid: 0, mode: 0o700)
+        try appendDirectoryRecord(path: BoxConstants.secretDirectory, created: secretDirCreated)
         try writeSecretFile(password: password, to: identifier.secretPath)
+
+        let fm = FileManager.default
+        let managedHomePaths = [identifier.homeDirectory, identifier.applicationsDirectory, identifier.inboxDirectory]
+        let preexistingHomePaths = Set(managedHomePaths.filter { fm.fileExists(atPath: $0) })
 
         let homeCmd = DsclCommandBuilder.createHomeDirectory(id: identifier)
         let homeResult = try ProcessRunner.run(homeCmd)
@@ -170,15 +203,9 @@ enum BoxLifecycle {
             throw BoxCLIError.commandFailed(homeCmd.displayShellCommand, homeResult.stderr)
         }
 
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: identifier.homeDirectory) {
-            try fm.createDirectory(atPath: identifier.homeDirectory, withIntermediateDirectories: true)
-        }
-        try setOwnerAndMode(path: identifier.homeDirectory, uid: newUid, gid: primaryGid, mode: 0o700)
-
-        for subdir in [identifier.applicationsDirectory, identifier.inboxDirectory] {
-            try fm.createDirectory(atPath: subdir, withIntermediateDirectories: true)
-            try setOwnerAndMode(path: subdir, uid: newUid, gid: primaryGid, mode: 0o700)
+        for path in managedHomePaths {
+            _ = try ensureDirectoryOwned(path: path, uid: newUid, gid: primaryGid, mode: 0o700)
+            try appendDirectoryRecord(path: path, created: !preexistingHomePaths.contains(path))
         }
 
         let idResult = try ProcessRunner.run(CommandSpec(executable: "/usr/bin/id", arguments: [identifier.shortName]))
@@ -190,6 +217,15 @@ enum BoxLifecycle {
             .map(String.init)
 
         let homeMode = try octalPermissions(of: identifier.homeDirectory)
+
+        try writePrototypeManifest(
+            groupRecord: PrototypeGroupRecord(
+                name: BoxConstants.primaryGroupName,
+                gid: primaryGid,
+                createdByTool: primaryGroup.created
+            ),
+            directoryRecords: createdDirectoryRecords
+        )
 
         return BoxEvidence(
             boxId: identifier.boxId,
@@ -222,6 +258,61 @@ enum BoxLifecycle {
         if chmod(path, mode) != 0 {
             throw BoxCLIError.internalError("chmod(\(path), \(String(mode, radix: 8))) failed: errno=\(errno)")
         }
+    }
+
+    static func ensureDirectoryOwned(path: String, uid: UInt32, gid: UInt32, mode: mode_t) throws -> Bool {
+        let fm = FileManager.default
+        let existed = fm.fileExists(atPath: path)
+        if existed {
+            guard let observation = observeDirectory(path: path), observation.isDirectory else {
+                throw BoxCLIError.guardrailRejected("Refusing non-directory or symlink at required directory path: \(path)")
+            }
+        } else {
+            try fm.createDirectory(atPath: path, withIntermediateDirectories: true)
+        }
+        try setOwnerAndMode(path: path, uid: uid, gid: gid, mode: mode)
+        return !existed
+    }
+
+    static func observeDirectory(path: String) -> PrototypeDirectoryObservation? {
+        var st = stat()
+        guard lstat(path, &st) == 0 else {
+            return nil
+        }
+        return PrototypeDirectoryObservation(
+            inode: UInt64(st.st_ino),
+            ownerUid: UInt32(st.st_uid),
+            isDirectory: (st.st_mode & S_IFMT) == S_IFDIR
+        )
+    }
+
+    static func directoryRecordIfCreated(path: String, created: Bool) throws -> PrototypeDirectoryRecord? {
+        guard created, let observation = observeDirectory(path: path), observation.isDirectory else {
+            return nil
+        }
+        return PrototypeDirectoryRecord(path: path, inode: observation.inode, ownerUid: observation.ownerUid)
+    }
+
+    static func loadPrototypeManifest() -> PrototypeManifest? {
+        guard let data = FileManager.default.contents(atPath: BoxConstants.prototypeManifestPath) else {
+            return nil
+        }
+        return try? PrototypeManifestCodec.decode(data)
+    }
+
+    static func writePrototypeManifest(
+        groupRecord: PrototypeGroupRecord,
+        directoryRecords: [PrototypeDirectoryRecord]
+    ) throws {
+        _ = try ensureDirectoryOwned(path: BoxConstants.prototypeStateDirectory, uid: 0, gid: 0, mode: 0o700)
+        var manifest = loadPrototypeManifest() ?? PrototypeManifest()
+        manifest = manifest.addingGroup(groupRecord)
+        for record in directoryRecords {
+            manifest = manifest.addingCreatedDirectory(record)
+        }
+        let data = try PrototypeManifestCodec.encode(manifest)
+        try data.write(to: URL(fileURLWithPath: BoxConstants.prototypeManifestPath))
+        try setOwnerAndMode(path: BoxConstants.prototypeManifestPath, uid: 0, gid: 0, mode: 0o600)
     }
 
     static func octalPermissions(of path: String) throws -> String {
@@ -288,14 +379,6 @@ enum BoxLifecycle {
 
         if approved.isEmpty {
             print("No managed Atomium prototype Box accounts found to destroy.")
-            if allPrototype {
-                printCleanupRemainderPreview(apply: apply)
-                if apply {
-                    try requireRoot(for: "destroy --all-prototype --apply")
-                    try cleanupSharedPrototypeArtifacts()
-                }
-            }
-            return
         }
 
         print(apply ? "=== DESTROY PLAN (APPLY MODE) ===" : "=== DESTROY PLAN (DRY-RUN) ===")
@@ -360,28 +443,53 @@ enum BoxLifecycle {
 
     static func printCleanupRemainderPreview(apply: Bool) {
         print("  Groups  : \(BoxConstants.primaryGroupName), \(BoxConstants.controlGroupName) (if present and no managed accounts remain)")
-        print("  Dirs    : \(BoxConstants.secretDirectory), /private/var/atomium-proto (if present)")
+        print("  Dirs    : \(BoxConstants.secretDirectory), \(BoxConstants.sharedRuntimeRootDirectory) (only when owned according to \(BoxConstants.prototypeManifestPath))")
         if !apply {
             print("  (Only removed when --all-prototype --apply is confirmed)")
         }
     }
 
     static func cleanupSharedPrototypeArtifacts() throws {
-        let fm = FileManager.default
+        let manifest = loadPrototypeManifest()
+        if manifest == nil {
+            fputs("Warning: prototype manifest missing or unreadable at \(BoxConstants.prototypeManifestPath); no shared groups or directories will be removed.\n", stderr)
+            return
+        }
+
         for group in [BoxConstants.primaryGroupName, BoxConstants.controlGroupName] {
-            if readGroupGid(group) != nil {
-                let res = try ProcessRunner.run(DsclCommandBuilder.deleteGroup(groupName: group))
-                if res.succeeded {
-                    print("Deleted group '\(group)'.")
-                } else {
-                    fputs("Warning: failed to delete group '\(group)': \(res.stderr)\n", stderr)
-                }
+            let decision = PrototypeCleanupEvaluator.groupDecision(
+                manifest: manifest,
+                groupName: group,
+                currentGid: readGroupGid(group)
+            )
+            guard decision.shouldDelete else {
+                print("Skipping group '\(group)': \(decision.skipReason).")
+                continue
+            }
+            let res = try ProcessRunner.run(DsclCommandBuilder.deleteGroup(groupName: group))
+            if res.succeeded {
+                print("Deleted group '\(group)'.")
+            } else {
+                fputs("Warning: failed to delete group '\(group)': \(res.stderr)\n", stderr)
             }
         }
-        for dir in [BoxConstants.secretDirectory, "/private/var/atomium-proto"] {
-            if fm.fileExists(atPath: dir) {
+
+        let fm = FileManager.default
+        for dir in [BoxConstants.secretDirectory, BoxConstants.sharedRuntimeRootDirectory] {
+            let decision = PrototypeCleanupEvaluator.directoryDecision(
+                manifest: manifest,
+                path: dir,
+                current: observeDirectory(path: dir)
+            )
+            guard decision.shouldDelete else {
+                print("Skipping directory '\(dir)': \(decision.skipReason).")
+                continue
+            }
+            do {
                 try fm.removeItem(atPath: dir)
                 print("Removed directory '\(dir)'.")
+            } catch {
+                fputs("Warning: failed to remove directory '\(dir)': \(error.localizedDescription)\n", stderr)
             }
         }
     }

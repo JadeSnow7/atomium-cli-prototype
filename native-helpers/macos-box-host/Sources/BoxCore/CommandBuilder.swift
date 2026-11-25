@@ -5,11 +5,19 @@ public struct CommandSpec: Equatable, Sendable {
     public let arguments: [String]
     /// Optional redacted copy of arguments for display/logging (e.g. passwords).
     public let redactedArguments: [String]?
+    /// Optional stdin payload. This is the only permitted channel for secrets.
+    public let stdinData: Data?
 
-    public init(executable: String, arguments: [String], redactedArguments: [String]? = nil) {
+    public init(
+        executable: String,
+        arguments: [String],
+        redactedArguments: [String]? = nil,
+        stdinData: Data? = nil
+    ) {
         self.executable = executable
         self.arguments = arguments
         self.redactedArguments = redactedArguments
+        self.stdinData = stdinData
     }
 
     public var argv: [String] {
@@ -124,10 +132,12 @@ public enum DsclCommandBuilder {
 
     public static func setPassword(id: BoxIdentifier, password: String) -> CommandSpec {
         let userPath = "/Users/\(id.shortName)"
+        let interactiveInput = "-passwd \(userPath) \(password)\nquit\n"
         return CommandSpec(
             executable: "/usr/bin/dscl",
-            arguments: [".", "-passwd", userPath, password],
-            redactedArguments: [".", "-passwd", userPath, "<REDACTED>"]
+            arguments: ["."],
+            redactedArguments: ["."],
+            stdinData: Data(interactiveInput.utf8)
         )
     }
 
@@ -142,6 +152,26 @@ public enum DsclCommandBuilder {
         CommandSpec(
             executable: "/usr/bin/dscl",
             arguments: [".", "-delete", "/Users/\(id.shortName)"]
+        )
+    }
+}
+
+public enum SecurityCommandBuilder {
+    public static func createKeychain(keychainPath: String, password: String) -> CommandSpec {
+        CommandSpec(
+            executable: "/usr/bin/security",
+            arguments: ["create-keychain", keychainPath],
+            redactedArguments: ["create-keychain", keychainPath],
+            stdinData: Data((password + "\n" + password + "\n").utf8)
+        )
+    }
+
+    public static func unlockKeychain(keychainPath: String, password: String) -> CommandSpec {
+        CommandSpec(
+            executable: "/usr/bin/security",
+            arguments: ["unlock-keychain", keychainPath],
+            redactedArguments: ["unlock-keychain", keychainPath],
+            stdinData: Data((password + "\n").utf8)
         )
     }
 }

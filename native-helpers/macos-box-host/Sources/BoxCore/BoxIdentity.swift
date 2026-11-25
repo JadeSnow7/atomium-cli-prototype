@@ -7,7 +7,10 @@ public enum BoxConstants {
     public static let commentPrefix = "atomium-box:"
     public static let userShell = "/usr/bin/false"
     public static let secretDirectory = "/var/db/atomium-proto"
+    public static let sharedRuntimeRootDirectory = "/private/var/atomium-proto"
     public static let runtimeDirectory = "/private/var/atomium-proto/boxes"
+    public static let prototypeStateDirectory = "/var/db/atomium-prototype"
+    public static let prototypeManifestPath = "/var/db/atomium-prototype/manifest.json"
     public static let minGid: UInt32 = 700
     public static let minUid: UInt32 = 701
     public static let evidenceSchema = "atomium-s1-evidence-v1"

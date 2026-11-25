@@ -177,10 +177,14 @@ final class BoxCoreTests: XCTestCase {
         XCTAssertEqual(createCommands[6].shellCommand, "/usr/bin/dscl . -create /Users/atombox_s1a IsHidden 1")
         XCTAssertEqual(createCommands[7].shellCommand, "/usr/bin/dscl . -create /Users/atombox_s1a Comment atomium-box:s1a")
 
-        let passwd = DsclCommandBuilder.setPassword(id: id, password: "super-secret-value")
-        XCTAssertEqual(passwd.argv, ["/usr/bin/dscl", ".", "-passwd", "/Users/atombox_s1a", "super-secret-value"])
-        XCTAssertFalse(passwd.displayShellCommand.contains("super-secret-value"))
-        XCTAssertTrue(passwd.displayShellCommand.contains("<REDACTED>"))
+        let secret = "super-secret-value"
+        let passwd = DsclCommandBuilder.setPassword(id: id, password: secret)
+        XCTAssertEqual(passwd.argv, ["/usr/bin/dscl", "."])
+        XCTAssertFalse(passwd.arguments.contains(where: { $0.contains(secret) }))
+        let passwdStdin = passwd.stdinData.map { String(decoding: $0, as: UTF8.self) } ?? ""
+        XCTAssertTrue(passwdStdin.contains("-passwd /Users/atombox_s1a "))
+        XCTAssertTrue(passwdStdin.contains(secret))
+        XCTAssertFalse(passwd.displayShellCommand.contains(secret))
 
         let homedir = DsclCommandBuilder.createHomeDirectory(id: id)
         XCTAssertEqual(homedir.shellCommand, "/usr/sbin/createhomedir -c -u atombox_s1a")
@@ -312,5 +316,83 @@ final class BoxCoreTests: XCTestCase {
         let resp = AgentResponse(ok: true, op: "health", text: "uid=701")
         let encodedResp = try JSONEncoder().encode(resp)
         XCTAssertEqual(try JSONDecoder().decode(AgentResponse.self, from: encodedResp), resp)
+    }
+
+    func testSecurityCommandsKeepSecretsOutOfArgv() {
+        let secret = "keychain-test-secret"
+        let path = "/tmp/example.keychain-db"
+
+        let create = SecurityCommandBuilder.createKeychain(keychainPath: path, password: secret)
+        XCTAssertEqual(create.arguments, ["create-keychain", path])
+        XCTAssertFalse(create.arguments.contains(where: { $0.contains(secret) }))
+        let createStdin = create.stdinData.map { String(decoding: $0, as: UTF8.self) } ?? ""
+        XCTAssertEqual(createStdin.split(separator: "\n").count, 2)
+        XCTAssertTrue(createStdin.contains(secret))
+        XCTAssertFalse(create.displayShellCommand.contains(secret))
+
+        let unlock = SecurityCommandBuilder.unlockKeychain(keychainPath: path, password: secret)
+        XCTAssertEqual(unlock.arguments, ["unlock-keychain", path])
+        XCTAssertFalse(unlock.arguments.contains(where: { $0.contains(secret) }))
+        let unlockStdin = unlock.stdinData.map { String(decoding: $0, as: UTF8.self) } ?? ""
+        XCTAssertTrue(unlockStdin.contains(secret))
+        XCTAssertFalse(unlock.displayShellCommand.contains(secret))
+    }
+
+    func testProcessRunnerWritesAndClosesStdin() throws {
+        let payload = "stdin-payload-without-trailing-newline"
+        let result = try ProcessRunner.run(
+            CommandSpec(
+                executable: "/bin/cat",
+                arguments: [],
+                stdinData: Data(payload.utf8)
+            )
+        )
+        XCTAssertTrue(result.succeeded)
+        XCTAssertEqual(result.stdout, payload)
+    }
+
+    func testPrototypeManifestCodecAndCleanupDecisions() throws {
+        XCTAssertEqual(
+            PrototypeCleanupEvaluator.groupDecision(manifest: nil, groupName: "atombox", currentGid: 700),
+            .missingManifest
+        )
+
+        let reusedGroup = PrototypeGroupRecord(name: "atombox", gid: 700, createdByTool: false)
+        let reusedManifest = PrototypeManifest(groups: [reusedGroup], directories: [])
+        XCTAssertEqual(
+            PrototypeCleanupEvaluator.groupDecision(manifest: reusedManifest, groupName: "atombox", currentGid: 700),
+            .notCreatedByTool
+        )
+
+        let directory = PrototypeDirectoryRecord(path: "/private/var/atomium-proto", inode: 12345, ownerUid: 0)
+        let ownedGroup = PrototypeGroupRecord(name: "atombox", gid: 700, createdByTool: true)
+        let manifest = PrototypeManifest(groups: [ownedGroup], directories: [directory])
+
+        let encoded = try PrototypeManifestCodec.encode(manifest)
+        let json = String(decoding: encoded, as: UTF8.self)
+        XCTAssertTrue(json.contains("\"created_by_tool\""))
+        XCTAssertTrue(json.contains("\"owner_uid\""))
+        XCTAssertEqual(try PrototypeManifestCodec.decode(encoded), manifest)
+
+        XCTAssertEqual(
+            PrototypeCleanupEvaluator.directoryDecision(
+                manifest: manifest,
+                path: directory.path,
+                current: PrototypeDirectoryObservation(inode: 999, ownerUid: 0, isDirectory: true)
+            ),
+            .inodeMismatch(expected: 12345, actual: 999)
+        )
+        XCTAssertEqual(
+            PrototypeCleanupEvaluator.directoryDecision(
+                manifest: manifest,
+                path: directory.path,
+                current: PrototypeDirectoryObservation(inode: 12345, ownerUid: 0, isDirectory: true)
+            ),
+            .delete
+        )
+        XCTAssertEqual(
+            PrototypeCleanupEvaluator.groupDecision(manifest: manifest, groupName: "atombox", currentGid: 700),
+            .delete
+        )
     }
 }
