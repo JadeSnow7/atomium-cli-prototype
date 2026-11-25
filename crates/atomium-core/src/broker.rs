@@ -1,9 +1,10 @@
+use crate::sqlite_security::SecureSqliteConnection;
 use anyhow::Result;
 use atomium_protocol::{
     CandidateDiffSummary, CandidateSnapshot, CandidateStatus, ExportResult, FileChangeKind,
     FileDiffEntry, SnapshotFileEntry, WorkspaceImportLimits, WorkspaceSnapshot,
 };
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -15,7 +16,15 @@ use thiserror::Error;
 
 const EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules", ".build"];
 const MAX_DIFF_TEXT_BYTES: usize = 256 * 1024;
+
+/// Daemon-side hard ceilings for caller-supplied workspace import/freeze limits.
+/// The defaults are lower; callers may tighten but never loosen beyond these caps.
+pub const MAX_WORKSPACE_IMPORT_FILES: u32 = 16_384;
+pub const MAX_WORKSPACE_IMPORT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_WORKSPACE_IMPORT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DIFF_LINES_PER_FILE: usize = 2000;
+const MAX_WORKSPACE_IMPORT_DEPTH: usize = 64;
+const MAX_WORKSPACE_IMPORT_DIRS: u32 = 4096;
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -156,6 +165,30 @@ struct ScannedFile {
     source_path: PathBuf,
 }
 
+fn validate_workspace_import_limits(
+    limits: &WorkspaceImportLimits,
+) -> std::result::Result<(), BrokerError> {
+    if limits.max_files > MAX_WORKSPACE_IMPORT_FILES {
+        return Err(BrokerError::LimitExceeded(format!(
+            "max_files {} exceeds daemon ceiling {}",
+            limits.max_files, MAX_WORKSPACE_IMPORT_FILES
+        )));
+    }
+    if limits.max_total_bytes > MAX_WORKSPACE_IMPORT_TOTAL_BYTES {
+        return Err(BrokerError::LimitExceeded(format!(
+            "max_total_bytes {} exceeds daemon ceiling {}",
+            limits.max_total_bytes, MAX_WORKSPACE_IMPORT_TOTAL_BYTES
+        )));
+    }
+    if limits.max_file_bytes > MAX_WORKSPACE_IMPORT_FILE_BYTES {
+        return Err(BrokerError::LimitExceeded(format!(
+            "max_file_bytes {} exceeds daemon ceiling {}",
+            limits.max_file_bytes, MAX_WORKSPACE_IMPORT_FILE_BYTES
+        )));
+    }
+    Ok(())
+}
+
 fn scan_directory_tree(
     root: &Path,
     limits: &WorkspaceImportLimits,
@@ -181,18 +214,25 @@ fn scan_directory_tree(
     }
     let canonical_root = fs::canonicalize(root)?;
 
-    let mut scanned = Vec::new();
-    let mut total_bytes: u64 = 0;
-    let mut excluded_count: u32 = 0;
+    struct ScanState {
+        scanned: Vec<ScannedFile>,
+        total_bytes: u64,
+        excluded_count: u32,
+        dir_count: u32,
+    }
 
     fn walk(
         current: &Path,
         rel_prefix: &str,
+        depth: usize,
         limits: &WorkspaceImportLimits,
-        scanned: &mut Vec<ScannedFile>,
-        total_bytes: &mut u64,
-        excluded_count: &mut u32,
+        state: &mut ScanState,
     ) -> std::result::Result<(), BrokerError> {
+        if depth > MAX_WORKSPACE_IMPORT_DEPTH {
+            return Err(BrokerError::LimitExceeded(format!(
+                "directory depth exceeds daemon ceiling {MAX_WORKSPACE_IMPORT_DEPTH}"
+            )));
+        }
         let mut dir_entries: Vec<fs::DirEntry> = Vec::new();
         for item in fs::read_dir(current)? {
             dir_entries.push(item?);
@@ -221,29 +261,28 @@ fn scan_directory_tree(
                 return Err(BrokerError::SymlinkRejected(rel_path));
             }
             if ft.is_dir() {
+                state.dir_count = state.dir_count.saturating_add(1);
+                if state.dir_count > MAX_WORKSPACE_IMPORT_DIRS {
+                    return Err(BrokerError::LimitExceeded(format!(
+                        "directory count exceeds daemon ceiling {MAX_WORKSPACE_IMPORT_DIRS}"
+                    )));
+                }
                 if is_excluded_dir_name(name) {
-                    *excluded_count = excluded_count.saturating_add(1);
+                    state.excluded_count = state.excluded_count.saturating_add(1);
                     continue;
                 }
-                walk(
-                    &full_path,
-                    &rel_path,
-                    limits,
-                    scanned,
-                    total_bytes,
-                    excluded_count,
-                )?;
+                walk(&full_path, &rel_path, depth + 1, limits, state)?;
                 continue;
             }
             if !ft.is_file() {
                 return Err(BrokerError::SpecialFileRejected(rel_path));
             }
             if is_excluded_file_name(name) {
-                *excluded_count = excluded_count.saturating_add(1);
+                state.excluded_count = state.excluded_count.saturating_add(1);
                 continue;
             }
 
-            let next_count = (scanned.len() + 1) as u32;
+            let next_count = (state.scanned.len() + 1) as u32;
             if next_count > limits.max_files {
                 return Err(BrokerError::LimitExceeded(format!(
                     "file count exceeds limit ({} > {})",
@@ -258,7 +297,7 @@ fn scan_directory_tree(
                     rel_path, size, limits.max_file_bytes
                 )));
             }
-            let next_total = total_bytes.saturating_add(size);
+            let next_total = state.total_bytes.saturating_add(size);
             if next_total > limits.max_total_bytes {
                 return Err(BrokerError::LimitExceeded(format!(
                     "total workspace bytes {} exceeds max_total_bytes {}",
@@ -275,18 +314,18 @@ fn scan_directory_tree(
                     rel_path, actual_size, limits.max_file_bytes
                 )));
             }
-            let actual_total = total_bytes.saturating_add(actual_size);
+            let actual_total = state.total_bytes.saturating_add(actual_size);
             if actual_total > limits.max_total_bytes {
                 return Err(BrokerError::LimitExceeded(format!(
                     "total workspace bytes {} exceeds max_total_bytes {}",
                     actual_total, limits.max_total_bytes
                 )));
             }
-            *total_bytes = actual_total;
+            state.total_bytes = actual_total;
 
             let executable = (meta.permissions().mode() & 0o111) != 0;
             let sha256 = hex::encode(Sha256::digest(&bytes));
-            scanned.push(ScannedFile {
+            state.scanned.push(ScannedFile {
                 entry: SnapshotFileEntry {
                     relative_path: rel_path,
                     size_bytes: actual_size,
@@ -299,23 +338,22 @@ fn scan_directory_tree(
         Ok(())
     }
 
-    walk(
-        &canonical_root,
-        "",
-        limits,
-        &mut scanned,
-        &mut total_bytes,
-        &mut excluded_count,
-    )?;
+    let mut state = ScanState {
+        scanned: Vec::new(),
+        total_bytes: 0,
+        excluded_count: 0,
+        dir_count: 0,
+    };
+    walk(&canonical_root, "", 0, limits, &mut state)?;
 
-    scanned.sort_by(|a, b| {
+    state.scanned.sort_by(|a, b| {
         a.entry
             .relative_path
             .as_bytes()
             .cmp(b.entry.relative_path.as_bytes())
     });
 
-    Ok((scanned, total_bytes, excluded_count))
+    Ok((state.scanned, state.total_bytes, state.excluded_count))
 }
 
 fn copy_scanned_tree(
@@ -370,6 +408,7 @@ pub fn import_workspace(
     dest_dir: &Path,
     limits: &WorkspaceImportLimits,
 ) -> std::result::Result<ImportedTree, BrokerError> {
+    validate_workspace_import_limits(limits)?;
     let (scanned, total_bytes, excluded_count) = scan_directory_tree(source_dir, limits)?;
     copy_scanned_tree(&scanned, dest_dir, false)?;
 
@@ -739,7 +778,7 @@ impl WorkspaceBroker {
         fs::create_dir_all(&broker_dir)?;
         fs::set_permissions(&broker_dir, fs::Permissions::from_mode(0o700))?;
 
-        let conn = Connection::open(&db_path)?;
+        let conn = SecureSqliteConnection::open(&db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute_batch(
@@ -831,8 +870,8 @@ impl WorkspaceBroker {
             created_at_ms: now_ms(),
         };
 
-        let conn =
-            Connection::open(&self.db_path).map_err(|e| BrokerError::Storage(e.to_string()))?;
+        let conn = SecureSqliteConnection::open(&self.db_path)
+            .map_err(|e| BrokerError::Storage(e.to_string()))?;
         conn.pragma_update(None, "busy_timeout", 5000)
             .map_err(|e| BrokerError::Storage(e.to_string()))?;
         let json =
@@ -862,8 +901,8 @@ impl WorkspaceBroker {
         &self,
         workspace_id: &str,
     ) -> std::result::Result<Option<WorkspaceSnapshot>, BrokerError> {
-        let conn =
-            Connection::open(&self.db_path).map_err(|e| BrokerError::Storage(e.to_string()))?;
+        let conn = SecureSqliteConnection::open(&self.db_path)
+            .map_err(|e| BrokerError::Storage(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT snapshot_json FROM workspace_snapshots WHERE workspace_id = ?1")
             .map_err(|e| BrokerError::Storage(e.to_string()))?;
@@ -886,8 +925,8 @@ impl WorkspaceBroker {
     }
 
     pub fn list_workspaces(&self) -> std::result::Result<Vec<WorkspaceSnapshot>, BrokerError> {
-        let conn =
-            Connection::open(&self.db_path).map_err(|e| BrokerError::Storage(e.to_string()))?;
+        let conn = SecureSqliteConnection::open(&self.db_path)
+            .map_err(|e| BrokerError::Storage(e.to_string()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT snapshot_json FROM workspace_snapshots ORDER BY created_at_ms DESC, workspace_id DESC",
@@ -931,6 +970,7 @@ impl WorkspaceBroker {
             None => PathBuf::from(&workspace.working_dir),
         };
         let limits = limits.unwrap_or_default();
+        validate_workspace_import_limits(&limits)?;
 
         let candidate_id = format!("cand-{}", uuid::Uuid::now_v7());
         let frozen_dir = self
@@ -982,8 +1022,8 @@ impl WorkspaceBroker {
         &self,
         candidate: &CandidateSnapshot,
     ) -> std::result::Result<(), BrokerError> {
-        let conn =
-            Connection::open(&self.db_path).map_err(|e| BrokerError::Storage(e.to_string()))?;
+        let conn = SecureSqliteConnection::open(&self.db_path)
+            .map_err(|e| BrokerError::Storage(e.to_string()))?;
         conn.pragma_update(None, "busy_timeout", 5000)
             .map_err(|e| BrokerError::Storage(e.to_string()))?;
         let status_json = serde_json::to_string(&candidate.status)
@@ -1048,8 +1088,8 @@ impl WorkspaceBroker {
         &self,
         candidate_id: &str,
     ) -> std::result::Result<Option<CandidateSnapshot>, BrokerError> {
-        let conn =
-            Connection::open(&self.db_path).map_err(|e| BrokerError::Storage(e.to_string()))?;
+        let conn = SecureSqliteConnection::open(&self.db_path)
+            .map_err(|e| BrokerError::Storage(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT snapshot_json FROM candidate_snapshots WHERE candidate_id = ?1")
             .map_err(|e| BrokerError::Storage(e.to_string()))?;
@@ -1076,8 +1116,8 @@ impl WorkspaceBroker {
         &self,
         candidate_digest: &str,
     ) -> std::result::Result<Option<CandidateSnapshot>, BrokerError> {
-        let conn =
-            Connection::open(&self.db_path).map_err(|e| BrokerError::Storage(e.to_string()))?;
+        let conn = SecureSqliteConnection::open(&self.db_path)
+            .map_err(|e| BrokerError::Storage(e.to_string()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT snapshot_json FROM candidate_snapshots WHERE candidate_digest = ?1 ORDER BY created_at_ms DESC LIMIT 1",
@@ -1105,8 +1145,8 @@ impl WorkspaceBroker {
         &self,
         workspace_id: Option<&str>,
     ) -> std::result::Result<Vec<CandidateSnapshot>, BrokerError> {
-        let conn =
-            Connection::open(&self.db_path).map_err(|e| BrokerError::Storage(e.to_string()))?;
+        let conn = SecureSqliteConnection::open(&self.db_path)
+            .map_err(|e| BrokerError::Storage(e.to_string()))?;
         let items = if let Some(ws_id) = workspace_id {
             let mut stmt = conn
                 .prepare(
@@ -1388,8 +1428,8 @@ impl WorkspaceBroker {
     }
 
     fn save_export_receipt(&self, receipt: &ExportResult) -> std::result::Result<(), BrokerError> {
-        let conn =
-            Connection::open(&self.db_path).map_err(|e| BrokerError::Storage(e.to_string()))?;
+        let conn = SecureSqliteConnection::open(&self.db_path)
+            .map_err(|e| BrokerError::Storage(e.to_string()))?;
         conn.pragma_update(None, "busy_timeout", 5000)
             .map_err(|e| BrokerError::Storage(e.to_string()))?;
         let json =
@@ -1414,8 +1454,8 @@ impl WorkspaceBroker {
         &self,
         approval_id: &str,
     ) -> std::result::Result<Option<ExportResult>, BrokerError> {
-        let conn =
-            Connection::open(&self.db_path).map_err(|e| BrokerError::Storage(e.to_string()))?;
+        let conn = SecureSqliteConnection::open(&self.db_path)
+            .map_err(|e| BrokerError::Storage(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT receipt_json FROM export_receipts WHERE approval_id = ?1")
             .map_err(|e| BrokerError::Storage(e.to_string()))?;

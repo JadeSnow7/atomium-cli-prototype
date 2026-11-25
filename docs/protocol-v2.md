@@ -1,11 +1,11 @@
 # Atomium 控制协议 v2
 
-状态：**v1.1 已实现**（本仓库当前代码），**v2 已确定、按里程碑实现**。产品背景见 [product-spec.md](product-spec.md)。
+状态：**v1.2 已实现**（本仓库当前代码），**v2 已确定、按里程碑实现**。产品背景见 [product-spec.md](product-spec.md)。
 
 ## 1. 基本约定
 
 - **单一真相源**：所有线上类型定义在 `crates/atomium-protocol`（`serde` + `ts-rs`）。TypeScript 绑定由 `pnpm run gen:protocol` 生成，`pnpm run check:protocol-sync` 保证零漂移。禁止手写或手改 `packages/protocol-types/src/generated/`。
-- **传输**：JSON-RPC 2.0，每行一帧（NDJSON）。
+- **传输**：JSON-RPC 2.0，每行一帧（NDJSON）。单帧明文上限为 1 MiB；超限连接会被守护进程直接关闭。
   - 桌面端：`0600` Unix Domain Socket（默认 `$TMPDIR/atomiumd.sock`，可用 `ATOMIUM_SOCKET` 覆盖）。
   - 移动端（M7）：端到端加密中继，见 §3。
 - **命名**：方法名为 `<域>.<动词>`，字段一律 snake_case，时间单位为毫秒（`*_ms`），摘要格式为 `sha256:<hex>`。
@@ -24,7 +24,7 @@
 
 | 阶段 | 机制 |
 | --- | --- |
-| v1.1（当前） | Socket 文件权限 `0600`，只有同一 uid 能连接 |
+| v1.2（当前） | Socket 文件权限 `0600`，只有同一 uid 能连接 |
 | M5 | 在 `0600` 之外，用 `LOCAL_PEERTOKEN` 取对端 audit token，校验代码签名（Team ID 与 bundle ID 白名单）。未签名的调用方只能调用只读方法 |
 | M7 | 移动端经中继连接：设备配对时交换公钥；会话使用 Noise IK 端到端加密；设备密钥存放在 Secure Enclave / StrongBox |
 
@@ -40,7 +40,7 @@ PresenceProof {
 }
 ```
 
-## 4. 已实现方法（v1.1）
+## 4. 已实现方法（v1.2）
 
 | 方法 | 参数 → 结果 | 说明 |
 | --- | --- | --- |
@@ -70,6 +70,19 @@ PresenceProof {
 | `RunStartRequest` 删除 `use_seatbelt` 与 `workspace_dir`，新增 `workspace_id`。旧字段即使传入也会被忽略 | D-14 |
 | `CandidateFreezeRequest` 删除 `run_workspace_dir` | D-14 |
 | CLI：`account` → `subscription`（`capture` / `list` / `activate` / `run`）；删除 `--no-seatbelt`；`--workspace <path>` → `--workspace-id <id>`；删除 `candidate freeze --workspace-dir`；`--proxy-id` → `--upstream-proxy-id` | 同上 |
+
+### 4.2 v1.1 → v1.2 安全加固变更日志（已落地，破坏性变更）
+
+| 变更 | 原因 |
+| --- | --- |
+| `SubscriptionCaptureRequest` 删除 `source_file_path`；捕获请求启用严格字段校验。CLI 的 `--source-file` 改为由 CLI 在本进程读取文件后通过 `raw_secret_b64` 提交，守护进程不再按 RPC 调用方给定的宿主路径读取凭据 | 遵守“除 `workspaces.import.source_dir` 外 RPC 不接受任意宿主路径”的边界 |
+| JSON-RPC 单帧上限固定为 1 MiB，超限直接断开连接 | 防止单连接内存放大与审计存储资源耗尽 |
+| `subscriptions.capture` 的原始与规范化 OAuth 载荷上限为 256 KiB | 防止 Vault / SQLite / 事件存储资源耗尽 |
+| `runs.start.env` 拒绝 `DYLD_*`、`LD_*`、代理变量、`PATH`、隔离目录变量、`ATOMIUM_*`、SSH/Git 执行入口等保留或高风险键，并限制键值数量与长度 | 防止调用方劫持 `sandbox-exec`/动态链接器、覆盖单端口网关或伪造运行时身份 |
+| 子进程 stdout/stderr、持久化 `RunRecord.args` 与实时/回放事件做单行截断、每流 1 MiB 持久化上限、控制字符清理；精确凭据片段与常见 token 形态统一替换为 `<redacted:sha256:前12位hex>` | 防止凭据进入审计日志，同时避免日志洪泛撑爆 SQLite |
+| OAuth 捕获与刷新写回只接受结构合法的 agy JSON（`id_token_email` + `token` 对象），且刷新写回必须与快照原身份一致；身份变化或畸形载荷只拒绝写回并记录审计事件，不覆盖 Vault | 防止子进程用垃圾数据或其他账号凭据覆写已知良好的 Vault 快照，落实禁止自动换号红线 |
+| 隔离 `$HOME` 中投影 OAuth 的写回读取拒绝符号链接路径组件；运行首领进程正常退出后也会收尾终止整个进程组 | 防止子进程利用符号链接诱导守护进程读取宿主文件，或留下运行结束后的后台孤儿进程 |
+| `runs.start.allowed_egress_hosts` 只接受可解析的精确主机（可选端口）或通配符条目；畸形条目在 RPC 边界拒绝，直接构造代理时也会 fail closed。网关把十进制/八进制/十六进制等非规范 IPv4 数字形式按解析后的地址分类，拒绝用 `127.1`、整数或十六进制形式绕过非公网地址拦截 | 防止拼写错误的策略被静默放宽为无限制出网，并防止替代数字编码绕过回环、链路本地、CGNAT 或文档前缀拦截 |
 
 ## 5. v2 类型（已确定，按里程碑实现）
 

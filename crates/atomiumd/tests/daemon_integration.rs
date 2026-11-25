@@ -619,3 +619,38 @@ async fn e2e_atomiumd_binary_serves_requests_and_cleans_up() {
 
     guard.kill_and_reap();
 }
+
+#[tokio::test]
+async fn sqlite_database_is_created_owner_only() {
+    let srv = ServerHandle::start().await;
+    let db_path = srv._dir.path().join("d.sqlite");
+    let mode = std::fs::metadata(&db_path)
+        .expect("sqlite metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "sqlite db must be owner-only");
+}
+
+#[tokio::test]
+async fn rpc_frames_above_daemon_limit_close_connection() {
+    let srv = ServerHandle::start().await;
+    let mut stream = UnixStream::connect(&srv.sock_path).await.expect("connect");
+    let oversized = "A".repeat(atomiumd::MAX_RPC_FRAME_BYTES + 1);
+    stream
+        .write_all(oversized.as_bytes())
+        .await
+        .expect("write oversized frame");
+    stream.write_all(b"\n").await.expect("write newline");
+    let _ = stream.shutdown().await;
+
+    let mut buf = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut buf)
+        .await
+        .expect("read closed connection");
+    assert!(
+        buf.is_empty(),
+        "oversized frame must close connection without a partial protocol response, got {} bytes",
+        buf.len()
+    );
+}

@@ -3,12 +3,14 @@ pub mod keychain;
 pub mod lease;
 pub mod oauth_codec;
 pub mod profile;
+pub mod sqlite_security;
 pub mod store;
 pub mod vault;
 
 pub use broker::{
     compute_tree_digest, import_workspace, validate_relative_path, BrokerError, ImportedTree,
-    WorkspaceBroker,
+    WorkspaceBroker, MAX_WORKSPACE_IMPORT_FILES, MAX_WORKSPACE_IMPORT_FILE_BYTES,
+    MAX_WORKSPACE_IMPORT_TOTAL_BYTES,
 };
 
 pub use keychain::{
@@ -24,8 +26,9 @@ pub use lease::{
     LeaseManager, LeaseMode, LeaseRequest, ReclaimedLease,
 };
 pub use oauth_codec::{
-    decode_agy_oauth_for_file, default_agy_oauth_mode, encode_agy_oauth_for_keychain,
-    project_isolated_oauth_file, read_projected_oauth_file, AGY_DEFAULT_RELATIVE_PATH,
+    agy_oauth_identity_key, agy_oauth_writeback_identity_matches, decode_agy_oauth_for_file,
+    default_agy_oauth_mode, encode_agy_oauth_for_keychain, project_isolated_oauth_file,
+    read_projected_oauth_file_confined, validate_agy_oauth_payload, AGY_DEFAULT_RELATIVE_PATH,
     GO_KEYRING_B64_PREFIX,
 };
 pub use profile::ProfileStore;
@@ -211,7 +214,9 @@ mod tests {
         assert_eq!(mode, 0o600);
         assert_eq!(std::fs::read(&projected).unwrap(), raw_json);
         assert_eq!(
-            read_projected_oauth_file(&projected).unwrap().as_deref(),
+            read_projected_oauth_file_confined(&dir, AGY_DEFAULT_RELATIVE_PATH)
+                .unwrap()
+                .as_deref(),
             Some(raw_json.as_slice())
         );
 

@@ -1,6 +1,7 @@
+use crate::sqlite_security::SecureSqliteConnection;
 use anyhow::Result;
 use atomium_protocol::{IdentityProfile, ProfileState};
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use std::path::{Path, PathBuf};
 
 pub struct ProfileStore {
@@ -13,7 +14,7 @@ impl ProfileStore {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&db_path)?;
+        let conn = SecureSqliteConnection::open(&db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute_batch(
@@ -29,7 +30,7 @@ impl ProfileStore {
     }
 
     pub fn upsert(&self, profile: &IdentityProfile) -> Result<()> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let json = serde_json::to_string(profile)?;
         let now = chrono::Utc::now().timestamp();
         conn.execute(
@@ -42,7 +43,7 @@ impl ProfileStore {
     }
 
     pub fn get(&self, id: &str) -> Result<Option<IdentityProfile>> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let mut stmt = conn.prepare("SELECT profile_json FROM identity_profiles WHERE id = ?1")?;
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
@@ -54,7 +55,7 @@ impl ProfileStore {
     }
 
     pub fn list(&self) -> Result<Vec<IdentityProfile>> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let mut stmt =
             conn.prepare("SELECT profile_json FROM identity_profiles ORDER BY id ASC")?;
         let items = stmt

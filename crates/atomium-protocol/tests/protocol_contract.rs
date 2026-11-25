@@ -408,12 +408,18 @@ fn run_and_subscription_rpc_types_roundtrip() {
             relative_home_path: ".gemini/antigravity-cli/antigravity-oauth-token".into(),
         }),
         raw_secret_b64: None,
-        source_file_path: Some("/tmp/oauth.json".into()),
         upstream_proxy_id: None,
         timezone: Some("UTC".into()),
         lang: Some("en_US.UTF-8".into()),
     };
-    assert_json_roundtrip(&capture);
+    let capture_json = assert_json_roundtrip(&capture);
+    for key in capture_json.as_object().expect("capture object").keys() {
+        assert!(
+            !key.split('_')
+                .any(|part| matches!(part, "path" | "file" | "dir")),
+            "capture field must not accept host filesystem locations: {key}"
+        );
+    }
 
     let activate = SubscriptionActivateRequest {
         profile_id: "acct_b".into(),

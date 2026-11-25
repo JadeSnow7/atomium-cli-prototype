@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize)]
@@ -86,6 +86,7 @@ impl EncryptedVault {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
+                .mode(0o600)
                 .open(&tmp_path)
                 .context("open vault tmp file")?;
             fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;

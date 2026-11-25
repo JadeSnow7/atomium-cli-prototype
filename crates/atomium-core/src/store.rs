@@ -1,6 +1,7 @@
+use crate::sqlite_security::SecureSqliteConnection;
 use anyhow::Result;
 use atomium_protocol::{ApprovalRequest, RunRecord, TaskStatus};
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,7 +29,7 @@ impl RunStore {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&db_path)?;
+        let conn = SecureSqliteConnection::open(&db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute_batch(
@@ -72,7 +73,7 @@ impl RunStore {
     }
 
     pub fn upsert(&self, record: &RunRecord) -> Result<()> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         let status_json = serde_json::to_string(&record.status)?;
         let status_str = status_json.trim_matches('"');
@@ -98,7 +99,7 @@ impl RunStore {
     }
 
     pub fn get(&self, run_id: &str) -> Result<Option<RunRecord>> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let mut stmt = conn.prepare("SELECT record_json FROM task_runs WHERE run_id = ?1")?;
         let mut rows = stmt.query(params![run_id])?;
         if let Some(row) = rows.next()? {
@@ -110,7 +111,7 @@ impl RunStore {
     }
 
     pub fn list(&self) -> Result<Vec<RunRecord>> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let mut stmt = conn.prepare(
             "SELECT record_json FROM task_runs ORDER BY created_at_ms DESC, run_id DESC",
         )?;
@@ -130,7 +131,7 @@ impl RunStore {
     }
 
     pub fn set_child_process(&self, run_id: &str, pgid: i64, proc_start: i64) -> Result<()> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute(
             "UPDATE task_runs SET child_pgid = ?1, child_proc_start = ?2 WHERE run_id = ?3",
@@ -140,7 +141,7 @@ impl RunStore {
     }
 
     pub fn clear_child_process(&self, run_id: &str) -> Result<()> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute(
             "UPDATE task_runs SET child_pgid = NULL, child_proc_start = NULL WHERE run_id = ?1",
@@ -151,7 +152,7 @@ impl RunStore {
 
     /// List all non-terminal runs along with their persisted `(child_pgid, child_proc_start)`.
     pub fn list_incomplete_runs_with_child(&self) -> Result<Vec<IncompleteRun>> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let mut stmt = conn.prepare(
             "SELECT record_json, child_pgid, child_proc_start FROM task_runs ORDER BY created_at_ms DESC",
         )?;
@@ -214,7 +215,7 @@ impl RunStore {
     }
 
     pub fn get_active_host_slot(&self, slot_key: &str) -> Result<Option<String>> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let mut stmt =
             conn.prepare("SELECT profile_id FROM host_slot_state WHERE slot_key = ?1")?;
         let mut rows = stmt.query(params![slot_key])?;
@@ -226,7 +227,7 @@ impl RunStore {
     }
 
     pub fn set_active_host_slot(&self, slot_key: &str, profile_id: &str) -> Result<()> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         conn.execute(
             r#"INSERT INTO host_slot_state (slot_key, profile_id, updated_at_ms)
                VALUES (?1, ?2, ?3)
@@ -249,7 +250,7 @@ impl ApprovalStore {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&db_path)?;
+        let conn = SecureSqliteConnection::open(&db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute_batch(
@@ -268,7 +269,7 @@ impl ApprovalStore {
     }
 
     pub fn insert(&self, req: &ApprovalRequest) -> Result<()> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         let json = serde_json::to_string(req)?;
         conn.execute(
@@ -291,7 +292,7 @@ impl ApprovalStore {
     }
 
     pub fn get(&self, approval_id: &str) -> Result<Option<ApprovalRequest>> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let mut stmt =
             conn.prepare("SELECT request_json FROM pending_approvals WHERE approval_id = ?1")?;
         let mut rows = stmt.query(params![approval_id])?;
@@ -304,7 +305,7 @@ impl ApprovalStore {
     }
 
     pub fn list(&self) -> Result<Vec<ApprovalRequest>> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let mut stmt =
             conn.prepare("SELECT request_json FROM pending_approvals ORDER BY created_at_ms ASC")?;
         let items = stmt
@@ -323,7 +324,7 @@ impl ApprovalStore {
     }
 
     pub fn remove(&self, approval_id: &str) -> Result<bool> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let deleted = conn.execute(
             "DELETE FROM pending_approvals WHERE approval_id = ?1",
             params![approval_id],
@@ -339,7 +340,7 @@ impl ApprovalStore {
             .filter(|a| a.run_id == run_id)
             .collect();
         if !matching.is_empty() {
-            let conn = Connection::open(&self.db_path)?;
+            let conn = SecureSqliteConnection::open(&self.db_path)?;
             conn.pragma_update(None, "busy_timeout", 5000)?;
             conn.execute(
                 "DELETE FROM pending_approvals WHERE run_id = ?1",
@@ -367,7 +368,7 @@ impl ApprovalStore {
             })
             .collect();
         if !matching.is_empty() {
-            let conn = Connection::open(&self.db_path)?;
+            let conn = SecureSqliteConnection::open(&self.db_path)?;
             conn.pragma_update(None, "busy_timeout", 5000)?;
             for item in &matching {
                 conn.execute(

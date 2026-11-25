@@ -1,12 +1,15 @@
 use anyhow::{anyhow, Result};
 use atomium_core::{
-    decode_agy_oauth_for_file, default_agy_oauth_mode, encode_agy_oauth_for_keychain,
-    is_process_alive, process_start_time, project_isolated_oauth_file, read_projected_oauth_file,
+    agy_oauth_writeback_identity_matches, decode_agy_oauth_for_file, default_agy_oauth_mode,
+    encode_agy_oauth_for_keychain, is_process_alive, process_start_time,
+    project_isolated_oauth_file, read_projected_oauth_file_confined, validate_agy_oauth_payload,
     ApprovalStore, BrokerError, EncryptedVault, FileMasterKeyProvider, InMemoryKeychainAdapter,
     KeychainAdapter, LeaseManager, LeaseMode, LeaseRequest, MasterKeyProvider, ProfileStore,
-    RunStore, WorkspaceBroker, AGY_KEYCHAIN_ACCOUNT, AGY_KEYCHAIN_SERVICE,
+    RunStore, WorkspaceBroker,
 };
-use atomium_gateway::{spawn_run_proxy_with_policy, EgressProxyHandle};
+use atomium_gateway::{
+    normalize_allowlist_pattern, spawn_run_proxy_with_policy, EgressProxyHandle,
+};
 use atomium_protocol::{
     ApprovalCreateRequest, ApprovalRequest, ApprovalResolveRequest, CandidateFreezeRequest,
     CandidateStatus, CredentialSpec, EgressBinding, IdentityProfile, JsonRpcError, JsonRpcRequest,
@@ -26,14 +29,19 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
-use tokio::sync::{broadcast, watch, Mutex, Notify};
+use tokio::sync::{broadcast, watch, Mutex, Notify, Semaphore};
 
 const DEFAULT_LEASE_TTL_SECS: i64 = 60;
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 const EVENT_BROADCAST_CAPACITY: usize = 1024;
+pub const MAX_RPC_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_CAPTURED_SECRET_BYTES: usize = 256 * 1024;
+const MAX_LOG_LINE_BYTES: usize = 8 * 1024;
+const MAX_LOG_STREAM_BYTES: usize = 1024 * 1024;
+const MAX_CONCURRENT_RUNS: usize = 32;
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -60,6 +68,387 @@ fn random_ephemeral_token() -> String {
     hex::encode(bytes)
 }
 
+fn caller_env_key_allowed(key: &str) -> bool {
+    if key.is_empty()
+        || key.len() > 128
+        || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return false;
+    }
+    if key.starts_with("ATOMIUM_") || key.starts_with("DYLD_") || key.starts_with("LD_") {
+        return false;
+    }
+    !matches!(
+        key,
+        "HOME"
+            | "TMPDIR"
+            | "XDG_CACHE_HOME"
+            | "PATH"
+            | "TZ"
+            | "LANG"
+            | "LC_ALL"
+            | "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "http_proxy"
+            | "https_proxy"
+            | "ALL_PROXY"
+            | "all_proxy"
+            | "NO_PROXY"
+            | "no_proxy"
+            | "SSH_AUTH_SOCK"
+            | "GIT_SSH_COMMAND"
+    )
+}
+
+fn validate_run_request_security(req: &RunStartRequest) -> std::result::Result<(), (i32, String)> {
+    if req.program.trim().is_empty() {
+        return Err((-32602, "program must not be empty".into()));
+    }
+    if req.program.len() > 4096 || req.program.chars().any(char::is_control) {
+        return Err((
+            -32602,
+            "program is too long or contains control characters".into(),
+        ));
+    }
+    if req.args.len() > 256 {
+        return Err((-32602, "too many argv entries (max 256)".into()));
+    }
+    if req
+        .args
+        .iter()
+        .any(|arg| arg.len() > 64 * 1024 || arg.contains('\0'))
+    {
+        return Err((
+            -32602,
+            "argv entries must be <=64KiB and must not contain NUL".into(),
+        ));
+    }
+    if req.timeout_ms.is_some_and(|ms| ms < 0) {
+        return Err((-32602, "timeout_ms must be non-negative".into()));
+    }
+    if req.env.len() > 128 {
+        return Err((-32602, "too many environment entries (max 128)".into()));
+    }
+    for (key, value) in &req.env {
+        if !caller_env_key_allowed(key) {
+            return Err((
+                -32602,
+                format!("environment variable {key} is reserved or unsafe"),
+            ));
+        }
+        if value.len() > 16 * 1024 || value.contains('\0') {
+            return Err((
+                -32602,
+                format!("environment variable {key} is too long or contains NUL"),
+            ));
+        }
+    }
+    if req.allowed_egress_hosts.len() > 64 {
+        return Err((-32602, "too many allowed egress hosts (max 64)".into()));
+    }
+    if req
+        .allowed_egress_hosts
+        .iter()
+        .any(|host| normalize_allowlist_pattern(host).is_none())
+    {
+        return Err((-32602, "allowed egress host entries are invalid".into()));
+    }
+    if req.upstream_proxy_addr.as_deref().is_some_and(|addr| {
+        addr.is_empty() || addr.len() > 255 || addr.chars().any(char::is_control)
+    }) {
+        return Err((-32602, "upstream_proxy_addr is invalid".into()));
+    }
+    Ok(())
+}
+
+fn credential_key_is_sensitive(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "access_token"
+            | "refresh_token"
+            | "id_token"
+            | "client_secret"
+            | "api_key"
+            | "authorization"
+            | "private_key"
+            | "password"
+            | "secret"
+            | "token"
+    )
+}
+
+fn collect_secret_fragments(
+    value: &serde_json::Value,
+    out: &mut Vec<String>,
+    sensitive_context: bool,
+) {
+    match value {
+        serde_json::Value::String(s) => {
+            if sensitive_context && !s.is_empty() {
+                out.push(s.clone());
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_secret_fragments(item, out, sensitive_context);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                collect_secret_fragments(
+                    item,
+                    out,
+                    sensitive_context || credential_key_is_sensitive(key),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redaction_replacement(secret: &str) -> String {
+    let digest = EncryptedVault::digest_hex(secret.as_bytes());
+    format!("<redacted:sha256:{}>", &digest[..12])
+}
+
+fn token_redaction_pattern() -> &'static regex::Regex {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    PATTERN.get_or_init(|| {
+        regex::Regex::new(
+            r"(sk-[A-Za-z0-9_-]{20,}|ya29\.[\w-]+|AIza[\w-]{35}|Bearer\s+\S+|\beyJ[\w-]*\.[\w-]+\.[\w-]+\b)",
+        )
+        .expect("valid token redaction regex")
+    })
+}
+
+fn base64_candidate_pattern() -> &'static regex::Regex {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    PATTERN.get_or_init(|| {
+        regex::Regex::new(r"\b[A-Za-z0-9+/]{40,}={0,2}\b").expect("valid base64 candidate regex")
+    })
+}
+
+fn shannon_entropy_bits_per_byte(text: &str) -> f64 {
+    let mut counts = [0usize; 256];
+    for byte in text.as_bytes() {
+        counts[*byte as usize] += 1;
+    }
+    let len = text.len() as f64;
+    counts
+        .iter()
+        .filter(|count| **count > 0)
+        .map(|count| {
+            let p = *count as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+#[derive(Clone, Debug, Default)]
+struct SecretRedactor {
+    fragments: Vec<String>,
+}
+
+impl SecretRedactor {
+    fn from_secret_bytes(bytes: &[u8]) -> Self {
+        let mut redactor = Self::default();
+        redactor.add_secret_bytes(bytes);
+        redactor
+    }
+
+    fn add_secret_bytes(&mut self, bytes: &[u8]) {
+        let mut new_fragments = Vec::new();
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            if text.len() >= 16 {
+                new_fragments.push(text.to_string());
+            }
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+                collect_secret_fragments(&json, &mut new_fragments, false);
+            }
+        }
+        // Redact common base64 carrying forms as credential material too, not only literal plaintext.
+        for fragment in new_fragments.clone() {
+            if fragment.len() >= 8 {
+                new_fragments.push(base64::engine::general_purpose::STANDARD.encode(&fragment));
+            }
+        }
+        self.fragments.extend(new_fragments);
+        self.fragments
+            .sort_by_key(|fragment| std::cmp::Reverse(fragment.len()));
+        self.fragments.dedup();
+    }
+
+    fn redact(&self, line: &str) -> String {
+        let mut redacted: String = line
+            .chars()
+            .map(|c| {
+                if c.is_control() && c != '\t' {
+                    '�'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        for fragment in &self.fragments {
+            if !fragment.is_empty() && redacted.contains(fragment) {
+                redacted = redacted.replace(fragment, &redaction_replacement(fragment));
+            }
+        }
+        redacted = token_redaction_pattern()
+            .replace_all(&redacted, |caps: &regex::Captures<'_>| {
+                redaction_replacement(caps.get(0).map(|m| m.as_str()).unwrap_or_default())
+            })
+            .into_owned();
+        redacted = base64_candidate_pattern()
+            .replace_all(&redacted, |caps: &regex::Captures<'_>| {
+                let candidate = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+                if shannon_entropy_bits_per_byte(candidate) >= 4.2 {
+                    redaction_replacement(candidate)
+                } else {
+                    candidate.to_string()
+                }
+            })
+            .into_owned();
+        if redacted.len() > MAX_LOG_LINE_BYTES {
+            let mut end = MAX_LOG_LINE_BYTES;
+            while !redacted.is_char_boundary(end) {
+                end -= 1;
+            }
+            redacted.truncate(end);
+            redacted.push_str("…[truncated]");
+        }
+        redacted
+    }
+
+    fn redact_args(&self, args: &[String]) -> Vec<String> {
+        fn sensitive_flag(flag: &str) -> bool {
+            let normalized = flag
+                .trim_start_matches('-')
+                .replace('_', "-")
+                .to_ascii_lowercase();
+            matches!(
+                normalized.as_str(),
+                "token"
+                    | "api-key"
+                    | "apikey"
+                    | "password"
+                    | "secret"
+                    | "access-token"
+                    | "refresh-token"
+                    | "id-token"
+                    | "client-secret"
+                    | "auth-token"
+                    | "bearer-token"
+            )
+        }
+
+        let mut out = Vec::with_capacity(args.len());
+        let mut redact_next = false;
+        for arg in args {
+            if redact_next {
+                out.push(redaction_replacement(arg));
+                redact_next = false;
+                continue;
+            }
+            if let Some((flag, value)) = arg.split_once('=') {
+                if sensitive_flag(flag) {
+                    out.push(format!("{}={}", flag, redaction_replacement(value)));
+                    continue;
+                }
+            }
+            if sensitive_flag(arg) {
+                out.push(arg.clone());
+                redact_next = true;
+                continue;
+            }
+            out.push(self.redact(arg));
+        }
+        out
+    }
+}
+
+fn oauth_log_redactor(decoded: &[u8], stored: &[u8]) -> SecretRedactor {
+    let mut redactor = SecretRedactor::from_secret_bytes(decoded);
+    redactor.add_secret_bytes(stored);
+    let keychain_wrapped = encode_agy_oauth_for_keychain(decoded);
+    redactor.add_secret_bytes(&keychain_wrapped);
+    redactor
+}
+
+async fn read_bounded_child_line<R>(reader: &mut BufReader<R>) -> Result<Option<String>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut out = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if out.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(String::from_utf8_lossy(&out).into_owned()))
+            };
+        }
+
+        let newline_pos = available.iter().position(|b| *b == b'\n');
+        let remaining = MAX_LOG_LINE_BYTES.saturating_sub(out.len()).max(1);
+        let take = newline_pos
+            .map(|pos| pos + 1)
+            .unwrap_or(available.len())
+            .min(available.len())
+            .min(remaining);
+        out.extend_from_slice(&available[..take]);
+        reader.consume(take);
+
+        if newline_pos.is_some_and(|pos| take == pos + 1) || out.len() >= MAX_LOG_LINE_BYTES {
+            if out.last() == Some(&b'\n') {
+                out.pop();
+            }
+            if out.last() == Some(&b'\r') {
+                out.pop();
+            }
+            return Ok(Some(String::from_utf8_lossy(&out).into_owned()));
+        }
+    }
+}
+
+fn emit_bounded_log_line(
+    state: &DaemonState,
+    run_id: &str,
+    stream: &str,
+    line: &str,
+    redactor: &SecretRedactor,
+    emitted_bytes: &mut usize,
+    truncation_notified: &mut bool,
+) {
+    if *truncation_notified {
+        return;
+    }
+    let redacted = redactor.redact(line);
+    let prospective = emitted_bytes.saturating_add(redacted.len().saturating_add(1));
+    if prospective > MAX_LOG_STREAM_BYTES {
+        *truncation_notified = true;
+        let _ = state.emit_event(
+            run_id,
+            &TaskEventPayload::LogLine {
+                stream: stream.into(),
+                line: format!(
+                    "[atomium] {stream} log truncated after {MAX_LOG_STREAM_BYTES} bytes"
+                ),
+            },
+        );
+        return;
+    }
+    *emitted_bytes = prospective;
+    let _ = state.emit_event(
+        run_id,
+        &TaskEventPayload::LogLine {
+            stream: stream.into(),
+            line: redacted,
+        },
+    );
+}
+
 fn host_slot_key(service: &str, account: &str) -> String {
     format!("{service}:{account}")
 }
@@ -68,7 +457,7 @@ enum CredentialProjection {
     None,
     IsolatedFile {
         vault_blob_id: String,
-        projected_path: PathBuf,
+        relative_home_path: String,
         initial_digest: String,
     },
     HostKeychainSlot {
@@ -98,6 +487,7 @@ pub struct DaemonState {
     event_tx: broadcast::Sender<TaskEvent>,
     active_runs: Mutex<HashMap<String, ActiveRunControl>>,
     broker_lock: Mutex<()>,
+    run_slot_semaphore: Arc<Semaphore>,
     unsandboxed_dev_mode: bool,
 }
 
@@ -173,6 +563,7 @@ impl DaemonState {
             event_tx,
             active_runs: Mutex::new(HashMap::new()),
             broker_lock: Mutex::new(()),
+            run_slot_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RUNS)),
             unsandboxed_dev_mode: false,
         })
     }
@@ -265,6 +656,10 @@ impl DaemonState {
         let decoded = decode_agy_oauth_for_file(&current_raw)?;
         let new_digest = EncryptedVault::digest_hex(&decoded);
         if new_digest == *content_digest {
+            return Ok(false);
+        }
+        let before_bytes = self.vault.read_blob(vault_blob_id)?;
+        if !agy_oauth_writeback_identity_matches(&before_bytes, &decoded) {
             return Ok(false);
         }
 
@@ -466,16 +861,54 @@ async fn recv_live_event(
     }
 }
 
+async fn read_bounded_rpc_line<R>(reader: &mut BufReader<R>) -> Result<Option<String>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut out = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if out.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(String::from_utf8(out)?))
+            };
+        }
+
+        let newline_pos = available.iter().position(|b| *b == b'\n');
+        let take = newline_pos.map(|pos| pos + 1).unwrap_or(available.len());
+        if out.len().saturating_add(take) > MAX_RPC_FRAME_BYTES {
+            return Err(anyhow!(
+                "RPC frame exceeds {} byte daemon limit",
+                MAX_RPC_FRAME_BYTES
+            ));
+        }
+        out.extend_from_slice(&available[..take]);
+        reader.consume(take);
+
+        if newline_pos.is_some() {
+            if out.last() == Some(&b'\n') {
+                out.pop();
+            }
+            if out.last() == Some(&b'\r') {
+                out.pop();
+            }
+            return Ok(Some(String::from_utf8(out)?));
+        }
+    }
+}
+
 pub async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
+    let mut reader = BufReader::new(read_half);
     let mut sub_rx: Option<broadcast::Receiver<TaskEvent>> = None;
     let mut last_pushed_seq: i64 = 0;
 
     loop {
         tokio::select! {
             biased;
-            line_res = lines.next_line() => {
+            line_res = read_bounded_rpc_line(&mut reader) => {
                 let Some(line) = line_res? else {
                     break;
                 };
@@ -934,37 +1367,33 @@ fn handle_subscriptions_capture(
     }
 
     let storage_mode = req.storage_mode.unwrap_or_else(default_agy_oauth_mode);
-    let raw_secret = if let Some(b64) = &req.raw_secret_b64 {
-        base64::engine::general_purpose::STANDARD
-            .decode(b64.trim())
-            .map_err(|_| (-32602, "invalid base64 in raw_secret_b64".into()))?
-    } else if let Some(path) = &req.source_file_path {
-        fs::read(path).map_err(|e| (-32004, format!("failed to read source_file_path: {e}")))?
-    } else {
-        let (service, account) = match &storage_mode {
-            OAuthStorageMode::HostKeychainSlot { service, account } => {
-                (service.as_str(), account.as_str())
-            }
-            OAuthStorageMode::IsolatedFile { .. } => (AGY_KEYCHAIN_SERVICE, AGY_KEYCHAIN_ACCOUNT),
-        };
-        state
-            .keychain
-            .read_generic_password(service, account)
-            .map_err(|e| (-32000, e.to_string()))?
-            .ok_or_else(|| {
-                (
-                    -32004,
-                    format!("keychain slot {service}/{account} is empty"),
-                )
-            })?
+    let Some(raw_secret_b64) = &req.raw_secret_b64 else {
+        return Err((-32602, "raw_secret_b64 is required".into()));
     };
+    let raw_secret = base64::engine::general_purpose::STANDARD
+        .decode(raw_secret_b64.trim())
+        .map_err(|_| (-32602, "invalid base64 in raw_secret_b64".into()))?;
 
     if raw_secret.is_empty() {
         return Err((-32602, "captured oauth credential payload is empty".into()));
     }
+    if raw_secret.len() > MAX_CAPTURED_SECRET_BYTES {
+        return Err((
+            -32602,
+            "captured oauth credential payload exceeds daemon size limit".into(),
+        ));
+    }
 
     let canonical_bytes =
         decode_agy_oauth_for_file(&raw_secret).map_err(|e| (-32602, e.to_string()))?;
+    if canonical_bytes.len() > MAX_CAPTURED_SECRET_BYTES {
+        return Err((
+            -32602,
+            "canonical oauth credential payload exceeds daemon size limit".into(),
+        ));
+    }
+    validate_agy_oauth_payload(&canonical_bytes)
+        .map_err(|e| (-32602, format!("invalid oauth credential payload: {e}")))?;
 
     // Reclaim stale leases and acquire exclusive OAuth lease so recapture cannot race with
     // an active run holding the same profile or host keychain slot.
@@ -1181,9 +1610,7 @@ async fn handle_runs_start(
     state: &Arc<DaemonState>,
     req: RunStartRequest,
 ) -> std::result::Result<RunRecord, (i32, String)> {
-    if req.program.trim().is_empty() {
-        return Err((-32602, "program must not be empty".into()));
-    }
+    validate_run_request_security(&req)?;
 
     let _ = state
         .leases
@@ -1214,6 +1641,17 @@ async fn handle_runs_start(
             "no isolation backend available on this OS; refusing to run unsandboxed".into(),
         ));
     }
+
+    let run_slot_permit = state
+        .run_slot_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                -32016,
+                format!("concurrent run limit {MAX_CONCURRENT_RUNS} reached"),
+            )
+        })?;
 
     // Only Broker-imported workspaces may be mounted into a run; arbitrary host paths are rejected.
     let brokered_workspace_dir = match &req.workspace_id {
@@ -1265,76 +1703,96 @@ async fn handle_runs_start(
     let run_cache = run_dir.join("cache");
     let default_ws = run_dir.join("workspace");
 
-    let prepare_res = (|| -> Result<(PathBuf, CredentialProjection, Option<i64>)> {
-        for dir in [&run_dir, &run_home, &run_tmp, &run_cache, &default_ws] {
-            fs::create_dir_all(dir)?;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-        }
+    let prepare_res =
+        (|| -> Result<(PathBuf, CredentialProjection, Option<i64>, SecretRedactor)> {
+            for dir in [&run_dir, &run_home, &run_tmp, &run_cache, &default_ws] {
+                fs::create_dir_all(dir)?;
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+            }
 
-        let workspace_dir = match &brokered_workspace_dir {
-            Some(p) if p.is_dir() => p.clone(),
-            Some(p) => return Err(anyhow!("brokered working_dir is missing: {}", p.display())),
-            None => default_ws.clone(),
-        };
+            let workspace_dir = match &brokered_workspace_dir {
+                Some(p) if p.is_dir() => p.clone(),
+                Some(p) => return Err(anyhow!("brokered working_dir is missing: {}", p.display())),
+                None => default_ws.clone(),
+            };
 
-        // 2. Project OAuth credentials into isolated $HOME (0600 decoded JSON) or HostKeychainSlot.
-        let (projection, initial_ver) = match &profile.credential {
-            CredentialSpec::OauthSnapshot {
-                vault_blob_id,
-                mode,
-                snapshot_version,
-                ..
-            } => {
-                let secret_bytes = state.vault.read_blob(vault_blob_id)?;
-                match mode {
-                    OAuthStorageMode::IsolatedFile { relative_home_path } => {
-                        let decoded = decode_agy_oauth_for_file(&secret_bytes)?;
-                        let initial_digest = EncryptedVault::digest_hex(&decoded);
-                        let projected_path =
+            // 2. Project OAuth credentials into isolated $HOME (0600 decoded JSON) or HostKeychainSlot.
+            let (projection, initial_ver, secret_redactor) = match &profile.credential {
+                CredentialSpec::OauthSnapshot {
+                    vault_blob_id,
+                    mode,
+                    snapshot_version,
+                    ..
+                } => {
+                    let secret_bytes = state.vault.read_blob(vault_blob_id)?;
+                    match mode {
+                        OAuthStorageMode::IsolatedFile { relative_home_path } => {
+                            let decoded = decode_agy_oauth_for_file(&secret_bytes)?;
+                            let initial_digest = EncryptedVault::digest_hex(&decoded);
                             project_isolated_oauth_file(&run_home, relative_home_path, &decoded)?;
-                        (
-                            CredentialProjection::IsolatedFile {
-                                vault_blob_id: vault_blob_id.clone(),
-                                projected_path,
-                                initial_digest,
-                            },
-                            Some(*snapshot_version),
-                        )
-                    }
-                    OAuthStorageMode::HostKeychainSlot { service, account } => {
-                        let slot_key = host_slot_key(service, account);
-                        if let Some(prev_id) = state.runs.get_active_host_slot(&slot_key)? {
-                            if prev_id != profile.id {
-                                let _ = state
-                                    .writeback_host_slot_if_refreshed(&prev_id, service, account)?;
-                            }
+                            (
+                                CredentialProjection::IsolatedFile {
+                                    vault_blob_id: vault_blob_id.clone(),
+                                    relative_home_path: relative_home_path.clone(),
+                                    initial_digest,
+                                },
+                                Some(*snapshot_version),
+                                oauth_log_redactor(&decoded, &secret_bytes),
+                            )
                         }
-                        let decoded = decode_agy_oauth_for_file(&secret_bytes)?;
-                        let initial_digest = EncryptedVault::digest_hex(&decoded);
-                        let encoded = encode_agy_oauth_for_keychain(&decoded);
-                        state
-                            .keychain
-                            .write_generic_password(service, account, &encoded)?;
-                        state.runs.set_active_host_slot(&slot_key, &profile.id)?;
-                        (
-                            CredentialProjection::HostKeychainSlot {
-                                vault_blob_id: vault_blob_id.clone(),
-                                service: service.clone(),
-                                account: account.clone(),
-                                initial_digest,
-                            },
-                            Some(*snapshot_version),
-                        )
+                        OAuthStorageMode::HostKeychainSlot { service, account } => {
+                            let slot_key = host_slot_key(service, account);
+                            if let Some(prev_id) = state.runs.get_active_host_slot(&slot_key)? {
+                                if prev_id != profile.id {
+                                    let _ = state.writeback_host_slot_if_refreshed(
+                                        &prev_id, service, account,
+                                    )?;
+                                }
+                            }
+                            let decoded = decode_agy_oauth_for_file(&secret_bytes)?;
+                            let initial_digest = EncryptedVault::digest_hex(&decoded);
+                            let encoded = encode_agy_oauth_for_keychain(&decoded);
+                            state
+                                .keychain
+                                .write_generic_password(service, account, &encoded)?;
+                            state.runs.set_active_host_slot(&slot_key, &profile.id)?;
+                            (
+                                CredentialProjection::HostKeychainSlot {
+                                    vault_blob_id: vault_blob_id.clone(),
+                                    service: service.clone(),
+                                    account: account.clone(),
+                                    initial_digest,
+                                },
+                                Some(*snapshot_version),
+                                oauth_log_redactor(&decoded, &secret_bytes),
+                            )
+                        }
                     }
                 }
-            }
-            _ => (CredentialProjection::None, None),
-        };
+                CredentialSpec::ApiKey {
+                    vault_secret_id, ..
+                } => {
+                    let secret_bytes = state.vault.read_blob(vault_secret_id)?;
+                    (
+                        CredentialProjection::None,
+                        None,
+                        SecretRedactor::from_secret_bytes(&secret_bytes),
+                    )
+                }
+                CredentialSpec::Adc { vault_blob_id, .. } => {
+                    let secret_bytes = state.vault.read_blob(vault_blob_id)?;
+                    (
+                        CredentialProjection::None,
+                        None,
+                        SecretRedactor::from_secret_bytes(&secret_bytes),
+                    )
+                }
+            };
 
-        Ok((workspace_dir, projection, initial_ver))
-    })();
+            Ok((workspace_dir, projection, initial_ver, secret_redactor))
+        })();
 
-    let (workspace_dir, projection, initial_version) = match prepare_res {
+    let (workspace_dir, projection, initial_version, secret_redactor) = match prepare_res {
         Ok(v) => v,
         Err(e) => {
             let _ = fs::remove_dir_all(&run_dir);
@@ -1376,7 +1834,7 @@ async fn handle_runs_start(
         profile_id: profile.id.clone(),
         agent_kind: profile.agent_kind.clone(),
         program: req.program.clone(),
-        args: req.args.clone(),
+        args: secret_redactor.redact_args(&req.args),
         status: TaskStatus::Prepared,
         exit_code: None,
         proxy_port: Some(proxy_port),
@@ -1424,8 +1882,7 @@ async fn handle_runs_start(
         ("ATOMIUM_PROXY_PORT".into(), proxy_port.to_string()),
     ];
     for (k, v) in &req.env {
-        // Never allow caller env to override isolated HOME / TMPDIR / XDG_CACHE_HOME.
-        if !matches!(k.as_str(), "HOME" | "TMPDIR" | "XDG_CACHE_HOME") {
+        if caller_env_key_allowed(k) {
             extra_env.push((k.clone(), v.clone()));
         }
     }
@@ -1518,8 +1975,8 @@ async fn handle_runs_start(
     };
 
     // 6. Persist child process group (for crash recovery) and transition to Running.
-    if let Some(pid) = child.id() {
-        let pgid = pid as i64;
+    let child_pgid = child.id().map(|pid| pid as i64);
+    if let Some(pgid) = child_pgid {
         let proc_start = process_start_time(pgid).unwrap_or(0);
         let _ = state.runs.set_child_process(&run_id, pgid, proc_start);
     }
@@ -1560,18 +2017,24 @@ async fn handle_runs_start(
     let timeout_ms = req.timeout_ms;
 
     tokio::spawn(async move {
+        let _run_slot_permit = run_slot_permit;
         let stdout_task = child.stdout.take().map(|out| {
             let st = sup_state.clone();
             let rid = sup_run_id.clone();
+            let redactor = secret_redactor.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(out).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = st.emit_event(
+                let mut reader = BufReader::new(out);
+                let mut emitted_bytes = 0usize;
+                let mut truncation_notified = false;
+                while let Ok(Some(line)) = read_bounded_child_line(&mut reader).await {
+                    emit_bounded_log_line(
+                        &st,
                         &rid,
-                        &TaskEventPayload::LogLine {
-                            stream: "stdout".into(),
-                            line,
-                        },
+                        "stdout",
+                        &line,
+                        &redactor,
+                        &mut emitted_bytes,
+                        &mut truncation_notified,
                     );
                 }
             })
@@ -1580,15 +2043,20 @@ async fn handle_runs_start(
         let stderr_task = child.stderr.take().map(|err_pipe| {
             let st = sup_state.clone();
             let rid = sup_run_id.clone();
+            let redactor = secret_redactor.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(err_pipe).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = st.emit_event(
+                let mut reader = BufReader::new(err_pipe);
+                let mut emitted_bytes = 0usize;
+                let mut truncation_notified = false;
+                while let Ok(Some(line)) = read_bounded_child_line(&mut reader).await {
+                    emit_bounded_log_line(
+                        &st,
                         &rid,
-                        &TaskEventPayload::LogLine {
-                            stream: "stderr".into(),
-                            line,
-                        },
+                        "stderr",
+                        &line,
+                        &redactor,
+                        &mut emitted_bytes,
+                        &mut truncation_notified,
                     );
                 }
             })
@@ -1624,6 +2092,10 @@ async fn handle_runs_start(
                 if let Ok(status) = status_res {
                     exit_code = status.code();
                 }
+                // The leader may exit while background descendants keep running. A completed
+                // run must not leave live isolated processes behind, so terminate the rest of
+                // the process group before write-back, cleanup verification, and lease release.
+                terminate_child_process_group(&mut child, child_pgid).await;
             }
             _ = cancel_rx.changed() => {
                 let reason = cancel_rx.borrow().clone().unwrap_or_else(|| "cancelled".into());
@@ -1632,7 +2104,7 @@ async fn handle_runs_start(
                 if let Some(handle) = egress_slot.lock().await.take() {
                     handle.revoke();
                 }
-                terminate_child_process_group(&mut child).await;
+                terminate_child_process_group(&mut child, child_pgid).await;
             }
             _ = &mut timeout_fut => {
                 cancelled_reason = Some("timeout".into());
@@ -1646,7 +2118,7 @@ async fn handle_runs_start(
                         reason: cancelled_reason.clone(),
                     },
                 );
-                terminate_child_process_group(&mut child).await;
+                terminate_child_process_group(&mut child, child_pgid).await;
             }
         }
 
@@ -1673,10 +2145,22 @@ async fn handle_runs_start(
             match &projection {
                 CredentialProjection::IsolatedFile {
                     vault_blob_id,
-                    projected_path,
+                    relative_home_path,
                     initial_digest,
-                } => {
-                    if let Ok(Some(after_bytes)) = read_projected_oauth_file(projected_path) {
+                } => match read_projected_oauth_file_confined(&run_home, relative_home_path) {
+                    Err(reason) => {
+                        let _ = sup_state.emit_event(
+                                &sup_run_id,
+                                &TaskEventPayload::LogLine {
+                                    stream: "atomium".into(),
+                                    line: format!(
+                                        "[atomium] oauth write-back skipped: confined projection read failed: {reason}"
+                                    ),
+                                },
+                            );
+                    }
+                    Ok(None) => {}
+                    Ok(Some(after_bytes)) => {
                         let after_digest = EncryptedVault::digest_hex(&after_bytes);
                         if after_digest != *initial_digest {
                             if let Ok(Some(mut prof)) = sup_state.profiles.get(&sup_profile_id) {
@@ -1690,7 +2174,25 @@ async fn handle_runs_start(
                                         && content_digest == initial_digest
                                 );
                                 if version_matches {
-                                    if let Ok(written_digest) =
+                                    let writeback_allowed = sup_state
+                                        .vault
+                                        .read_blob(vault_blob_id)
+                                        .map(|before_bytes| {
+                                            agy_oauth_writeback_identity_matches(
+                                                &before_bytes,
+                                                &after_bytes,
+                                            )
+                                        })
+                                        .unwrap_or(false);
+                                    if !writeback_allowed {
+                                        let _ = sup_state.emit_event(
+                                            &sup_run_id,
+                                            &TaskEventPayload::LogLine {
+                                                stream: "atomium".into(),
+                                                line: "[atomium] oauth write-back rejected: malformed payload or identity changed".into(),
+                                            },
+                                        );
+                                    } else if let Ok(written_digest) =
                                         sup_state.vault.write_blob(vault_blob_id, &after_bytes)
                                     {
                                         if let CredentialSpec::OauthSnapshot {
@@ -1710,7 +2212,7 @@ async fn handle_runs_start(
                             }
                         }
                     }
-                }
+                },
                 CredentialProjection::HostKeychainSlot {
                     vault_blob_id,
                     service,
@@ -1735,7 +2237,25 @@ async fn handle_runs_start(
                                             && content_digest == initial_digest
                                     );
                                     if version_matches {
-                                        if let Ok(written_digest) =
+                                        let writeback_allowed = sup_state
+                                            .vault
+                                            .read_blob(vault_blob_id)
+                                            .map(|before_bytes| {
+                                                agy_oauth_writeback_identity_matches(
+                                                    &before_bytes,
+                                                    &after_bytes,
+                                                )
+                                            })
+                                            .unwrap_or(false);
+                                        if !writeback_allowed {
+                                            let _ = sup_state.emit_event(
+                                                &sup_run_id,
+                                                &TaskEventPayload::LogLine {
+                                                    stream: "atomium".into(),
+                                                    line: "[atomium] oauth write-back rejected: malformed payload or identity changed".into(),
+                                                },
+                                            );
+                                        } else if let Ok(written_digest) =
                                             sup_state.vault.write_blob(vault_blob_id, &after_bytes)
                                         {
                                             if let CredentialSpec::OauthSnapshot {
@@ -1839,8 +2359,7 @@ fn kill_orphaned_process_group_sync(pgid: i64) {
     }
 }
 
-async fn terminate_child_process_group(child: &mut tokio::process::Child) {
-    let pgid = child.id().map(|id| id as i64);
+async fn terminate_child_process_group(child: &mut tokio::process::Child, pgid: Option<i64>) {
     if let Some(pgid) = pgid {
         let neg_pgid = -(pgid as libc::pid_t);
         unsafe {

@@ -958,7 +958,8 @@ async fn host_keychain_slot_switch_writes_back_refreshed_previous_account() {
                     "storage": "host_keychain_slot",
                     "service": "gemini",
                     "account": "antigravity"
-                }
+                },
+                "raw_secret_b64": base64::engine::general_purpose::STANDARD.encode(raw_a)
             }),
         )
         .await;
@@ -984,7 +985,8 @@ async fn host_keychain_slot_switch_writes_back_refreshed_previous_account() {
                     "storage": "host_keychain_slot",
                     "service": "gemini",
                     "account": "antigravity"
-                }
+                },
+                "raw_secret_b64": base64::engine::general_purpose::STANDARD.encode(raw_b_v1)
             }),
         )
         .await;
@@ -1113,7 +1115,8 @@ async fn codex_review_regressions_orphan_recovery_capture_lock_dirty_switch_and_
                     "storage": "host_keychain_slot",
                     "service": "gemini",
                     "account": "antigravity"
-                }
+                },
+                "raw_secret_b64": base64::engine::general_purpose::STANDARD.encode(kc_a)
             }),
         )
         .await;
@@ -1136,7 +1139,8 @@ async fn codex_review_regressions_orphan_recovery_capture_lock_dirty_switch_and_
                     "storage": "host_keychain_slot",
                     "service": "gemini",
                     "account": "antigravity"
-                }
+                },
+                "raw_secret_b64": base64::engine::general_purpose::STANDARD.encode(kc_b)
             }),
         )
         .await;
@@ -1440,4 +1444,594 @@ async fn runs_start_caller_cannot_disable_seatbelt_on_macos() {
         stdout_lines.iter().all(|l| !l.contains("HOST_CANARY")),
         "host canary leaked through legacy use_seatbelt=false: {stdout_lines:?}"
     );
+}
+
+#[tokio::test]
+async fn runs_start_rejects_loader_proxy_and_reserved_environment_overrides() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    capture_test_subscription(&mut client, "env_probe").await;
+
+    for (key, value) in [
+        ("DYLD_INSERT_LIBRARIES", "/tmp/inject.dylib"),
+        ("DYLD_PRINT_LIBRARIES", "1"),
+        ("LD_PRELOAD", "/tmp/inject.so"),
+        ("HTTP_PROXY", "http://attacker.invalid:8080"),
+        ("PATH", "/tmp"),
+        ("ATOMIUM_RUN_ID", "forged"),
+    ] {
+        let resp = client
+            .call(
+                json!(key),
+                "runs.start",
+                json!({
+                    "profile_id": "env_probe",
+                    "program": "/bin/sh",
+                    "args": ["-c", "true"],
+                    "env": { key: value }
+                }),
+            )
+            .await;
+        assert_eq!(
+            resp.error.expect("unsafe env must be rejected").code,
+            -32602,
+            "env key {key} must be rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn runs_start_rejects_malformed_allowed_egress_host_entries() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    capture_test_subscription(&mut client, "egress_probe").await;
+
+    for entry in ["*.", "api.example.com:99999", "", "bad host"] {
+        let resp = client
+            .call(
+                json!(entry),
+                "runs.start",
+                json!({
+                    "profile_id": "egress_probe",
+                    "program": "/bin/sh",
+                    "args": ["-c", "true"],
+                    "allowed_egress_hosts": ["api.example.com", entry]
+                }),
+            )
+            .await;
+        assert_eq!(
+            resp.error.expect("malformed egress entry must fail").code,
+            -32602,
+            "entry {entry:?} must be rejected before it can widen egress"
+        );
+    }
+}
+
+#[tokio::test]
+async fn subscriptions_capture_rejects_removed_source_file_path_field() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    let secret_file = srv.dir.path().join("host-oauth.json");
+    fs::write(&secret_file, br#"{"auth_method":"consumer"}"#).unwrap();
+
+    let resp = client
+        .call(
+            json!(1),
+            "subscriptions.capture",
+            json!({
+                "profile_id": "capture_probe",
+                "display_name": "Capture probe",
+                "source_file_path": secret_file.to_string_lossy()
+            }),
+        )
+        .await;
+    assert_eq!(
+        resp.error.expect("legacy host file capture must fail").code,
+        -32602
+    );
+}
+
+#[tokio::test]
+async fn run_log_events_redact_oauth_material_and_bound_persisted_output() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    let secret_token = "zz9";
+    let raw = format!(
+        r#"{{"auth_method":"consumer","id_token_email":"redact@example.test","token":{{"access_token":"{secret_token}"}}}}"#
+    );
+    let cap = client
+        .call(
+            json!("cap"),
+            "subscriptions.capture",
+            json!({
+                "profile_id": "redact_probe",
+                "display_name": "Redaction probe",
+                "raw_secret_b64": base64::engine::general_purpose::STANDARD.encode(raw.as_bytes())
+            }),
+        )
+        .await;
+    assert!(cap.error.is_none(), "capture err: {:?}", cap.error);
+
+    let script = format!(
+        "python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ[\"HOME\"],\"{AGY_DEFAULT_RELATIVE_PATH}\")))[\"token\"][\"access_token\"])'; cat \"$HOME/{AGY_DEFAULT_RELATIVE_PATH}\"; python3 -c 'import base64,os; print(base64.b64encode(open(os.path.join(os.environ[\"HOME\"],\"{AGY_DEFAULT_RELATIVE_PATH}\"),\"rb\").read()).decode())'; python3 -c 'for i in range(20000): print(\"x\" * 100)'"
+    );
+    let started = client
+        .call(
+            json!(1),
+            "runs.start",
+            json!({
+                "profile_id": "redact_probe",
+                "program": "/bin/sh",
+                "args": ["-c", script]
+            }),
+        )
+        .await;
+    assert!(started.error.is_none(), "start err: {:?}", started.error);
+    let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+    let final_rec = wait_for_run_done(&mut client, &run.run_id).await;
+    assert_eq!(final_rec.status, TaskStatus::Completed);
+
+    let events = srv.state.leases().query_events_after(0).unwrap();
+    let run_events: Vec<_> = events.iter().filter(|ev| ev.run_id == run.run_id).collect();
+    let serialized = serde_json::to_string(&run_events).unwrap();
+    assert!(
+        !serialized.contains(secret_token),
+        "oauth access token must not be persisted in events"
+    );
+    assert!(
+        !serialized.contains("redact@example.test"),
+        "oauth identity material must not be persisted in events"
+    );
+    assert!(
+        serialized.contains("<redacted:sha256:"),
+        "redaction marker missing from events: {serialized}"
+    );
+    let encoded_secret = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
+    assert!(
+        !serialized.contains(&encoded_secret),
+        "base64-encoded oauth payload must not be persisted in events"
+    );
+
+    let stdout_lines: Vec<&str> = run_events
+        .iter()
+        .filter_map(|ev| match &ev.payload {
+            TaskEventPayload::LogLine { stream, line } if stream == "stdout" => Some(line.as_str()),
+            _ => None,
+        })
+        .collect();
+    let stdout_bytes: usize = stdout_lines.iter().map(|line| line.len() + 1).sum();
+    assert!(
+        stdout_bytes <= 1024 * 1024 + 128,
+        "persisted stdout bytes must be bounded, got {stdout_bytes}"
+    );
+    assert!(
+        stdout_lines
+            .iter()
+            .any(|line| line.contains("log truncated after")),
+        "missing truncation marker; lines={}",
+        stdout_lines.len()
+    );
+}
+
+#[tokio::test]
+async fn runs_start_enforces_daemon_side_concurrent_run_ceiling() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    let raw = br#"{"auth_method":"consumer","id_token_email":"slots@example.test","token":{"access_token":"tok-slots-long-enough"}}"#;
+
+    let mut run_ids = Vec::new();
+    for i in 0..32 {
+        let profile_id = format!("slot_probe_{i}");
+        let cap = client
+            .call(
+                json!(format!("cap-{i}")),
+                "subscriptions.capture",
+                json!({
+                    "profile_id": profile_id,
+                    "display_name": "Slot probe",
+                    "raw_secret_b64": base64::engine::general_purpose::STANDARD.encode(raw)
+                }),
+            )
+            .await;
+        assert!(cap.error.is_none(), "capture {i} err: {:?}", cap.error);
+        let started = client
+            .call(
+                json!(format!("start-{i}")),
+                "runs.start",
+                json!({
+                    "profile_id": profile_id,
+                    "program": "/bin/sh",
+                    "args": ["-c", "sleep 30"]
+                }),
+            )
+            .await;
+        assert!(
+            started.error.is_none(),
+            "start {i} err: {:?}",
+            started.error
+        );
+        let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+        run_ids.push(run.run_id);
+    }
+
+    let overflow_profile = "slot_probe_overflow";
+    let cap = client
+        .call(
+            json!("cap-overflow"),
+            "subscriptions.capture",
+            json!({
+                "profile_id": overflow_profile,
+                "display_name": "Slot overflow",
+                "raw_secret_b64": base64::engine::general_purpose::STANDARD.encode(raw)
+            }),
+        )
+        .await;
+    assert!(cap.error.is_none(), "overflow capture err: {:?}", cap.error);
+    let overflow = client
+        .call(
+            json!("start-overflow"),
+            "runs.start",
+            json!({
+                "profile_id": overflow_profile,
+                "program": "/bin/sh",
+                "args": ["-c", "sleep 30"]
+            }),
+        )
+        .await;
+    assert_eq!(
+        overflow.error.expect("33rd concurrent run must fail").code,
+        -32016
+    );
+
+    for (i, run_id) in run_ids.iter().enumerate() {
+        let cancelled = client
+            .call(
+                json!(format!("cancel-{i}")),
+                "runs.cancel",
+                json!({ "run_id": run_id, "reason": "slot_test_cleanup" }),
+            )
+            .await;
+        assert!(
+            cancelled.error.is_none(),
+            "cancel {run_id} err: {:?}",
+            cancelled.error
+        );
+    }
+}
+
+#[tokio::test]
+async fn subscriptions_capture_rejects_malformed_oauth_payload() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    let malformed = br#"{"auth_method":"consumer","token":{"access_token":"tok-1"}}"#;
+
+    let resp = client
+        .call(
+            json!("cap-malformed"),
+            "subscriptions.capture",
+            json!({
+                "profile_id": "malformed_probe",
+                "display_name": "Malformed probe",
+                "raw_secret_b64": base64::engine::general_purpose::STANDARD.encode(malformed)
+            }),
+        )
+        .await;
+    assert_eq!(
+        resp.error.expect("malformed capture must fail").code,
+        -32602
+    );
+    assert!(srv
+        .state
+        .profiles()
+        .get("malformed_probe")
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn oauth_writeback_rejects_identity_switch_and_malformed_projection() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    let original =
+        br#"{"id_token_email":"owner@example.test","token":{"access_token":"tok-owner-1"}}"#;
+    let attacker =
+        br#"{"id_token_email":"attacker@example.test","token":{"access_token":"tok-attacker-1"}}"#;
+
+    let cap = client
+        .call(
+            json!("cap-owner"),
+            "subscriptions.capture",
+            json!({
+                "profile_id": "writeback_guard",
+                "display_name": "Writeback guard",
+                "raw_secret_b64": base64::engine::general_purpose::STANDARD.encode(original)
+            }),
+        )
+        .await;
+    assert!(cap.error.is_none(), "capture err: {:?}", cap.error);
+
+    let script = write_executable_script(
+        srv.dir.path(),
+        "overwrite-oauth-identity.sh",
+        &format!(
+            r#"#!/bin/sh
+cat > "$HOME/{AGY_DEFAULT_RELATIVE_PATH}" <<'EOF'
+{}
+EOF
+"#,
+            String::from_utf8_lossy(attacker)
+        ),
+    );
+    let started = client
+        .call(
+            json!("start-writeback-guard"),
+            "runs.start",
+            json!({
+                "profile_id": "writeback_guard",
+                "program": script.to_string_lossy(),
+                "args": []
+            }),
+        )
+        .await;
+    assert!(started.error.is_none(), "start err: {:?}", started.error);
+    let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+    let final_rec = wait_for_run_done(&mut client, &run.run_id).await;
+    assert_eq!(final_rec.status, TaskStatus::Completed);
+    assert!(!final_rec.token_refreshed);
+    assert_eq!(
+        srv.state
+            .vault()
+            .read_blob("oauth_writeback_guard")
+            .unwrap(),
+        original
+    );
+
+    let events = srv.state.leases().query_events_after(0).unwrap();
+    assert!(events.iter().any(|ev| {
+        ev.run_id == run.run_id
+            && matches!(
+                &ev.payload,
+                TaskEventPayload::LogLine { stream, line }
+                    if stream == "atomium" && line.contains("oauth write-back rejected")
+            )
+    }));
+}
+
+#[tokio::test]
+async fn natural_leader_exit_kills_background_descendants_before_completion() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    capture_test_subscription(&mut client, "descendant_natural_exit").await;
+
+    let pid_file = srv.dir.path().join("natural-descendant.pid");
+    let script = write_executable_script(
+        srv.dir.path(),
+        "natural-exit-descendant.sh",
+        &format!(
+            r#"#!/bin/sh
+python3 - "{}" <<'PY' &
+import os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(sys.argv[1], "w") as f:
+    f.write(str(os.getpid()))
+time.sleep(30)
+PY
+while [ ! -s "{}" ]; do sleep 0.02; done
+exit 0
+"#,
+            pid_file.display(),
+            pid_file.display()
+        ),
+    );
+
+    let started = client
+        .call(
+            json!("start-natural-descendant"),
+            "runs.start",
+            json!({
+                "profile_id": "descendant_natural_exit",
+                "program": script.to_string_lossy(),
+                "args": []
+            }),
+        )
+        .await;
+    assert!(started.error.is_none(), "start err: {:?}", started.error);
+    let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let desc_pid: i64 = loop {
+        if let Ok(text) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = text.trim().parse::<i64>() {
+                break pid;
+            }
+        }
+        assert!(Instant::now() < deadline, "descendant did not write PID");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let final_rec = wait_for_run_done(&mut client, &run.run_id).await;
+    assert_eq!(final_rec.status, TaskStatus::Completed);
+    assert!(
+        atomium_core::process_start_time(desc_pid).is_none(),
+        "background descendant {desc_pid} survived normal leader exit"
+    );
+}
+
+#[tokio::test]
+async fn oauth_writeback_confined_read_rejects_symlink_fifo_and_oversized_projection() {
+    for case in ["symlink", "fifo", "large"] {
+        let srv = ServerHandle::start().await;
+        let mut client = RpcClient::connect(&srv.sock_path).await;
+        let profile_id = format!("confined_{case}");
+        let original = br#"{"id_token_email":"confined@example.test","token":{"access_token":"tok-confined-original"}}"#;
+        let cap = client
+            .call(
+                json!("cap"),
+                "subscriptions.capture",
+                json!({
+                    "profile_id": profile_id,
+                    "display_name": "Confined writeback probe",
+                    "raw_secret_b64": base64::engine::general_purpose::STANDARD.encode(original)
+                }),
+            )
+            .await;
+        assert!(cap.error.is_none(), "capture err: {:?}", cap.error);
+
+        let script = write_executable_script(
+            srv.dir.path(),
+            &format!("confined-{case}.sh"),
+            &format!(
+                r#"#!/bin/sh
+set -eu
+TOKEN_FILE="$HOME/{AGY_DEFAULT_RELATIVE_PATH}"
+case "{case}" in
+  symlink)
+    rm -f "$TOKEN_FILE"
+    printf '%s' x > "$TMPDIR/outside-oauth"
+    ln -s "$TMPDIR/outside-oauth" "$TOKEN_FILE"
+    ;;
+  fifo)
+    rm -f "$TOKEN_FILE"
+    mkfifo "$TOKEN_FILE"
+    ;;
+  large)
+    python3 -c 'import os; open(os.path.join(os.environ["HOME"], "{AGY_DEFAULT_RELATIVE_PATH}"), "w").write("x" * (2 * 1024 * 1024))'
+    ;;
+esac
+"#,
+            ),
+        );
+        let started = client
+            .call(
+                json!("start"),
+                "runs.start",
+                json!({
+                    "profile_id": profile_id,
+                    "program": script.to_string_lossy(),
+                    "args": []
+                }),
+            )
+            .await;
+        assert!(started.error.is_none(), "start err: {:?}", started.error);
+        let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+        let final_rec = wait_for_run_done(&mut client, &run.run_id).await;
+        assert_eq!(final_rec.status, TaskStatus::Completed);
+        assert!(!final_rec.token_refreshed, "{case} must not write back");
+        assert_eq!(
+            srv.state
+                .vault()
+                .read_blob(&format!("oauth_{profile_id}"))
+                .unwrap(),
+            original,
+            "{case} changed vault bytes"
+        );
+        let events = srv.state.leases().query_events_after(0).unwrap();
+        assert!(
+            events.iter().any(|ev| {
+                ev.run_id == run.run_id
+                    && matches!(
+                        &ev.payload,
+                        TaskEventPayload::LogLine { stream, line }
+                            if stream == "atomium" && line.contains("confined projection read failed")
+                    )
+            }),
+            "{case} did not emit a redacted write-back warning"
+        );
+    }
+}
+
+#[tokio::test]
+async fn run_record_live_events_and_replay_redact_args_and_token_patterns() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    let oauth_token = "sk-oauthexact123456789012345";
+    let raw = format!(
+        r#"{{"id_token_email":"pattern@example.test","token":{{"access_token":"{oauth_token}"}}}}"#
+    );
+    let cap = client
+        .call(
+            json!("cap"),
+            "subscriptions.capture",
+            json!({
+                "profile_id": "redact_patterns",
+                "display_name": "Redaction patterns",
+                "raw_secret_b64": base64::engine::general_purpose::STANDARD.encode(raw.as_bytes())
+            }),
+        )
+        .await;
+    assert!(cap.error.is_none(), "capture err: {:?}", cap.error);
+
+    let mut sub = RpcClient::connect(&srv.sock_path).await;
+    let subscribe = sub
+        .call(json!("sub"), "events.subscribe", json!({ "after_seq": 0 }))
+        .await;
+    assert!(subscribe.error.is_none());
+
+    let api_secret = "sk-argsecret123456789012345678";
+    let token_secret = "ya29.argtokensecret1234567890";
+    let bearer_secret = "Bearer bearersecret12345678901234567890";
+    let script = format!(
+        "python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ[\"HOME\"],\"{AGY_DEFAULT_RELATIVE_PATH}\")))[\"token\"][\"access_token\"])'; echo '{bearer_secret}'"
+    );
+    let started = client
+        .call(
+            json!("start"),
+            "runs.start",
+            json!({
+                "profile_id": "redact_patterns",
+                "program": "/bin/sh",
+                "args": ["-c", script, "--api-key", api_secret, "--token", token_secret]
+            }),
+        )
+        .await;
+    assert!(started.error.is_none(), "start err: {:?}", started.error);
+    let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+    let final_rec = wait_for_run_done(&mut client, &run.run_id).await;
+    assert_eq!(final_rec.status, TaskStatus::Completed);
+
+    let mut live = Vec::new();
+    loop {
+        let ev = sub.next_push_event().await;
+        let terminal = ev.run_id == run.run_id
+            && matches!(
+                &ev.payload,
+                TaskEventPayload::StatusChanged { status, .. } if *status == TaskStatus::Completed
+            );
+        live.push(ev);
+        if terminal {
+            break;
+        }
+    }
+    let live_json = serde_json::to_string(&live).unwrap();
+    for plaintext in [oauth_token, api_secret, token_secret, bearer_secret] {
+        assert!(
+            !live_json.contains(plaintext),
+            "live events contain plaintext credential material"
+        );
+    }
+
+    let replay = srv.state.leases().query_events_after(0).unwrap();
+    let replay_json = serde_json::to_string(&replay).unwrap();
+    for plaintext in [oauth_token, api_secret, token_secret, bearer_secret] {
+        assert!(
+            !replay_json.contains(plaintext),
+            "replayed events contain plaintext credential material"
+        );
+    }
+
+    fn digest_marker(secret: &str) -> String {
+        let digest = EncryptedVault::digest_hex(secret.as_bytes());
+        format!("<redacted:sha256:{}>", &digest[..12])
+    }
+    assert!(live_json.contains(&digest_marker(oauth_token)));
+    assert!(live_json.contains(&digest_marker(bearer_secret)));
+
+    let record_json = serde_json::to_string(&final_rec).unwrap();
+    for plaintext in [api_secret, token_secret] {
+        assert!(
+            !record_json.contains(plaintext),
+            "RunRecord contains plaintext argv secret"
+        );
+    }
+    assert!(record_json.contains(&digest_marker(api_secret)));
+    assert!(record_json.contains(&digest_marker(token_secret)));
 }

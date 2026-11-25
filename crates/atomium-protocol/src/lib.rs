@@ -189,6 +189,7 @@ pub struct RunCancelRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct SubscriptionCaptureRequest {
     pub profile_id: String,
@@ -196,7 +197,6 @@ pub struct SubscriptionCaptureRequest {
     pub agent_kind: Option<String>,
     pub storage_mode: Option<OAuthStorageMode>,
     pub raw_secret_b64: Option<String>,
-    pub source_file_path: Option<String>,
     #[serde(default)]
     pub upstream_proxy_id: Option<String>,
     #[serde(default)]
