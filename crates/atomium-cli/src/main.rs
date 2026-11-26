@@ -220,8 +220,6 @@ enum ApprovalCommands {
         #[arg(long)]
         action_kind: Option<String>,
         #[arg(long)]
-        target_dir: Option<PathBuf>,
-        #[arg(long)]
         summary: Option<String>,
     },
     /// List pending approvals
@@ -674,7 +672,6 @@ async fn main() -> Result<()> {
                     candidate_digest,
                     run_id,
                     action_kind,
-                    target_dir,
                     summary,
                 } => {
                     let req = ApprovalCreateRequest {
@@ -682,7 +679,6 @@ async fn main() -> Result<()> {
                         candidate_digest,
                         run_id,
                         action_kind,
-                        target_dir: target_dir.map(|p| p.to_string_lossy().into_owned()),
                         summary,
                     };
                     let res =

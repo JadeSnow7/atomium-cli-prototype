@@ -39,7 +39,7 @@ CLI 在本进程通过 Security.framework 读取 agy 的 Keychain 槽位，macOS
 
 输出包含 `content_digest` 和 `snapshot_version`。`--tz` 和 `--lang` 是可选的手动设置，省略时跟随本机。
 
-文件捕获在各平台均可用，使用 `--source-file <json>`。文件须为普通文件且不超过 1 MiB。非 macOS 平台必须指定该选项。
+文件捕获在各平台均可用，使用 `--source-file <json>`。CLI 只读取不超过 1 MiB 的普通文件。daemon 对收到的 OAuth 原始内容和规范化后的内容分别执行 256 KiB 上限。非 macOS 平台必须指定该选项。
 
 OAuth 数据中 `access_token`、`refresh_token`、`id_token`、`client_secret`、`api_key`、`private_key`、`password`、`secret` 的字符串值须至少 16 字节，包括嵌套字段。`token_type`、`expiry` 等元数据可以更短。捕获和刷新写回都会校验此规则，刷新被拒绝时保留原 Vault 快照。已有短凭据快照会阻止运行启动，请重新捕获有效凭据。运行中一旦观察到含短凭据的投影，该 run 后续 stdout/stderr 持续只记录逐行摘要。
 

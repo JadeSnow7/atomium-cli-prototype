@@ -398,7 +398,6 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
       candidate_digest: cand.candidate_digest,
       run_id: startedRun.run_id,
       action_kind: "export_patch",
-      target_dir: null,
       summary: null,
     });
     assert.equal(appr.action_kind, "export_patch");
@@ -451,6 +450,7 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
     });
     assert.equal(exportRes.resolved, true);
     assert.equal(exportRes.export_result.exported, true);
+    assert.equal(exportRes.export_result.post_verify_ok, true);
     assert.equal(await fs.readFile(path.join(hostRepo, "src", "app.txt"), "utf8"), "candidate-v2\n");
     assert.equal(await fs.readFile(path.join(hostRepo, "added.txt"), "utf8"), "new-file\n");
     assert.equal(await fs.readFile(path.join(hostRepo, ".env"), "utf8"), "SECRET=exclude-me\n");

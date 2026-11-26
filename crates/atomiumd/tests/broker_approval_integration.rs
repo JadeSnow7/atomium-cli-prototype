@@ -232,23 +232,25 @@ async fn full_dual_role_broker_review_approval_and_atomic_export_loop() {
         & 0o777;
     assert_eq!(frozen_mode, 0o400, "reviewer frozen file must be read-only");
 
-    // 5. approvals.request rejects cross-directory target_dir outside imported workspace scope (-32012)
+    // 5. Approval creation rejects every caller-supplied host target, including legacy null.
     let other_dir = TempDirGuard::new("host-ws-other");
-    let bad_target = client
-        .call(
-            json!(61),
-            "approvals.request",
-            json!({
-                "candidate_id": cand.candidate_id,
-                "candidate_digest": cand.candidate_digest,
-                "target_dir": other_dir.path().to_string_lossy()
-            }),
-        )
-        .await;
-    assert_eq!(
-        bad_target.error.expect("cross-dir target rejected").code,
-        -32012
-    );
+    for target in [Value::Null, json!(other_dir.path().to_string_lossy())] {
+        let bad_target = client
+            .call(
+                json!(61),
+                "approvals.request",
+                json!({
+                    "candidate_id": cand.candidate_id,
+                    "candidate_digest": cand.candidate_digest,
+                    "target_dir": target
+                }),
+            )
+            .await;
+        assert_eq!(
+            bad_target.error.expect("caller target rejected").code,
+            -32602
+        );
+    }
 
     // 5b. approvals.request creates persistent approval and pushes real-time ApprovalRequested
     let req_appr = client
@@ -268,6 +270,7 @@ async fn full_dual_role_broker_review_approval_and_atomic_export_loop() {
     );
     let approval: ApprovalRequest = serde_json::from_value(req_appr.result.unwrap()).unwrap();
     assert_eq!(approval.action_kind, "export_patch");
+    assert_eq!(approval.target_dir.as_deref(), Some(ws.source_dir.as_str()));
     assert_eq!(approval.candidate_digest, cand.candidate_digest);
     assert_eq!(
         approval.baseline_digest.as_deref(),

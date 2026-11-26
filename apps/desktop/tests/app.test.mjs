@@ -286,6 +286,7 @@ test('panelController actions handle host-slot activation, start/cancel run, liv
               applied_added: 1,
               applied_modified: 2,
               applied_deleted: 0,
+              post_verify_ok: true,
               exported_at_ms: 9999,
             }
           : undefined,
@@ -382,4 +383,43 @@ test('panelController actions handle host-slot activation, start/cancel run, liv
     payload: { type: 'status_changed', status: 'completed', reason: null },
   });
   assert.equal(state.runs[0].status, 'completed');
+});
+
+
+test('Export approval displays post-verify results in both notice and receipt', async () => {
+  const React = require('react');
+  const { renderToStaticMarkup } = require('react-dom/server');
+  const { resolveApprovalAction } = loadDesktopModules();
+  const { ReviewApprovalPanel } = require(resolve(appRoot, '.test-dist/apps/desktop/src/components/ReviewApprovalPanel.js'));
+  const approval = { approval_id: 'appr-verify', candidate_digest: 'sha256:c', baseline_digest: null, patch_digest: null };
+  for (const verified of [true, false, null, undefined]) {
+    const receipt = { exported: true, approval_id: approval.approval_id, candidate_id: 'cand-1', workspace_id: 'ws-1', target_dir: '/tmp/repo', applied_added: 1, applied_modified: 0, applied_deleted: 0, post_verify_ok: verified };
+    const { client } = createMockClient({ 'approvals.resolve': () => ({ resolved: true, export_result: receipt }) });
+    const result = await resolveApprovalAction(client, approval, true);
+    const label = verified == null ? 'unknown' : String(verified);
+    assert.match(result.notice.detail, new RegExp(`post_verify_ok=${label}`));
+    assert.equal(result.notice.kind, verified === false ? 'error' : verified == null ? 'info' : 'ok');
+    const html = renderToStaticMarkup(React.createElement(ReviewApprovalPanel, { approvals: [], candidates: [], lastExportReceipt: receipt, busy: false, onRequestApproval() {}, onResolveApproval() {} }));
+    assert.match(html, new RegExp(`post_verify_ok=${label}`));
+    assert.match(html, new RegExp(`banner ${verified === false ? 'error' : verified == null ? 'info' : 'ok'}`));
+  }
+});
+
+test('Export inconsistency gives manual recovery guidance in approval feedback', async () => {
+  const { resolveApprovalAction } = loadDesktopModules();
+  const { client } = createMockClient({ 'approvals.resolve': () => ({ __error: { code: -32018, message: 'workspace export inconsistent', data: { kind: 'export_inconsistent' } } }) });
+  const result = await resolveApprovalAction(client, { approval_id: 'appr-1', candidate_digest: 'sha256:c', baseline_digest: null, patch_digest: null }, true);
+  assert.equal(result.receipt, null);
+  assert.equal(result.notice.kind, 'error');
+  assert.match(result.notice.title, /Export Inconsistent/);
+  assert.match(result.notice.detail, /journal|backup/i);
+  assert.match(result.notice.detail, /manual|manually/i);
+  assert.match(result.notice.detail, /import/i);
+});
+
+test('Desktop approval requests omit host target paths', async () => {
+  const { requestCandidateApprovalAction } = loadDesktopModules();
+  const { client, sent } = createMockClient({ 'approvals.request': () => ({ approval_id: 'appr-1', candidate_digest: 'sha256:c' }) });
+  await requestCandidateApprovalAction(client, { candidate_id: 'cand-1', candidate_digest: 'sha256:c', run_id: null });
+  assert.equal(Object.hasOwn(sent.find(frame => frame.method === 'approvals.request').params, 'target_dir'), false);
 });

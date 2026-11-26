@@ -2809,32 +2809,7 @@ async fn handle_approvals_request(
     }
 
     let action_kind = req.action_kind.unwrap_or_else(|| "export_patch".into());
-    let target_dir = match req.target_dir {
-        Some(requested_target) => {
-            let canon_req = fs::canonicalize(&requested_target).map_err(|_| {
-                (
-                    -32012,
-                    format!("target_dir does not exist: {requested_target}"),
-                    None,
-                )
-            })?;
-            let canon_src = fs::canonicalize(&workspace.source_dir)
-                .unwrap_or_else(|_| PathBuf::from(&workspace.source_dir));
-            if canon_req != canon_src {
-                return Err((
-                    -32012,
-                    format!(
-                        "broker_policy_violation: target_dir {} is outside imported workspace scope {}",
-                        canon_req.display(),
-                        canon_src.display()
-                    ),
-                    None,
-                ));
-            }
-            canon_req.to_string_lossy().into_owned()
-        }
-        None => workspace.source_dir.clone(),
-    };
+    let target_dir = workspace.source_dir.clone();
     let summary = req.summary.unwrap_or_else(|| {
         format!(
             "Export candidate {} (+{} ~{} -{}) to {}",

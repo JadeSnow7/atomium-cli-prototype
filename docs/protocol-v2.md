@@ -80,6 +80,7 @@ PresenceProof {
 | `runs.start` 同时拒绝小于 16 字节的历史 API key，以及含上述短敏感叶子的 ADC JSON。ADC 按自身 JSON 格式校验敏感叶子 | 在 spawn 前保护全部凭据类型，失败时释放租约 |
 | 已弃用的 `HostKeychainSlot` 模式从运行开始仅记录 stdout/stderr 的逐行摘要；daemon 在运行日志路径中不读取宿主 Keychain | 避免运行中刷新产生的未知凭据进入审计 |
 | `SubscriptionCaptureRequest` 删除 `source_file_path`；捕获请求启用严格字段校验。CLI 的 `--source-file` 改为由 CLI 在本进程读取文件后通过 `raw_secret_b64` 提交，守护进程不再按 RPC 调用方给定的宿主路径读取凭据 | 遵守“除 `workspaces.import.source_dir` 外 RPC 不接受任意宿主路径”的边界 |
+| `ApprovalCreateRequest` 删除 `target_dir`。目标目录由 daemon 根据候选关联的工作区记录确定。携带旧字段的审批请求（包括 `target_dir: null`）返回 `-32602`，升级客户端后重新发起审批。审批记录和回执仍可显示 daemon 确定的目标 | 确保只有 `workspaces.import.source_dir` 接受客户端指定的宿主路径 |
 | JSON-RPC 单帧上限固定为 1 MiB，超限直接断开连接 | 防止单连接内存放大与审计存储资源耗尽 |
 | `subscriptions.capture` 的原始与规范化 OAuth 载荷上限为 256 KiB | 防止 Vault / SQLite / 事件存储资源耗尽 |
 | `runs.start.env` 拒绝 `DYLD_*`、`LD_*`、代理变量、`PATH`、隔离目录变量、`ATOMIUM_*`、SSH/Git 执行入口等保留或高风险键，并限制键值数量与长度 | 防止调用方劫持 `sandbox-exec`/动态链接器、覆盖单端口网关或伪造运行时身份 |
@@ -87,7 +88,7 @@ PresenceProof {
 | OAuth 捕获与刷新写回只接受结构合法的 agy JSON（`id_token_email` + `token` 对象），且刷新写回必须与快照原身份一致；身份变化或畸形载荷只拒绝写回并记录审计事件，不覆盖 Vault | 防止子进程用垃圾数据或其他账号凭据覆写已知良好的 Vault 快照，落实禁止自动换号红线 |
 | 隔离 `$HOME` 中投影 OAuth 的写回读取拒绝符号链接路径组件；运行首领进程正常退出后也会收尾终止整个进程组 | 防止子进程利用符号链接诱导守护进程读取宿主文件，或留下运行结束后的后台孤儿进程 |
 | `runs.start.allowed_egress_hosts` 只接受可解析的精确主机（可选端口）或通配符条目；畸形条目在 RPC 边界拒绝，直接构造代理时也会 fail closed。网关把十进制/八进制/十六进制等非规范 IPv4 数字形式按解析后的地址分类，拒绝用 `127.1`、整数或十六进制形式绕过非公网地址拦截 | 防止拼写错误的策略被静默放宽为无限制出网，并防止替代数字编码绕过回环、链路本地、CGNAT 或文档前缀拦截 |
-| `ExportResult` 新增可选字段 `post_verify_ok`；导出改为 `broker_dir/exports/<export_id>/journal.json` 记录的准备-提交-回滚流程，守护进程启动时自动恢复未完成导出。回滚失败的工作区进入 `export_inconsistent`，后续导出返回 `-32018` | 防止导出中途崩溃造成宿主工作区处于无审计、不可恢复的中间状态 |
+| `ExportResult` 新增可选字段 `post_verify_ok`；导出改为 `broker_dir/exports/<export_id>/journal.json` 记录的准备、提交、复核及回滚流程。每次尝试生成独立的 `exp-<UUIDv7>`，可用 journal 中的 `approval_id` 与回执关联，守护进程启动时自动恢复未完成导出。回滚失败的工作区进入 `export_inconsistent`，后续导出返回 `-32018` | 防止导出中途崩溃造成宿主工作区处于无审计、不可恢复的中间状态 |
 | 带 `workspace_id` 的运行在 `runs.start` 租约原子获取阶段同时获取 `workspace:<workspace_id>` Exclusive 租约；正常结束、取消、超时和僵尸租约回收路径都释放该租约 | 防止多个写入者并发修改同一 Broker 工作副本 |
 
 ## 5. v2 类型（已确定，按里程碑实现）
@@ -214,7 +215,9 @@ struct DeviceRecord { device_id: String, display_name: String, platform: String,
 | -32015 | 授权已过期或次数用尽 | v2 |
 | -32016 | 达到平台上限（例如同时只能运行 2 台 macOS VM） | v2 |
 | -32017 | 调用方未通过签名校验 | v2 |
-| -32018 | 工作区导出回滚失败，处于 `export_inconsistent` | 已用 |
+| -32018 | 工作区导出恢复失败，已暂停后续导出。保留原工作区，在 daemon 的 `broker_dir/exports/exp-*/journal.json` 中按 `workspace_id` 和 `approval_id` 找到该次尝试。保留 journal 与备份，核对宿主文件和权限，从可信备份恢复后重新导入为新工作区，重新冻结并审批。旧工作区保留供审计 | 已用 |
+
+旧基线可能在写入回执之前就已将 journal 标为 `committed`。新恢复流程处理 `verifying` 和 `rolling_back`，升级前已终结为 `committed` 且缺少回执的历史记录需要人工核对。
 
 ## 8. 状态机
 

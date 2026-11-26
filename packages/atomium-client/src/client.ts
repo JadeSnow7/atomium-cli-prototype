@@ -68,6 +68,15 @@ export class AtomiumRpcError extends Error {
     );
   }
 
+  isExportInconsistent(): boolean {
+    return (
+      this.code === -32018 ||
+      (typeof this.data === "object" &&
+        this.data !== null &&
+        (this.data as { kind?: unknown }).kind === "export_inconsistent")
+    );
+  }
+
   asBaselineConflict(): BaselineConflictData | null {
     if (!this.isBaselineConflict()) return null;
     if (typeof this.data === "object" && this.data !== null) {

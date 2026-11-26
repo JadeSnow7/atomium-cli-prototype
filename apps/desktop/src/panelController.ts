@@ -17,7 +17,7 @@ import {
 } from "@atomium/client";
 
 export interface FeedbackNotice {
-  kind: "ok" | "error";
+  kind: "ok" | "info" | "error";
   title: string;
   detail: string;
   conflict?: BaselineConflictData | null;
@@ -287,7 +287,6 @@ export async function requestCandidateApprovalAction(
       candidate_digest: candidate.candidate_digest,
       run_id: candidate.run_id,
       action_kind: "export_patch",
-      target_dir: null,
       summary: null,
     });
     return {
@@ -300,6 +299,19 @@ export async function requestCandidateApprovalAction(
     };
   } catch (err) {
     return { approval: null, notice: errorToNotice("Failed to request approval", err) };
+  }
+}
+
+export function exportVerificationFeedback(
+  verified: boolean | null | undefined,
+): { kind: FeedbackNotice["kind"]; label: string; title: string } {
+  switch (verified) {
+    case true:
+      return { kind: "ok", label: "true", title: "Approved & exported" };
+    case false:
+      return { kind: "error", label: "false", title: "Export verification failed for" };
+    default:
+      return { kind: "info", label: "unknown", title: "Export verification unknown for" };
   }
 }
 
@@ -318,12 +330,13 @@ export async function resolveApprovalAction(
     });
     if (approved && res.export_result) {
       const r = res.export_result;
+      const verification = exportVerificationFeedback(r.post_verify_ok);
       return {
         receipt: r,
         notice: {
-          kind: "ok",
-          title: `Approved & exported ${r.candidate_id}`,
-          detail: `Applied +${r.applied_added} ~${r.applied_modified} -${r.applied_deleted} to ${r.target_dir}`,
+          kind: verification.kind,
+          title: `${verification.title} ${r.candidate_id}`,
+          detail: `Applied +${r.applied_added} ~${r.applied_modified} -${r.applied_deleted} to ${r.target_dir}. post_verify_ok=${verification.label}`,
         },
       };
     }
@@ -338,6 +351,16 @@ export async function resolveApprovalAction(
       },
     };
   } catch (err) {
+    if (err instanceof AtomiumRpcError && err.isExportInconsistent()) {
+      return {
+        receipt: null,
+        notice: {
+          kind: "error",
+          title: "Export Inconsistent — Manual Recovery Required",
+          detail: "Further exports are blocked. Preserve the export journal and backups, manually inspect and reconcile the host workspace, then import the verified directory as a new workspace before exporting again.",
+        },
+      };
+    }
     if (err instanceof AtomiumRpcError && err.isBaselineConflict()) {
       const conflict = err.asBaselineConflict();
       const drifted = conflict?.drifted_paths.length

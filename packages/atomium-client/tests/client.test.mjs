@@ -263,7 +263,7 @@ test('typed RPC helpers send expected methods, unwrap envelopes, and handle BigI
   assert.equal((await client.freezeCandidate({ workspace_id: 'ws-1', run_id: null, limits: null })).candidate_id, 'cand-1');
   assert.equal((await client.listCandidates('ws-1')).length, 1);
   assert.equal((await client.getCandidate({ candidate_digest: 'sha256:cand' })).candidate_id, 'cand-1');
-  assert.equal((await client.requestApproval({ candidate_id: 'cand-1', candidate_digest: 'sha256:cand', run_id: null, action_kind: null, target_dir: null, summary: null })).approval_id, 'appr-1');
+  assert.equal((await client.requestApproval({ candidate_id: 'cand-1', candidate_digest: 'sha256:cand', run_id: null, action_kind: null, summary: null })).approval_id, 'appr-1');
   assert.equal((await client.listApprovals()).length, 1);
   assert.equal((await client.resolveApproval({ approval_id: 'appr-1', candidate_digest: 'sha256:cand', approved: true, baseline_digest: null, patch_digest: null })).resolved, true);
 });
@@ -306,4 +306,12 @@ test('AtomiumRpcError exposes baseline_conflict structured data', async () => {
     });
     return true;
   });
+});
+
+
+test('AtomiumRpcError recognizes export inconsistency by code or structured kind', () => {
+  assert.equal(new AtomiumRpcError(-32018, 'rollback failed').isExportInconsistent(), true);
+  assert.equal(new AtomiumRpcError(-32000, 'recovery failed', { kind: 'export_inconsistent' }).isExportInconsistent(), true);
+  assert.equal(new AtomiumRpcError(-32010, 'baseline conflict').isExportInconsistent(), false);
+  assert.equal(new AtomiumRpcError(-32000, 'internal error', null).isExportInconsistent(), false);
 });

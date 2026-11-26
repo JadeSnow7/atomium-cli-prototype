@@ -1,4 +1,5 @@
 import React from "react";
+import { exportVerificationFeedback } from "../panelController";
 import type {
   ApprovalRequest,
   CandidateSnapshot,
@@ -50,6 +51,7 @@ export function ReviewApprovalPanel({
   onRequestApproval,
   onResolveApproval,
 }: ReviewApprovalPanelProps) {
+  const verification = exportVerificationFeedback(lastExportReceipt?.post_verify_ok);
   const candidateById = new Map<string, CandidateSnapshot>();
   for (const c of candidates) {
     candidateById.set(c.candidate_id, c);
@@ -66,11 +68,14 @@ export function ReviewApprovalPanel({
       </div>
 
       {lastExportReceipt ? (
-        <div className="banner ok mono">
+        <div
+          className={`banner ${verification.kind} mono`}
+          role={verification.kind === "error" ? "alert" : "status"}
+        >
           Export Receipt: candidate={lastExportReceipt.candidate_id} approval=
           {lastExportReceipt.approval_id} target={lastExportReceipt.target_dir} (+
           {lastExportReceipt.applied_added} ~{lastExportReceipt.applied_modified} -
-          {lastExportReceipt.applied_deleted})
+          {lastExportReceipt.applied_deleted}) post_verify_ok={verification.label}
         </div>
       ) : null}
 

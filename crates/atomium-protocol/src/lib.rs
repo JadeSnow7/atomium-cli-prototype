@@ -413,6 +413,7 @@ pub struct CandidateSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalCreateRequest {
     pub candidate_id: String,
     pub candidate_digest: String,
@@ -420,8 +421,6 @@ pub struct ApprovalCreateRequest {
     pub run_id: Option<String>,
     #[serde(default)]
     pub action_kind: Option<String>,
-    #[serde(default)]
-    pub target_dir: Option<String>,
     #[serde(default)]
     pub summary: Option<String>,
 }

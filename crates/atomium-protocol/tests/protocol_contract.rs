@@ -519,7 +519,6 @@ fn broker_and_approval_m3_types_roundtrip() {
         candidate_digest: "sha256:cand".into(),
         run_id: Some("run-1".into()),
         action_kind: Some("export_patch".into()),
-        target_dir: Some("/tmp/repo".into()),
         summary: Some("Export cand-1".into()),
     };
     assert_json_roundtrip(&create_appr);
@@ -550,4 +549,19 @@ fn broker_and_approval_m3_types_roundtrip() {
     };
     let v_exp = assert_json_roundtrip(&export);
     assert_eq!(v_exp["exported"], true);
+}
+
+#[test]
+fn approval_create_rejects_host_paths_including_legacy_null() {
+    for target in [serde_json::Value::Null, json!("/tmp/untrusted-target")] {
+        let request =
+            json!({"candidate_id":"cand-1", "candidate_digest":"sha256:cand", "target_dir":target});
+        assert!(serde_json::from_value::<ApprovalCreateRequest>(request).is_err());
+    }
+    let request = json!({"candidate_id":"cand-1", "candidate_digest":"sha256:cand"});
+    let parsed: ApprovalCreateRequest = serde_json::from_value(request).unwrap();
+    assert!(serde_json::to_value(parsed)
+        .unwrap()
+        .get("target_dir")
+        .is_none());
 }

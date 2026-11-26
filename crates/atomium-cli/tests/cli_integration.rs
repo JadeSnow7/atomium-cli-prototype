@@ -662,3 +662,22 @@ async fn workspace_candidate_and_approval_cli_subcommands_end_to_end() {
 
     daemon_task.abort();
 }
+
+#[test]
+fn approval_request_rejects_removed_target_dir_option() {
+    let output = Command::new(cli_bin())
+        .args([
+            "approval",
+            "request",
+            "--candidate-id",
+            "cand-1",
+            "--candidate-digest",
+            "sha256:cand",
+            "--target-dir",
+            "/tmp/untrusted-target",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--target-dir'"));
+}

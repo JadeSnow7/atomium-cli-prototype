@@ -302,7 +302,7 @@ export function App({ initialState, injectedClient = null }: AppProps = {}) {
       {state.notice ? (
         <div
           role={state.notice.kind === "error" ? "alert" : "status"}
-          className={`banner ${state.notice.kind === "error" ? "error" : "ok"}`}
+          className={`banner ${state.notice.kind}`}
         >
           <strong>{state.notice.title}: </strong>
           <span>{state.notice.detail}</span>
