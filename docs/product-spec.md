@@ -118,7 +118,7 @@
 
 - **硬性保证**：守护进程知道的确切凭据材料（投影的 OAuth 原文、keychain 包装形态、OAuth JSON 中的 `access_token` / `refresh_token` / `id_token` / API key 等字段）在进入持久化事件、`RunRecord.args`、实时 `events.push` 与 stdout/stderr 日志前，必须替换为 `<redacted:sha256:前12位hex>`。测试也只能比较摘要或断言明文不存在，不能打印明文。
 - **尽力而为**：`sk-...`、`ya29....`、`AIza...`、`Bearer ...`、JWT 三段式和高熵 base64 串使用模式匹配补充拦截。模式匹配不是协议级保证，不能替代凭据不进入 Box 的设计。
-- 单行日志和每流持久化总量都有上限；`--token`、`--api-key`、`--password`、`--secret` 等参数值无论用 `=` 还是分开书写，持久化时都必须脱敏。子进程实际收到的 argv 不变。
+- stdout/stderr 按逻辑行脱敏。正文超过 8 KiB 时，守护进程读至换行或 EOF，整行只记录一次截断提示。每个流的持久化额度为 1 MiB。`--token`、`--api-key`、`--password`、`--secret` 等参数值无论用 `=` 还是分开书写，持久化时都必须脱敏。子进程仍收到原始 argv。
 
 ### 7.3 工作区导出一致性语义
 

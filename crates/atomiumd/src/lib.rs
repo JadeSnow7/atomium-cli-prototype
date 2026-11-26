@@ -40,6 +40,7 @@ const EVENT_BROADCAST_CAPACITY: usize = 1024;
 pub const MAX_RPC_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CAPTURED_SECRET_BYTES: usize = 256 * 1024;
 const MAX_LOG_LINE_BYTES: usize = 8 * 1024;
+const TRUNCATED_CHILD_LINE: &str = "[atomium] log line truncated after 8192 bytes";
 const MAX_LOG_STREAM_BYTES: usize = 1024 * 1024;
 const MAX_CONCURRENT_RUNS: usize = 32;
 
@@ -401,39 +402,66 @@ fn oauth_log_redactor(decoded: &[u8], stored: &[u8]) -> SecretRedactor {
     redactor
 }
 
-async fn read_bounded_child_line<R>(reader: &mut BufReader<R>) -> Result<Option<String>>
+enum ChildLogLine {
+    Text(String),
+    Truncated,
+}
+
+impl ChildLogLine {
+    fn into_audit_text(self, digest_only: bool) -> String {
+        match self {
+            Self::Text(text) if digest_only => redaction_replacement(&text),
+            Self::Text(text) => text,
+            // This records discarded input, so it must not look like a digest of that input.
+            Self::Truncated => TRUNCATED_CHILD_LINE.into(),
+        }
+    }
+}
+
+async fn read_bounded_child_line<R>(reader: &mut BufReader<R>) -> Result<Option<ChildLogLine>>
 where
     R: AsyncRead + Unpin,
 {
+    // One additional byte distinguishes an exact-size CRLF line from oversized content.
     let mut out = Vec::new();
+    let mut oversized = false;
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
-            return if out.is_empty() {
+            return if oversized || out.len() > MAX_LOG_LINE_BYTES {
+                Ok(Some(ChildLogLine::Truncated))
+            } else if out.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(String::from_utf8_lossy(&out).into_owned()))
+                Ok(Some(ChildLogLine::Text(
+                    String::from_utf8_lossy(&out).into_owned(),
+                )))
             };
         }
 
         let newline_pos = available.iter().position(|b| *b == b'\n');
-        let remaining = MAX_LOG_LINE_BYTES.saturating_sub(out.len()).max(1);
-        let take = newline_pos
-            .map(|pos| pos + 1)
-            .unwrap_or(available.len())
-            .min(available.len())
-            .min(remaining);
-        out.extend_from_slice(&available[..take]);
+        let content_len = newline_pos.unwrap_or(available.len());
+        let take = content_len + usize::from(newline_pos.is_some());
+        if !oversized {
+            if out.len() + content_len > MAX_LOG_LINE_BYTES + 1 {
+                oversized = true;
+                out.clear();
+            } else {
+                out.extend_from_slice(&available[..content_len]);
+            }
+        }
         reader.consume(take);
 
-        if newline_pos.is_some_and(|pos| take == pos + 1) || out.len() >= MAX_LOG_LINE_BYTES {
-            if out.last() == Some(&b'\n') {
-                out.pop();
-            }
+        if newline_pos.is_some() {
             if out.last() == Some(&b'\r') {
                 out.pop();
             }
-            return Ok(Some(String::from_utf8_lossy(&out).into_owned()));
+            if oversized || out.len() > MAX_LOG_LINE_BYTES {
+                return Ok(Some(ChildLogLine::Truncated));
+            }
+            return Ok(Some(ChildLogLine::Text(
+                String::from_utf8_lossy(&out).into_owned(),
+            )));
         }
     }
 }
@@ -2141,20 +2169,18 @@ async fn handle_runs_start(
                 let mut reader = BufReader::new(out);
                 let mut emitted_bytes = 0usize;
                 let mut truncation_notified = false;
-                while let Ok(Some(mut line)) = read_bounded_child_line(&mut reader).await {
+                while let Ok(Some(line)) = read_bounded_child_line(&mut reader).await {
                     if truncation_notified {
                         continue;
                     }
                     let mut redactor = log_redactor.lock().expect("run redactor lock poisoned");
                     // Refresh can switch this very line to digest-only output.
-                    if (emitted_bytes < MAX_LOG_STREAM_BYTES
+                    let digest_only = (emitted_bytes < MAX_LOG_STREAM_BYTES
                         && redactor
                             .refresh(&run_home, projected_relative_path.as_deref())
                             .is_err())
-                        || redactor.digest_only
-                    {
-                        line = redaction_replacement(&line);
-                    }
+                        || redactor.digest_only;
+                    let line = line.into_audit_text(digest_only);
                     emit_bounded_log_line(
                         &st,
                         &rid,
@@ -2178,20 +2204,18 @@ async fn handle_runs_start(
                 let mut reader = BufReader::new(err_pipe);
                 let mut emitted_bytes = 0usize;
                 let mut truncation_notified = false;
-                while let Ok(Some(mut line)) = read_bounded_child_line(&mut reader).await {
+                while let Ok(Some(line)) = read_bounded_child_line(&mut reader).await {
                     if truncation_notified {
                         continue;
                     }
                     let mut redactor = log_redactor.lock().expect("run redactor lock poisoned");
                     // Refresh can switch this very line to digest-only output.
-                    if (emitted_bytes < MAX_LOG_STREAM_BYTES
+                    let digest_only = (emitted_bytes < MAX_LOG_STREAM_BYTES
                         && redactor
                             .refresh(&run_home, projected_relative_path.as_deref())
                             .is_err())
-                        || redactor.digest_only
-                    {
-                        line = redaction_replacement(&line);
-                    }
+                        || redactor.digest_only;
+                    let line = line.into_audit_text(digest_only);
                     emit_bounded_log_line(
                         &st,
                         &rid,
@@ -3096,6 +3120,60 @@ mod workspace_freeze_review_tests {
 #[cfg(test)]
 mod gemini_review_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_child_lines_keep_exact_boundaries_and_consume_complete_lines() {
+        for capacity in [1, 7, MAX_LOG_LINE_BYTES] {
+            for len in [
+                0,
+                MAX_LOG_LINE_BYTES - 1,
+                MAX_LOG_LINE_BYTES,
+                MAX_LOG_LINE_BYTES + 1,
+                65536,
+            ] {
+                for ending in ["\n", "\r\n", ""] {
+                    let content = "x".repeat(len);
+                    let input = if ending.is_empty() {
+                        content.clone()
+                    } else {
+                        format!("{content}{ending}next\r\n")
+                    };
+                    let mut reader = BufReader::with_capacity(capacity, input.as_bytes());
+                    let line = read_bounded_child_line(&mut reader).await.unwrap();
+                    if len > MAX_LOG_LINE_BYTES {
+                        assert!(matches!(line, Some(ChildLogLine::Truncated)));
+                    } else if len == 0 && ending.is_empty() {
+                        assert!(line.is_none());
+                    } else {
+                        assert!(matches!(line, Some(ChildLogLine::Text(text)) if text == content));
+                    }
+                    if !ending.is_empty() {
+                        let next = read_bounded_child_line(&mut reader).await.unwrap();
+                        assert!(matches!(next, Some(ChildLogLine::Text(text)) if text == "next"));
+                    }
+                    assert!(read_bounded_child_line(&mut reader)
+                        .await
+                        .unwrap()
+                        .is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_child_line_drains_large_generated_stream_without_retaining_fragments() {
+        use tokio::io::AsyncReadExt;
+        let source = tokio::io::repeat(b'x').take(16 * 1024 * 1024);
+        let mut reader = BufReader::with_capacity(1024, source);
+        assert!(matches!(
+            read_bounded_child_line(&mut reader).await.unwrap(),
+            Some(ChildLogLine::Truncated)
+        ));
+        assert!(read_bounded_child_line(&mut reader)
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn repeated_observations_keep_each_secret_fragment_once() {

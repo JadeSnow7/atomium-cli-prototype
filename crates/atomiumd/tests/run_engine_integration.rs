@@ -2183,6 +2183,120 @@ for output in (sys.stdout,sys.stderr):
 }
 
 #[tokio::test]
+async fn oversized_log_lines_are_marked_once_in_both_modes_and_all_event_paths() {
+    for digest_only in [false, true] {
+        let srv = ServerHandle::start().await;
+        let mut client = RpcClient::connect(&srv.sock_path).await;
+        let raw = br#"{"id_token_email":"bounded@example.test","token":{"access_token":"synthetic-bounded-log-material"}}"#;
+        let mut capture = json!({
+            "profile_id": "bounded_logs",
+            "display_name": "Bounded logs",
+            "raw_secret_b64": base64::engine::general_purpose::STANDARD.encode(raw)
+        });
+        if digest_only {
+            capture["storage_mode"] = json!({
+                "storage": "host_keychain_slot", "service": "gemini", "account": "antigravity"
+            });
+        }
+        assert!(client
+            .call(json!("cap"), "subscriptions.capture", capture)
+            .await
+            .error
+            .is_none());
+        let mut subscriber = RpcClient::connect(&srv.sock_path).await;
+        assert!(subscriber
+            .call(json!("sub"), "events.subscribe", json!({"after_seq": 0}))
+            .await
+            .error
+            .is_none());
+        let script = r#"import sys
+credential='synthetic-bounded-'+'log-material'
+for output in (sys.stdout,sys.stderr):
+    output.write('ordinary diagnostic\n')
+    output.write('n'*8192+'\r\n')
+    output.write('p'*(8192-5)+credential+'\r\n')
+    output.write('credential='+credential+'\n')
+    output.write('next diagnostic\n')
+    output.write('e'*65536)
+    output.flush()
+"#;
+        let started = client.call(json!("start"), "runs.start", json!({
+            "profile_id": "bounded_logs", "program": "/usr/bin/python3", "args": ["-c", script]
+        })).await;
+        assert!(started.error.is_none());
+        let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+        assert_eq!(
+            wait_for_run_done(&mut client, &run.run_id).await.status,
+            TaskStatus::Completed
+        );
+        let mut live = Vec::new();
+        loop {
+            let event = subscriber.next_push_event().await;
+            let completed = event.run_id == run.run_id
+                && matches!(&event.payload, TaskEventPayload::StatusChanged { status, .. } if *status == TaskStatus::Completed);
+            live.push(event);
+            if completed {
+                break;
+            }
+        }
+        let persisted = srv.state.leases().query_events_after(0).unwrap();
+        let mut replay_client = RpcClient::connect(&srv.sock_path).await;
+        let replay_response = replay_client
+            .call(json!("replay"), "events.subscribe", json!({"after_seq": 0}))
+            .await;
+        assert!(replay_response.error.is_none());
+        let replay_count = replay_response.result.unwrap()["replayed"]
+            .as_u64()
+            .unwrap();
+        let mut replay = Vec::new();
+        for _ in 0..replay_count {
+            replay.push(replay_client.next_push_event().await);
+        }
+        let truncated = "[atomium] log line truncated after 8192 bytes";
+        let credential = ["synthetic-bounded-", "log-material"].concat();
+        let expected: Vec<String> = [
+            "ordinary diagnostic".into(),
+            "n".repeat(8192),
+            truncated.into(),
+            format!("credential={credential}"),
+            "next diagnostic".into(),
+            truncated.into(),
+        ]
+        .into_iter()
+        .map(|line| {
+            if digest_only && line != truncated {
+                let digest = EncryptedVault::digest_hex(line.as_bytes());
+                format!("<redacted:sha256:{}>", &digest[..12])
+            } else if line.starts_with("credential=") {
+                let digest = EncryptedVault::digest_hex(credential.as_bytes());
+                format!("credential=<redacted:sha256:{}>", &digest[..12])
+            } else {
+                line
+            }
+        })
+        .collect();
+        for events in [&live, &persisted, &replay] {
+            for stream in ["stdout", "stderr"] {
+                let lines: Vec<&str> = events
+                    .iter()
+                    .filter(|event| event.run_id == run.run_id)
+                    .filter_map(|event| match &event.payload {
+                        TaskEventPayload::LogLine { stream: name, line } if name == stream => {
+                            Some(line.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    lines == expected,
+                    "logical log lines changed or exposed truncated fragments"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn workspace_exclusive_lease_serializes_writers_and_recovers_orphans() {
     let srv = ServerHandle::start().await;
     let mut client = RpcClient::connect(&srv.sock_path).await;
