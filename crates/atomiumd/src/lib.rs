@@ -1864,7 +1864,7 @@ async fn handle_runs_start(
             Ok((workspace_dir, projection, initial_ver, secret_redactor))
         })();
 
-    let (workspace_dir, projection, initial_version, secret_redactor) = match prepare_res {
+    let (workspace_dir, projection, initial_version, mut secret_redactor) = match prepare_res {
         Ok(v) => v,
         Err(e) => {
             let _ = fs::remove_dir_all(&run_dir);
@@ -1875,6 +1875,9 @@ async fn handle_runs_start(
 
     // 3. Start per-run Fail-Closed Egress Proxy.
     let ephemeral_token = random_ephemeral_token();
+    secret_redactor.add_secret_bytes(ephemeral_token.as_bytes());
+    // The proxy URL and Basic authentication encode the same per-run credentials differently.
+    secret_redactor.add_secret_bytes(format!("{run_id}:{ephemeral_token}").as_bytes());
     let allowlist = if req.allowed_egress_hosts.is_empty() {
         None
     } else {

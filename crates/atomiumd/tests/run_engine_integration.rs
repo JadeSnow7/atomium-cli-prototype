@@ -2056,6 +2056,133 @@ async fn run_record_live_events_and_replay_redact_args_and_token_patterns() {
 }
 
 #[tokio::test]
+async fn proxy_credentials_are_redacted_in_both_streams_live_storage_and_replay() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    capture_test_subscription(&mut client, "proxy_redact").await;
+    let mut subscriber = RpcClient::connect(&srv.sock_path).await;
+    let subscribed = subscriber
+        .call(json!("sub"), "events.subscribe", json!({ "after_seq": 0 }))
+        .await;
+    assert!(subscribed.error.is_none());
+
+    // Only digest expectations leave the child alongside its deliberately logged environment.
+    let script = r#"import base64,hashlib,os,sys,urllib.parse
+proxy=os.environ['HTTP_PROXY']
+parsed=urllib.parse.urlsplit(proxy)
+credentials=parsed.username+':'+parsed.password
+basic=base64.b64encode(credentials.encode()).decode()
+def marker(value):
+    return '<redacted:sha256:'+hashlib.sha256(value.encode()).hexdigest()[:12]+'>'
+for output in (sys.stdout,sys.stderr):
+    print('expected-token='+marker(parsed.password),file=output)
+    print('expected-credentials='+marker(credentials),file=output)
+    print('expected-basic='+marker(basic),file=output)
+    print('diagnostic proxy-url='+proxy,file=output)
+    print('diagnostic proxy-token='+parsed.password,file=output)
+    print('diagnostic proxy-basic=Basic '+basic,file=output)
+    print('ordinary proxy diagnostic',file=output,flush=True)
+"#;
+    let started = client
+        .call(
+            json!("start"),
+            "runs.start",
+            json!({
+                "profile_id": "proxy_redact",
+                "program": "/usr/bin/python3",
+                "args": ["-c", script]
+            }),
+        )
+        .await;
+    assert!(started.error.is_none());
+    let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+    let final_record = wait_for_run_done(&mut client, &run.run_id).await;
+    assert_eq!(final_record.status, TaskStatus::Completed);
+
+    let mut live = Vec::new();
+    loop {
+        let event = subscriber.next_push_event().await;
+        let completed = event.run_id == run.run_id
+            && matches!(
+                &event.payload,
+                TaskEventPayload::StatusChanged { status, .. } if *status == TaskStatus::Completed
+            );
+        live.push(event);
+        if completed {
+            break;
+        }
+    }
+    let persisted = srv.state.leases().query_events_after(0).unwrap();
+    let mut replay_client = RpcClient::connect(&srv.sock_path).await;
+    let replay_response = replay_client
+        .call(
+            json!("replay"),
+            "events.subscribe",
+            json!({ "after_seq": 0 }),
+        )
+        .await;
+    assert!(replay_response.error.is_none());
+    let replay_count = replay_response.result.unwrap()["replayed"]
+        .as_u64()
+        .unwrap();
+    let mut replay = Vec::new();
+    for _ in 0..replay_count {
+        replay.push(replay_client.next_push_event().await);
+    }
+
+    for events in [&live, &persisted, &replay] {
+        for stream in ["stdout", "stderr"] {
+            let lines: Vec<&str> = events
+                .iter()
+                .filter(|event| event.run_id == run.run_id)
+                .filter_map(|event| match &event.payload {
+                    TaskEventPayload::LogLine { stream: name, line } if name == stream => {
+                        Some(line.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(lines.len(), 7, "missing proxy diagnostic lines");
+            let markers: Vec<&str> = [
+                "expected-token=",
+                "expected-credentials=",
+                "expected-basic=",
+            ]
+            .iter()
+            .map(|prefix| {
+                lines
+                    .iter()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .expect("missing digest expectation")
+            })
+            .collect();
+            for marker in &markers {
+                let digest = marker
+                    .strip_prefix("<redacted:sha256:")
+                    .and_then(|value| value.strip_suffix('>'))
+                    .expect("invalid digest expectation");
+                assert!(digest.len() == 12 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            }
+            for expected in [
+                format!(
+                    "diagnostic proxy-url=http://{}@127.0.0.1:{}",
+                    markers[1],
+                    run.proxy_port.unwrap()
+                ),
+                format!("diagnostic proxy-token={}", markers[0]),
+                format!("diagnostic proxy-basic=Basic {}", markers[2]),
+                "ordinary proxy diagnostic".into(),
+            ] {
+                assert!(
+                    lines.contains(&expected.as_str()),
+                    "proxy diagnostic was not precisely redacted"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn workspace_exclusive_lease_serializes_writers_and_recovers_orphans() {
     let srv = ServerHandle::start().await;
     let mut client = RpcClient::connect(&srv.sock_path).await;
