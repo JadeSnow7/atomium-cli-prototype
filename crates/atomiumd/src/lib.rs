@@ -486,6 +486,8 @@ pub struct DaemonState {
     runs_dir: PathBuf,
     event_tx: broadcast::Sender<TaskEvent>,
     active_runs: Mutex<HashMap<String, ActiveRunControl>>,
+    #[cfg(test)]
+    before_spawn_hook: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     broker_lock: Mutex<()>,
     run_slot_semaphore: Arc<Semaphore>,
     unsandboxed_dev_mode: bool,
@@ -579,6 +581,8 @@ impl DaemonState {
             runs_dir: runs_dir.to_path_buf(),
             event_tx,
             active_runs: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            before_spawn_hook: Mutex::new(None),
             broker_lock: Mutex::new(()),
             run_slot_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RUNS)),
             unsandboxed_dev_mode: false,
@@ -1715,10 +1719,14 @@ async fn handle_runs_start(
         });
     }
 
-    state
-        .leases
-        .acquire_all(&run_id, lease_reqs, DEFAULT_LEASE_TTL_SECS)
-        .map_err(|e| (-32009, e.to_string()))?;
+    {
+        // Serialize acquiring writer ownership with freeze's ownership check and snapshot.
+        let _broker_guard = state.broker_lock.lock().await;
+        state
+            .leases
+            .acquire_all(&run_id, lease_reqs, DEFAULT_LEASE_TTL_SECS)
+            .map_err(|e| (-32009, e.to_string()))?;
+    }
 
     // From here on, any early failure MUST release leases and clean up run_dir.
     let run_dir = state.runs_dir.join(&run_id);
@@ -1977,10 +1985,37 @@ async fn handle_runs_start(
     // Put child in its own process group so cancel terminates the entire process tree.
     cmd.process_group(0);
 
+    #[cfg(test)]
+    if let Some((entered, resume)) = state.before_spawn_hook.lock().await.take() {
+        entered.notify_one();
+        resume.notified().await;
+    }
+
+    let (cancel_tx, mut cancel_rx) = watch::channel::<Option<String>>(None);
+    let egress_slot = Arc::new(Mutex::new(Some(proxy_handle)));
+    let done_notify = Arc::new(Notify::new());
+
+    {
+        let mut active = state.active_runs.lock().await;
+        active.insert(
+            run_id.clone(),
+            ActiveRunControl {
+                cancel_tx,
+                egress_handle: egress_slot.clone(),
+                done_notify: done_notify.clone(),
+                workspace_dir: canon_ws.clone(),
+            },
+        );
+    }
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            proxy_handle.revoke();
+            state.active_runs.lock().await.remove(&run_id);
+            if let Some(proxy) = egress_slot.lock().await.take() {
+                proxy.revoke();
+            }
+            done_notify.notify_waiters();
             let _ = fs::remove_dir_all(&run_dir);
             let _ = state.leases.release_all(&run_id);
             record.status = TaskStatus::Blocked;
@@ -2014,23 +2049,6 @@ async fn handle_runs_start(
             reason: None,
         },
     );
-
-    let (cancel_tx, mut cancel_rx) = watch::channel::<Option<String>>(None);
-    let egress_slot = Arc::new(Mutex::new(Some(proxy_handle)));
-    let done_notify = Arc::new(Notify::new());
-
-    {
-        let mut active = state.active_runs.lock().await;
-        active.insert(
-            run_id.clone(),
-            ActiveRunControl {
-                cancel_tx,
-                egress_handle: egress_slot.clone(),
-                done_notify: done_notify.clone(),
-                workspace_dir: canon_ws.clone(),
-            },
-        );
-    }
 
     // 7. Spawn background supervisor task (stdout/stderr streaming, lease heartbeat, cancellation,
     //    token refresh atomic write-back, directory cleanup verification, lease release).
@@ -2546,6 +2564,21 @@ async fn handle_candidates_freeze(
     let canon_working =
         fs::canonicalize(&target_working).unwrap_or_else(|_| target_working.clone());
 
+    let workspace_key = format!("workspace:{}", req.workspace_id);
+    if state
+        .leases
+        .list_active_leases()
+        .map_err(|e| (-32000, e.to_string(), None))?
+        .iter()
+        .any(|lease| lease.resource_key == workspace_key)
+    {
+        return Err((
+            -32009,
+            "workspace_busy: workspace writer lease is held".into(),
+            None,
+        ));
+    }
+
     // Refuse to freeze while any active writer run is running on this run_id or overlapping workspace.
     {
         let active = state.active_runs.lock().await;
@@ -2849,4 +2882,137 @@ async fn handle_approvals_resolve(
         "approval_id": pending.approval_id,
         "approved": req.approved
     }))
+}
+
+#[cfg(test)]
+mod workspace_freeze_review_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn freeze_rejects_workspace_lease_before_active_run_registration() {
+        let root =
+            std::env::temp_dir().join(format!("atomium-freeze-review-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(root.join("host")).unwrap();
+        fs::write(root.join("host/file"), b"baseline").unwrap();
+        let state = Arc::new(DaemonState::open(&root.join("state.sqlite")).unwrap());
+        let ws = state
+            .broker
+            .import_and_record(&root.join("host"), None, None)
+            .unwrap();
+        state
+            .leases
+            .acquire_all(
+                "run-pending",
+                vec![LeaseRequest {
+                    resource_key: format!("workspace:{}", ws.workspace_id),
+                    mode: LeaseMode::Exclusive,
+                }],
+                60,
+            )
+            .unwrap();
+        assert!(state.active_runs.lock().await.is_empty());
+        let result = handle_candidates_freeze(
+            &state,
+            CandidateFreezeRequest {
+                workspace_id: ws.workspace_id.clone(),
+                run_id: None,
+                limits: None,
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().0, -32009);
+        state.leases.release_all("run-pending").unwrap();
+        assert!(handle_candidates_freeze(
+            &state,
+            CandidateFreezeRequest {
+                workspace_id: ws.workspace_id,
+                run_id: None,
+                limits: None,
+            }
+        )
+        .await
+        .is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn freeze_is_rejected_at_spawn_hook_and_failed_spawn_removes_pending_run() {
+        let root =
+            std::env::temp_dir().join(format!("atomium-spawn-review-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(root.join("host")).unwrap();
+        fs::write(root.join("host/file"), b"baseline").unwrap();
+        let state = Arc::new(
+            DaemonState::open(&root.join("state.sqlite"))
+                .unwrap()
+                .with_unsandboxed_dev_mode(true),
+        );
+        state
+            .vault
+            .write_blob("test-key", b"synthetic-test-credential")
+            .unwrap();
+        state
+            .profiles
+            .upsert(&IdentityProfile {
+                id: "spawn-review".into(),
+                display_name: "spawn review".into(),
+                agent_kind: "test".into(),
+                credential: CredentialSpec::ApiKey {
+                    vault_secret_id: "test-key".into(),
+                    model_alias: "test".into(),
+                    max_concurrent_runs: 1,
+                },
+                egress: EgressBinding {
+                    upstream_proxy_id: None,
+                    fail_closed: true,
+                },
+                locale_policy: LocalePolicy {
+                    timezone: None,
+                    lang: None,
+                },
+                state: ProfileState::Active,
+            })
+            .unwrap();
+        let ws = state
+            .broker
+            .import_and_record(&root.join("host"), None, None)
+            .unwrap();
+        let entered = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *state.before_spawn_hook.lock().await = Some((entered.clone(), resume.clone()));
+        let st = state.clone();
+        let workspace_id = ws.workspace_id.clone();
+        let task = tokio::spawn(async move {
+            handle_runs_start(
+                &st,
+                RunStartRequest {
+                    profile_id: "spawn-review".into(),
+                    program: "/no-such-atomium-test-program".into(),
+                    args: vec![],
+                    env: Default::default(),
+                    workspace_id: Some(workspace_id),
+                    upstream_proxy_addr: None,
+                    allowed_egress_hosts: vec![],
+                    timeout_ms: None,
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let result = handle_candidates_freeze(
+            &state,
+            CandidateFreezeRequest {
+                workspace_id: ws.workspace_id.clone(),
+                run_id: None,
+                limits: None,
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().0, -32009);
+        resume.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert!(state.active_runs.lock().await.is_empty());
+        assert!(state.leases.list_active_leases().unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
