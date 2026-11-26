@@ -65,7 +65,8 @@ pub async fn spawn_run_proxy_with_policy(
 }
 
 /// Fully configurable policy proxy. `header_read_timeout` is an inactivity timeout
-/// for request/response header reads, including keep-alive idle periods.
+/// for request/response header reads, including keep-alive idle periods. Trailer sections
+/// use the same duration as a deadline for reading the complete section.
 pub async fn spawn_run_proxy_with_policy_and_config(
     run_id: &str,
     ephemeral_token: &str,
@@ -158,7 +159,11 @@ pub fn extract_destination_host(header_text: &str) -> Option<String> {
     parts.next()?;
 
     let destination = if method.eq_ignore_ascii_case("CONNECT") {
-        Some(normalize_authority(target, 443)?)
+        let authority = normalize_authority(target, 0)?;
+        if authority.1 == 0 {
+            return None;
+        }
+        Some(authority)
     } else if let Some((scheme, rest)) = target.split_once("://") {
         if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
             return None;
@@ -660,6 +665,8 @@ where
         &mut self,
         writer: &mut W,
         shutdown_rx: &mut watch::Receiver<bool>,
+        trailer_timeout: Duration,
+        headers: &[HeaderField],
     ) -> Result<bool>
     where
         W: tokio::io::AsyncWrite + Unpin,
@@ -686,24 +693,19 @@ where
             }
             let size = u64::from_str_radix(size_hex, 16)
                 .map_err(|_| anyhow::anyhow!("invalid chunk size"))?;
+            if size == 0 {
+                let Some(trailers) = self
+                    .read_trailers(shutdown_rx, trailer_timeout, headers)
+                    .await?
+                else {
+                    return Ok(false);
+                };
+                // A malformed trailer must not complete the message at the receiving peer.
+                let ending = [size_line, trailers].concat();
+                return write_all_cancellable(writer, &ending, shutdown_rx).await;
+            }
             if !write_all_cancellable(writer, &size_line, shutdown_rx).await? {
                 return Ok(false);
-            }
-
-            if size == 0 {
-                loop {
-                    let Some(trailer_line) =
-                        self.read_line(MAX_CHUNK_LINE_BYTES, shutdown_rx).await?
-                    else {
-                        return Ok(false);
-                    };
-                    if !write_all_cancellable(writer, &trailer_line, shutdown_rx).await? {
-                        return Ok(false);
-                    }
-                    if trailer_line == b"\r\n" {
-                        return Ok(true);
-                    }
-                }
             }
 
             if !self.forward_exact(writer, size, shutdown_rx).await? {
@@ -720,6 +722,87 @@ where
             }
         }
     }
+
+    async fn read_trailers(
+        &mut self,
+        shutdown_rx: &mut watch::Receiver<bool>,
+        timeout: Duration,
+        headers: &[HeaderField],
+    ) -> Result<Option<Vec<u8>>> {
+        let connection_fields = connection_tokens(headers);
+        tokio::time::timeout(timeout, async {
+            let mut trailers = Vec::new();
+            let mut count = 0;
+            loop {
+                let Some(line) = self.read_line(MAX_CHUNK_LINE_BYTES, shutdown_rx).await? else {
+                    return Ok(None);
+                };
+                if trailers.len() + line.len() > MAX_PROXY_HEADER_BYTES {
+                    anyhow::bail!("trailer section exceeds byte limit");
+                }
+                if line == b"\r\n" {
+                    trailers.extend_from_slice(&line);
+                    return Ok(Some(trailers));
+                }
+                count += 1;
+                if count > MAX_HEADER_COUNT {
+                    anyhow::bail!("trailer section exceeds field limit");
+                }
+                validate_trailer_line(&line, &connection_fields)?;
+                trailers.extend_from_slice(&line);
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("trailer section read timed out"))?
+    }
+}
+
+fn validate_trailer_line(
+    line: &[u8],
+    connection_fields: &std::collections::HashSet<String>,
+) -> Result<()> {
+    let field = line
+        .strip_suffix(b"\r\n")
+        .ok_or_else(|| anyhow::anyhow!("malformed trailer line ending"))?;
+    let colon = field
+        .iter()
+        .position(|byte| *byte == b':')
+        .ok_or_else(|| anyhow::anyhow!("trailer field lacks colon"))?;
+    let (name, value) = field.split_at(colon);
+    if name.is_empty()
+        || !name.iter().all(is_http_token)
+        || value[1..]
+            .iter()
+            .any(|byte| (*byte < b' ' && *byte != b'\t') || *byte == 0x7f)
+    {
+        anyhow::bail!("invalid trailer field syntax");
+    }
+    if [
+        "content-length",
+        "transfer-encoding",
+        "host",
+        "connection",
+        "proxy-connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "upgrade",
+        "authorization",
+        "proxy-authorization",
+        "proxy-authenticate",
+        "www-authenticate",
+        "authentication-info",
+        "proxy-authentication-info",
+        "cookie",
+        "set-cookie",
+    ]
+    .into_iter()
+    .chain(connection_fields.iter().map(String::as_str))
+    .any(|forbidden| name.eq_ignore_ascii_case(forbidden.as_bytes()))
+    {
+        anyhow::bail!("trailer contains framing, routing, or authentication field");
+    }
+    Ok(())
 }
 
 fn is_http_token(byte: &u8) -> bool {
@@ -1052,6 +1135,21 @@ fn validate_request_framing(request: &RequestHead) -> Result<BodyFraming> {
     body_framing(&request.headers).map_err(|_| anyhow::anyhow!("invalid request framing"))
 }
 
+fn validate_response_framing(response: &ResponseHead) -> Result<BodyFraming> {
+    validate_connection_framing(&response.headers)?;
+    if response.status == 101
+        || (response.version == 0
+            && response
+                .headers
+                .iter()
+                .any(|header| header.name.eq_ignore_ascii_case("transfer-encoding")))
+    {
+        anyhow::bail!("unsupported upstream response framing");
+    }
+    body_framing(&response.headers)
+        .map_err(|_| anyhow::anyhow!("invalid upstream response framing"))
+}
+
 fn head_requests_close(headers: &[HeaderField], version: u8) -> bool {
     let tokens = connection_tokens(headers);
     tokens.contains("close") || (version == 0 && !tokens.contains("keep-alive"))
@@ -1179,6 +1277,8 @@ async fn forward_body<W, R>(
     reader: &mut BufferedStream<R>,
     writer: &mut W,
     shutdown_rx: &mut watch::Receiver<bool>,
+    trailer_timeout: Duration,
+    headers: &[HeaderField],
 ) -> Result<bool>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -1187,7 +1287,11 @@ where
     match framing {
         BodyFraming::None => Ok(true),
         BodyFraming::ContentLength(len) => reader.forward_exact(writer, len, shutdown_rx).await,
-        BodyFraming::Chunked => reader.forward_chunked(writer, shutdown_rx).await,
+        BodyFraming::Chunked => {
+            reader
+                .forward_chunked(writer, shutdown_rx, trailer_timeout, headers)
+                .await
+        }
     }
 }
 
@@ -1247,9 +1351,7 @@ async fn handle_connect(
             anyhow::bail!("failed CONNECT handshake");
         };
         let response = parse_response_head(&head)?;
-        validate_connection_framing(&response.headers)?;
-        body_framing(&response.headers)
-            .map_err(|_| anyhow::anyhow!("invalid CONNECT response framing"))?;
+        validate_response_framing(&response)?;
         if !(200..300).contains(&response.status) {
             anyhow::bail!("upstream rejected CONNECT");
         }
@@ -1301,9 +1403,7 @@ async fn relay_response(
             }
         };
         let response = parse_response_head(&response_head)?;
-        validate_connection_framing(&response.headers)?;
-        let framing = body_framing(&response.headers)
-            .map_err(|_| anyhow::anyhow!("invalid upstream response framing"))?;
+        let framing = validate_response_framing(&response)?;
         let response_close = head_requests_close(&response.headers, response.version);
         let mut close_after_response = response_close;
         let rewritten = rewrite_response_head(&response, response_close);
@@ -1326,8 +1426,15 @@ async fn relay_response(
                         close_after_response = true;
                     }
                     framing => {
-                        if !forward_body(framing, &mut upstream.reader, client_writer, shutdown_rx)
-                            .await?
+                        if !forward_body(
+                            framing,
+                            &mut upstream.reader,
+                            client_writer,
+                            shutdown_rx,
+                            header_read_timeout,
+                            &response.headers,
+                        )
+                        .await?
                         {
                             return Ok(false);
                         }
@@ -1546,6 +1653,8 @@ async fn handle_client(
             &mut client_reader,
             &mut conn.writer,
             &mut shutdown_rx,
+            header_read_timeout,
+            &request.headers,
         )
         .await?
         {
@@ -1601,6 +1710,144 @@ mod review_regressions {
             "GET http://allowed%2eexample/ HTTP/1.1\r\n\r\n",
         ] {
             assert!(extract_destination_host(head).is_none());
+        }
+    }
+
+    #[test]
+    fn connect_requires_explicit_nonzero_port() {
+        for authority in ["example.com", "example.com:0", "[::1]", "[::1]:0"] {
+            let head = format!("CONNECT {authority} HTTP/1.1\r\n\r\n");
+            assert!(extract_destination_host(&head).is_none());
+        }
+        for authority in ["example.com:1", "example.com:65535", "[::1]:443"] {
+            let head = format!("CONNECT {authority} HTTP/1.1\r\n\r\n");
+            assert!(extract_destination_host(&head).is_some());
+        }
+        assert!(extract_destination_host("GET http://example.com/ HTTP/1.1\r\n\r\n").is_some());
+    }
+
+    #[test]
+    fn trailers_accept_metadata_and_reject_control_fields_and_invalid_syntax() {
+        let connection_fields = connection_tokens(&[HeaderField {
+            name: "Connection".into(),
+            value: "X-Session".into(),
+        }]);
+        for line in [b"X-Checksum: checked\r\n".as_slice(), b"X-Empty:\r\n"] {
+            assert!(validate_trailer_line(line, &connection_fields).is_ok());
+        }
+        for name in [
+            "Content-Length",
+            "Transfer-Encoding",
+            "Host",
+            "Connection",
+            "Proxy-Connection",
+            "Keep-Alive",
+            "TE",
+            "Trailer",
+            "Upgrade",
+            "Authorization",
+            "Proxy-Authorization",
+            "Proxy-Authenticate",
+            "WWW-Authenticate",
+            "Authentication-Info",
+            "Proxy-Authentication-Info",
+            "Cookie",
+            "Set-Cookie",
+            "x-session",
+        ] {
+            assert!(validate_trailer_line(
+                format!("{name}: value\r\n").as_bytes(),
+                &connection_fields
+            )
+            .is_err());
+        }
+        for line in [
+            b"X-Note: value\n".as_slice(),
+            b"X Note: value\r\n",
+            b"missing-colon\r\n",
+            b": value\r\n",
+            b" X-Note: value\r\n",
+            b"X-Note: \x00\r\n",
+        ] {
+            assert!(validate_trailer_line(line, &connection_fields).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn trailer_limits_allow_boundaries_and_withhold_rejected_endings() {
+        let max_line = format!("X-Note: {}\r\n", "a".repeat(MAX_CHUNK_LINE_BYTES - 10));
+        let exact_bytes = format!(
+            "{}{}{}X-Note: {}\r\n\r\n",
+            max_line,
+            max_line,
+            max_line,
+            "a".repeat(MAX_CHUNK_LINE_BYTES - 12)
+        );
+        assert_eq!(exact_bytes.len(), MAX_PROXY_HEADER_BYTES);
+        for trailers in [
+            "\r\n".to_string(),
+            format!("{}\r\n", "X-Note: checked\r\n".repeat(MAX_HEADER_COUNT)),
+            exact_bytes,
+        ] {
+            let input = format!("0\r\n{trailers}");
+            let mut reader = BufferedStream::new(input.as_bytes());
+            let mut output = Vec::new();
+            let (_tx, mut rx) = watch::channel(false);
+            assert!(reader
+                .forward_chunked(&mut output, &mut rx, Duration::from_secs(1), &[])
+                .await
+                .unwrap());
+            assert_eq!(output, input.as_bytes());
+        }
+        for trailers in [
+            format!("{}\r\n", "X-Note: checked\r\n".repeat(MAX_HEADER_COUNT + 1)),
+            format!("{}\r\n", max_line.repeat(4)),
+            format!("X-Note: {}\r\n\r\n", "a".repeat(MAX_CHUNK_LINE_BYTES)),
+            "X-Note: checked\r\nIncomplete\n\r\n".into(),
+            "X-Session: checked\r\n\r\n".into(),
+        ] {
+            let input = format!("0\r\n{trailers}");
+            let mut reader = BufferedStream::new(input.as_bytes());
+            let mut output = Vec::new();
+            let (_tx, mut rx) = watch::channel(false);
+            let headers = [HeaderField {
+                name: "Connection".into(),
+                value: "X-Session".into(),
+            }];
+            assert!(reader
+                .forward_chunked(&mut output, &mut rx, Duration::from_secs(1), &headers)
+                .await
+                .is_err());
+            assert!(output.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_trailers_timeout_and_revoke_without_forwarding() {
+        for revoke in [false, true] {
+            let (mut source, destination) = tokio::io::duplex(128);
+            source.write_all(b"0\r\nX-Note: checked\r\n").await.unwrap();
+            let mut reader = BufferedStream::new(destination);
+            let mut output = Vec::new();
+            let (tx, mut rx) = watch::channel(false);
+            let forwarding =
+                reader.forward_chunked(&mut output, &mut rx, Duration::from_millis(50), &[]);
+            let cancellation = async {
+                if revoke {
+                    tx.send(true).unwrap();
+                }
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(forwarding, cancellation)
+            })
+            .await
+            .unwrap();
+            if revoke {
+                assert!(!result.unwrap());
+            } else {
+                assert!(result.is_err());
+            }
+            assert!(output.is_empty());
         }
     }
 
@@ -1684,7 +1931,10 @@ mod review_regressions {
             let mut reader = BufferedStream::new(input);
             let mut output = Vec::new();
             let (_tx, mut rx) = watch::channel(false);
-            assert!(reader.forward_chunked(&mut output, &mut rx).await.is_err());
+            assert!(reader
+                .forward_chunked(&mut output, &mut rx, Duration::from_secs(1), &[])
+                .await
+                .is_err());
             assert!(output.is_empty());
         }
     }

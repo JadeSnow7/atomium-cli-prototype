@@ -1014,6 +1014,54 @@ async fn proxy_forwards_three_chunked_requests_on_one_keep_alive_connection() {
 }
 
 #[tokio::test]
+async fn proxy_forwards_valid_trailers_both_directions_with_informational_responses() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = b"4\r\ndata\r\n0\r\nX-Checksum: checked\r\n\r\n";
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut pending = Vec::new();
+        for _ in 0..2 {
+            read_head_buffered(&mut stream, &mut pending).await;
+            assert_eq!(
+                read_exact_buffered(&mut stream, &mut pending, body.len()).await,
+                body
+            );
+            stream.write_all(b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            stream.write_all(body).await.unwrap();
+        }
+    });
+    let proxy = spawn_run_proxy("trailers", "synthetic", Some(addr.to_string()))
+        .await
+        .unwrap();
+    let auth = basic_auth("trailers", "synthetic");
+    let mut client = TcpStream::connect(("127.0.0.1", proxy.local_port))
+        .await
+        .unwrap();
+    let mut pending = Vec::new();
+    for _ in 0..2 {
+        client.write_all(format!("POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic {auth}\r\nTransfer-Encoding: chunked\r\n\r\n").as_bytes()).await.unwrap();
+        client.write_all(body).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            assert!(read_head_buffered(&mut client, &mut pending)
+                .await
+                .starts_with("HTTP/1.1 103"));
+            assert!(read_head_buffered(&mut client, &mut pending)
+                .await
+                .starts_with("HTTP/1.1 200"));
+            assert_eq!(
+                read_exact_buffered(&mut client, &mut pending, body.len()).await,
+                body
+            );
+        })
+        .await
+        .unwrap();
+    }
+    server.await.unwrap();
+    proxy.revoke();
+}
+
+#[tokio::test]
 async fn proxy_connect_strips_local_proxy_authorization_before_upstream() {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream.local_addr().unwrap();
@@ -1197,6 +1245,8 @@ async fn review_bad_response_is_rejected_before_head_and_stream_errors_close() {
         "HTTP/1.1 200 OK\r\nConnection: Content-Length\r\nContent-Length: 4\r\n\r\ndata",
         "HTTP/1.1 200 OK\r\nConnection: Transfer-Encoding\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\nx",
+        "HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "HTTP/1.1 101 Switching Protocols\r\n\r\n",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\ninvalid\r\n",
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1231,6 +1281,8 @@ async fn review_connect_failures_return_bad_gateway() {
     for upstream_response in [
         None,
         Some("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"),
+        Some("HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"),
+        Some("HTTP/1.1 101 Switching Protocols\r\n\r\n"),
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
