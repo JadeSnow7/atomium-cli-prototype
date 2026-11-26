@@ -60,3 +60,12 @@ CONNECT 目标要求显式给出 1 至 65535 的端口，普通 HTTP URL 继续�
 | 导出恢复 | 审批 RPC 集成测试 4 项通过。故障用例同时阻止 journal 与 SQLite 封锁记录写入，重启 daemon 两次均从审批入口收到 `-32018`。Broker 单元测试还覆盖同一实例立即重试、其他工作区继续导出、回执仅落库一次和终态 journal 同步失败。 |
 | 临时权限 | 在独立测试进程设定宽松 umask，分别检查导出与回滚临时文件创建后、开始写内容前的权限，并核对最终文件的内容和模式。 |
 | 网关 | 11 项单元测试、24 项集成测试通过。覆盖 trailer 限额、超时、撤销、禁用字段、合法双向转发，以及同一连接上 103 临时响应之后的正常响应。 |
+| 8 KiB 日志边界（`cb07a98`） | stdout、stderr 各输出一条含跨界合成凭据的超长行。普通和仅摘要模式下，实时订阅、落盘和回放都只产生一个截断提示；短行继续正常脱敏。另覆盖恰好 8192 字节、CRLF、EOF、下一行、不同读缓冲以及 16 MiB 无换行输入。运行引擎集成测试 32 项通过。 |
+| 首份 journal 写入（`6ac2410`） | 写入失败且确认尚未生成 `journal.json` 时，同一 daemon 可立即重试。已 rename 但目录同步失败时保留 `-32018`，当前实例或新实例完成恢复后可以导出。另一工作区仍可使用。Broker 导出恢复单测 24 项通过。 |
+
+## 完整门禁与手工验收
+
+- 四项修复所在提交 `b10def9` 的本机 `pnpm run ci:local` 退出码为 0，跨层 E2E 通过。GitHub 上 7 项平台检查及汇总 `CI Gate` 全部成功。[不可变的 CI 运行记录](https://github.com/JadeSnow7/atomium-cli-prototype/actions/runs/45777305358)
+- 最终代码提交 `cb07a98` 包含两项追加修复。本机 `pnpm run ci:local` 退出码为 0，跨层 E2E 1 项通过。GitHub 的 Ubuntu、macOS 及汇总门禁 8/8 成功。[代码提交 CI](https://github.com/JadeSnow7/atomium-cli-prototype/actions/runs/45826815902) · [CI Gate](https://github.com/JadeSnow7/atomium-cli-prototype/actions/runs/45826815902/job/139934339797)
+- 合并前的最后一笔提交仅补录本页。该提交仍须通过本机 `pnpm run ci:local` 与相同的双平台门禁；其确切 SHA、本机退出码及对应 Actions 运行链接汇总在 PR 正文。[PR #4 最终验收](https://github.com/JadeSnow7/atomium-cli-prototype/pull/4) · [合并时的检查列表](https://github.com/JadeSnow7/atomium-cli-prototype/pull/4/checks)
+- R4 个人 Keychain 捕获和 W1–W3 真实 Box 生命周期由维护者安排在合并后手工验证。自动化验收使用合成数据。[手工验收步骤](../../DEVELOPMENT-STATUS.md)
