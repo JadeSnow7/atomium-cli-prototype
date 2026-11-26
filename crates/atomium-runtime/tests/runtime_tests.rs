@@ -284,3 +284,98 @@ async fn seatbelt_allows_basic_python_and_node_runtime_sysctls() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn review_ancestor_metadata_does_not_grant_file_data() {
+    let root = std::env::temp_dir().join(format!("atm-ancestors-{}", uuid::Uuid::now_v7()));
+    let dirs: Vec<_> = ["workspace", "home", "tmp", "cache", "tools/deep"]
+        .iter()
+        .map(|name| root.join(name))
+        .collect();
+    for dir in &dirs {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let dirs: Vec<_> = dirs
+        .iter()
+        .map(|dir| std::fs::canonicalize(dir).unwrap())
+        .collect();
+    let cfg = SeatbeltConfig {
+        workspace_dir: dirs[0].clone(),
+        run_home_dir: dirs[1].clone(),
+        run_tmp_dir: dirs[2].clone(),
+        run_cache_dir: dirs[3].clone(),
+        allowed_proxy_port: None,
+        keychain_policy: KeychainPolicy::Deny,
+        timezone: None,
+        lang: None,
+    };
+    let sbpl = atomium_runtime::render_sbpl_with_extra_read_paths(&cfg, &[dirs[4].clone()]);
+    let metadata = sbpl
+        .split("; 隔离路径祖先仅开放元数据")
+        .nth(1)
+        .unwrap()
+        .split("; 祖先元数据结束")
+        .next()
+        .unwrap();
+    for ancestor in dirs[4].ancestors().skip(1) {
+        let rule = format!("(literal \"{}\")", ancestor.display());
+        assert!(metadata.contains(&rule), "missing ancestor metadata");
+        if ancestor == dirs[4].parent().unwrap() {
+            assert_eq!(
+                sbpl.matches(&rule).count(),
+                1,
+                "ancestor must not grant data"
+            );
+        }
+    }
+    for link in ["/var", "/tmp", "/etc"] {
+        assert!(metadata.contains(&format!("(literal \"{link}\")")));
+    }
+    assert!(sbpl.contains("(sysctl-name \"hw.model\")"));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn review_seatbelt_realpath_and_system_symlink_metadata() {
+    let root = std::env::temp_dir().join(format!("atm-realpath-{}", uuid::Uuid::now_v7()));
+    let dirs: Vec<_> = ["workspace", "home", "tmp", "cache"]
+        .iter()
+        .map(|name| root.join(name))
+        .collect();
+    for dir in &dirs {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let cfg = SeatbeltConfig {
+        workspace_dir: dirs[0].clone(),
+        run_home_dir: dirs[1].clone(),
+        run_tmp_dir: dirs[2].clone(),
+        run_cache_dir: dirs[3].clone(),
+        allowed_proxy_port: None,
+        keychain_policy: KeychainPolicy::Deny,
+        timezone: None,
+        lang: None,
+    };
+    for (program, args) in [
+        ("/bin/realpath", vec![cfg.run_home_dir.to_str().unwrap()]),
+        ("/bin/ls", vec!["-ld", "/var", "/tmp", "/etc"]),
+        (
+            "/opt/homebrew/bin/node",
+            vec![
+                "-e",
+                "console.log(require('fs').realpathSync(process.cwd()))",
+            ],
+        ),
+    ] {
+        if !std::path::Path::new(program).exists() {
+            continue;
+        }
+        let out = atomium_runtime::run_in_seatbelt(&cfg, program, &args, &[])
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "program {program} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

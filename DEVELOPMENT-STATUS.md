@@ -33,7 +33,7 @@
 | 层 | 已具备 | 已知差距（对应里程碑） |
 | --- | --- | --- |
 | 协议 | v1.2：订阅、运行、事件、工作区、候选、审批；删除凭据宿主路径读取；导出返回 `post_verify_ok` | 还没有 Box、Session、Grant、Portal 等 v2 对象（M5） |
-| 运行时 | macOS Seatbelt 强制隔离（守护进程决定）；Keychain 默认拒绝；网络限制到 per-run 网关；`kern.hostname`、硬件 UUID/序列号 sysctl 与宿主目录读取按默认拒绝策略收敛；环境变量白名单；独立 HOME、TMPDIR、cache | 独立 Box 用户与正式 LaunchAgent/LaunchDaemon 尚未产品化，守护进程须独立运行才能切断终端 `responsible_pid` TCC 继承（M5）；GUI 档位已确定走 L2 Mac VM（M6） |
+| 运行时 | macOS Seatbelt 强制隔离（守护进程决定）；Keychain 默认拒绝；网络限制到 per-run 网关；sysctl-read 全部放行，加 `kern.hostname`、`hw.model`、硬件 UUID/序列号等身份类黑名单；宿主私有目录读取拒绝；环境变量白名单；独立 HOME、TMPDIR、cache | 独立 Box 用户与正式 LaunchAgent/LaunchDaemon 尚未产品化，守护进程须独立运行才能切断终端 `responsible_pid` TCC 继承（M5）；GUI 档位已确定走 L2 Mac VM（M6） |
 | 网关 | keep-alive 逐请求鉴权与策略检查；fail-closed；主机白名单；非公网 IP 拦截；请求头上限与防走私 framing；CONNECT 建隧道前检查；撤销在途连接 | 只能转发到上游代理，不能直连；隧道建立后的 TLS 字节不透明；没有 SOCKS 和询问机制（M5） |
 | 凭据 | AES-256-GCM Vault；IsolatedFile 投影；confined 刷新写回；日志/事件精确脱敏 | 凭据仍会投影进运行目录；同一订阅不能并行；`HostKeychainSlot` 已弃用（M6 注入） |
 | 控制面认证 | `0600` socket | 没有校验对端签名；审批不需要本人在场（M5、M7） |

@@ -56,6 +56,26 @@ pub fn render_sbpl_with_extra_read_paths(
     cfg: &SeatbeltConfig,
     extra_read_paths: &[PathBuf],
 ) -> String {
+    // Rendering is pure. Production command builders supply canonical paths.
+    let mut ancestors = std::collections::BTreeSet::new();
+    for path in [
+        &cfg.workspace_dir,
+        &cfg.run_home_dir,
+        &cfg.run_tmp_dir,
+        &cfg.run_cache_dir,
+    ]
+    .into_iter()
+    .chain(extra_read_paths.iter())
+    {
+        ancestors.extend(path.ancestors().skip(1).map(Path::to_path_buf));
+    }
+    ancestors.extend(["/var", "/tmp", "/etc"].into_iter().map(PathBuf::from));
+    let mut ancestor_metadata =
+        String::from("; 隔离路径祖先仅开放元数据\n(allow file-read-metadata\n");
+    for path in ancestors {
+        ancestor_metadata.push_str(&format!("    (literal \"{}\")\n", escape_sbpl(&path)));
+    }
+    ancestor_metadata.push_str(")\n; 祖先元数据结束\n");
     let ws = escape_sbpl(&cfg.workspace_dir);
     let home = escape_sbpl(&cfg.run_home_dir);
     let tmp = escape_sbpl(&cfg.run_tmp_dir);
@@ -65,17 +85,12 @@ pub fn render_sbpl_with_extra_read_paths(
         String::new()
     } else {
         let mut buf =
-            String::from("\n; 显式放行只读可执行路径\n(allow file-read* file-read-metadata file-map-executable\n");
+            String::from("\n; 显式放行只读可执行路径\n(allow file-read* file-map-executable\n");
         for p in extra_read_paths {
             let esc = escape_sbpl(p);
             buf.push_str(&format!("    (literal \"{esc}\")\n"));
-            if let Some(parent) = p.parent() {
-                if p.is_dir() {
-                    buf.push_str(&format!("    (subpath \"{esc}\")\n"));
-                } else {
-                    let p_esc = escape_sbpl(parent);
-                    buf.push_str(&format!("    (literal \"{p_esc}\")\n"));
-                }
+            if p.is_dir() {
+                buf.push_str(&format!("    (subpath \"{esc}\")\n"));
             }
         }
         buf.push_str(")\n");
@@ -134,6 +149,7 @@ pub fn render_sbpl_with_extra_read_paths(
     (sysctl-name "kern.filesetuuid")
     (sysctl-name "kern.apfsprebootuuid")
     (sysctl-name "kern.bootargs")
+    (sysctl-name "hw.model")
     (sysctl-name "hw.uuid")
     (sysctl-name "hw.serial")
     (sysctl-name "hw.serialnumber")
@@ -160,10 +176,9 @@ pub fn render_sbpl_with_extra_read_paths(
     (literal "/dev/null")
     (literal "/dev/urandom")
     (literal "/dev/random")
-    (literal "/private/etc/ssl")
     (subpath "/private/etc/ssl")
 )
-; file-read* 不隐含 metadata；只对标准系统/工具链根及其父目录、隔离目录开放 stat/readlink 元数据
+; file-read* 包含 metadata；以下规则仅补充系统路径祖先的 stat/readlink 权限
 (allow file-read-metadata
     (literal "/")
     (literal "/System")
@@ -189,22 +204,8 @@ pub fn render_sbpl_with_extra_read_paths(
     (literal "/Applications/Xcode.app")
     (literal "/Applications/Xcode.app/Contents")
     (literal "/Applications/Xcode.app/Contents/Developer")
-    (subpath "/System")
-    (subpath "/Library/Apple/System/Library")
-    (subpath "/private/var/db/timezone")
-    (subpath "/usr/lib")
-    (subpath "/usr/bin")
-    (subpath "/bin")
-    (subpath "/usr/share")
-    (subpath "/Library/Developer/CommandLineTools")
-    (subpath "/Applications/Xcode.app/Contents/Developer")
-    (subpath "/opt/homebrew")
-    (subpath "/usr/local")
-    (subpath "{ws}")
-    (subpath "{home}")
-    (subpath "{tmp}")
-    (subpath "{cache}")
 )
+{ancestor_metadata}
 (allow file-map-executable
     (subpath "/System")
     (subpath "/Library/Apple/System/Library")
@@ -252,7 +253,7 @@ pub fn build_seatbelt_command(
     program: &str,
     args: &[&str],
     extra_env: &[(&str, &str)],
-) -> Command {
+) -> Result<Command> {
     build_seatbelt_command_with_extra_read_paths(cfg, program, args, extra_env, &[])
 }
 
@@ -262,8 +263,30 @@ pub fn build_seatbelt_command_with_extra_read_paths(
     args: &[&str],
     extra_env: &[(&str, &str)],
     extra_read_paths: &[PathBuf],
-) -> Command {
-    let profile = render_sbpl_with_extra_read_paths(cfg, extra_read_paths);
+) -> Result<Command> {
+    let mut cfg = cfg.clone();
+    cfg.workspace_dir = cfg
+        .workspace_dir
+        .canonicalize()
+        .context("canonicalize workspace")?;
+    cfg.run_home_dir = cfg
+        .run_home_dir
+        .canonicalize()
+        .context("canonicalize run home")?;
+    cfg.run_tmp_dir = cfg
+        .run_tmp_dir
+        .canonicalize()
+        .context("canonicalize run tmp")?;
+    cfg.run_cache_dir = cfg
+        .run_cache_dir
+        .canonicalize()
+        .context("canonicalize run cache")?;
+    let extra_read_paths = extra_read_paths
+        .iter()
+        .map(|path| path.canonicalize())
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("canonicalize executable paths")?;
+    let profile = render_sbpl_with_extra_read_paths(&cfg, &extra_read_paths);
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-p").arg(profile).arg(program).args(args);
     cmd.current_dir(&cfg.workspace_dir);
@@ -286,7 +309,7 @@ pub fn build_seatbelt_command_with_extra_read_paths(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd
+    Ok(cmd)
 }
 
 pub async fn run_in_seatbelt(
@@ -295,7 +318,7 @@ pub async fn run_in_seatbelt(
     args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Result<std::process::Output> {
-    let mut cmd = build_seatbelt_command(cfg, program, args, extra_env);
+    let mut cmd = build_seatbelt_command(cfg, program, args, extra_env)?;
     cmd.output().await.context("failed to spawn sandbox-exec")
 }
 

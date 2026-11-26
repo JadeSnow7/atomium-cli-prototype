@@ -1997,6 +1997,23 @@ async fn handle_runs_start(
             &env_refs,
             &extra_read_paths,
         )
+        .map_err(|e| {
+            proxy_handle.revoke();
+            let _ = fs::remove_dir_all(&run_dir);
+            let _ = state.leases.release_all(&run_id);
+            record.status = TaskStatus::Blocked;
+            record.reason = Some(format!("sandbox_setup_failed: {e}"));
+            record.updated_at_ms = now_ms();
+            let _ = state.runs.upsert(&record);
+            let _ = state.emit_event(
+                &run_id,
+                &TaskEventPayload::StatusChanged {
+                    status: TaskStatus::Blocked,
+                    reason: record.reason.clone(),
+                },
+            );
+            (-32000, format!("failed to prepare sandbox: {e}"))
+        })?
     } else {
         let mut c = Command::new(&req.program);
         c.args(&req.args);
