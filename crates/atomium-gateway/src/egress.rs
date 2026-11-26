@@ -157,30 +157,42 @@ pub fn extract_destination_host(header_text: &str) -> Option<String> {
     let target = parts.next()?;
     parts.next()?;
 
-    if method.eq_ignore_ascii_case("CONNECT") {
-        return normalize_host_port(target);
-    }
-
-    // Absolute-form URI: http://host[:port]/path or https://host[:port]/path
-    if let Some((scheme, rest)) = target.split_once("://") {
+    let destination = if method.eq_ignore_ascii_case("CONNECT") {
+        Some(normalize_authority(target, 443)?)
+    } else if let Some((scheme, rest)) = target.split_once("://") {
         if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
             return None;
         }
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        let authority = &rest[..authority_end];
-        let authority = authority.rsplit('@').next().unwrap_or(authority);
-        return normalize_host_port(authority);
-    }
-
-    // Origin-form requests rely on exactly one consistent Host header.
-    let mut host: Option<String> = None;
+        Some(normalize_authority(
+            &rest[..authority_end],
+            if scheme.eq_ignore_ascii_case("http") {
+                80
+            } else {
+                443
+            },
+        )?)
+    } else {
+        None
+    };
+    let default_port = if method.eq_ignore_ascii_case("CONNECT")
+        || target.to_ascii_lowercase().starts_with("https://")
+    {
+        443
+    } else {
+        80
+    };
+    let mut host: Option<(String, u16)> = None;
     for line in lines {
         if line.trim().is_empty() {
             break;
         }
         if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("host") {
-                let parsed = normalize_host_port(v.trim())?;
+            if k.eq_ignore_ascii_case("host") {
+                let parsed = normalize_authority(v.trim(), default_port)?;
+                if destination.as_ref().is_some_and(|target| target != &parsed) {
+                    return None;
+                }
                 match &host {
                     None => host = Some(parsed),
                     Some(existing) if *existing == parsed => {}
@@ -189,15 +201,31 @@ pub fn extract_destination_host(header_text: &str) -> Option<String> {
             }
         }
     }
-    host
+    destination.or(host).map(|(host, _)| host)
+}
+
+fn normalize_authority(authority: &str, default_port: u16) -> Option<(String, u16)> {
+    let host = normalize_host_port(authority)?;
+    let port = if authority.starts_with('[') {
+        authority.split_once(']')?.1.strip_prefix(':')
+    } else {
+        authority.split_once(':').map(|(_, port)| port)
+    };
+    Some((
+        host,
+        port.map(|port| port.parse::<u16>())
+            .transpose()
+            .ok()?
+            .unwrap_or(default_port),
+    ))
 }
 
 fn valid_host_text(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 253
-        && !host
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | '@' | '#'))
+        && !host.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | '@' | '#' | '%')
+        })
 }
 
 fn valid_port_text(port: &str) -> bool {
@@ -216,7 +244,9 @@ fn normalize_host_port(authority: &str) -> Option<String> {
     let trimmed = authority.trim();
     if trimmed.is_empty()
         || trimmed.len() > 262
-        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+        || trimmed
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '@' | '\\' | '%'))
     {
         return None;
     }
@@ -230,11 +260,9 @@ fn normalize_host_port(authority: &str) -> Option<String> {
                 return None;
             }
         }
-        if host.is_empty() {
-            None
-        } else {
-            Some(host.to_ascii_lowercase())
-        }
+        host.parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(|ip| ip.to_string())
     } else {
         if trimmed.matches(':').count() > 1 {
             // Unbracketed IPv6 literals are not valid URI authorities.
@@ -292,7 +320,7 @@ fn exact_allowlist_match(host: &str, allowlist: Option<&[String]>) -> bool {
         if pattern.starts_with("*.") || pattern.starts_with('.') {
             return false;
         }
-        normalize_host_port(pattern).is_some_and(|exact| exact == host)
+        pattern == host
     })
 }
 
@@ -310,11 +338,22 @@ fn parse_inet_aton_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
 
     let parse_part = |part: &str| -> Option<u64> {
         if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
-            if hex.is_empty() || hex.len() > 8 {
+            if hex.is_empty() {
+                return None;
+            }
+            let hex = hex.trim_start_matches('0');
+            if hex.is_empty() {
+                return Some(0);
+            }
+            if hex.len() > 8 {
                 return None;
             }
             u64::from_str_radix(hex, 16).ok()
         } else if part.len() > 1 && part.starts_with('0') {
+            let part = part.trim_start_matches('0');
+            if part.is_empty() {
+                return Some(0);
+            }
             if part.len() > 11 {
                 return None;
             }
@@ -376,12 +415,27 @@ fn is_nonpublic_ipv4(addr: &std::net::Ipv4Addr) -> bool {
 }
 
 fn is_nonpublic_ipv6(addr: &std::net::Ipv6Addr) -> bool {
+    if let Some(ipv4) = addr.to_ipv4_mapped().or_else(|| addr.to_ipv4()) {
+        return is_nonpublic_ipv4(&ipv4);
+    }
+    let segments = addr.segments();
+    if segments[0] == 0x2002 {
+        return is_nonpublic_ipv4(&std::net::Ipv4Addr::from(
+            ((segments[1] as u32) << 16) | segments[2] as u32,
+        ));
+    }
     addr.is_loopback()
         || addr.is_unspecified()
         || addr.is_multicast()
         || addr.is_unicast_link_local()
         || addr.is_unique_local()
-        || (addr.segments()[0] == 0x2001 && addr.segments()[1] == 0xdb8)
+        || (segments[0] == 0x2001 && segments[1] == 0xdb8)
+        || (segments[0] == 0x64
+            && segments[1] == 0xff9b
+            && (segments[2] == 1 || segments[2..6] == [0, 0, 0, 0]))
+        || (segments[..4] == [0x100, 0, 0, 0])
+        || (segments[0] & 0xffc0 == 0xfec0)
+        || (segments[0] == 0x2001 && segments[1] == 0)
 }
 
 fn is_nonpublic_ip_literal(host: &str) -> bool {
@@ -488,6 +542,14 @@ where
                 let head: Vec<u8> = self.buf.drain(..end).collect();
                 return Ok(HeadRead::Complete(head));
             }
+            if let Some(pos) = self.buf.windows(2).position(|bytes| bytes == b"\n\n") {
+                if pos + 2 > max_bytes {
+                    self.buf.clear();
+                    return Ok(HeadRead::TooLarge);
+                }
+                let head = self.buf.drain(..pos + 2).collect();
+                return Ok(HeadRead::Complete(head));
+            }
             if self.buf.len() > max_bytes {
                 self.buf.clear();
                 return Ok(HeadRead::TooLarge);
@@ -508,6 +570,9 @@ where
     ) -> Result<Option<Vec<u8>>> {
         loop {
             if let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+                if pos + 1 > max_bytes {
+                    anyhow::bail!("chunk line exceeds {max_bytes} bytes");
+                }
                 let line: Vec<u8> = self.buf.drain(..=pos).collect();
                 return Ok(Some(line));
             }
@@ -603,17 +668,27 @@ where
             let Some(size_line) = self.read_line(MAX_CHUNK_LINE_BYTES, shutdown_rx).await? else {
                 return Ok(false);
             };
-            if !write_all_cancellable(writer, &size_line, shutdown_rx).await? {
-                return Ok(false);
-            }
             if !size_line.ends_with(b"\r\n") {
                 anyhow::bail!("malformed chunk size line");
             }
             let size_text = std::str::from_utf8(&size_line[..size_line.len() - 2])
                 .map_err(|_| anyhow::anyhow!("non-utf8 chunk size"))?;
-            let size_hex = size_text.split(';').next().unwrap_or("").trim();
+            let (size_hex, extensions) = size_text
+                .split_once(';')
+                .map_or((size_text, ""), |(size, _)| {
+                    (size, &size_text[size.len()..])
+                });
+            if !valid_chunk_extensions(extensions.as_bytes()) {
+                anyhow::bail!("invalid chunk extensions");
+            }
+            if size_hex.is_empty() || !size_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                anyhow::bail!("invalid chunk size");
+            }
             let size = u64::from_str_radix(size_hex, 16)
                 .map_err(|_| anyhow::anyhow!("invalid chunk size"))?;
+            if !write_all_cancellable(writer, &size_line, shutdown_rx).await? {
+                return Ok(false);
+            }
 
             if size == 0 {
                 loop {
@@ -645,6 +720,66 @@ where
             }
         }
     }
+}
+
+fn is_http_token(byte: &u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(byte)
+}
+
+fn valid_chunk_extensions(mut rest: &[u8]) -> bool {
+    if rest
+        .iter()
+        .any(|byte| (*byte < b' ' && *byte != b'\t') || *byte == 0x7f)
+    {
+        return false;
+    }
+    while !rest.is_empty() {
+        rest = rest.trim_ascii_start();
+        let Some(after_separator) = rest.strip_prefix(b";") else {
+            return false;
+        };
+        rest = after_separator.trim_ascii_start();
+        let name_end = rest.iter().take_while(|byte| is_http_token(byte)).count();
+        if name_end == 0 {
+            return false;
+        }
+        rest = rest[name_end..].trim_ascii_start();
+        if let Some(value) = rest.strip_prefix(b"=") {
+            rest = value.trim_ascii_start();
+            if let Some(quoted) = rest.strip_prefix(b"\"") {
+                let mut offset = 0;
+                loop {
+                    let Some(byte) = quoted.get(offset) else {
+                        return false;
+                    };
+                    offset += 1;
+                    match byte {
+                        b'"' => break,
+                        b'\\' => {
+                            let Some(escaped) = quoted.get(offset) else {
+                                return false;
+                            };
+                            if !matches!(escaped, b'\t' | b' '..=b'~') {
+                                return false;
+                            }
+                            offset += 1;
+                        }
+                        b'\t' | b' '..=b'~' => {}
+                        _ => return false,
+                    }
+                }
+                rest = &quoted[offset..];
+            } else {
+                let value_end = rest.iter().take_while(|byte| is_http_token(byte)).count();
+                if value_end == 0 {
+                    return false;
+                }
+                rest = &rest[value_end..];
+            }
+        }
+        rest = rest.trim_ascii_start();
+    }
+    true
 }
 
 async fn write_all_cancellable<W>(
@@ -689,11 +824,38 @@ struct ResponseHead {
     headers: Vec<HeaderField>,
 }
 
+fn validate_head_lines(bytes: &[u8]) -> Result<()> {
+    if bytes
+        .iter()
+        .enumerate()
+        .any(|(i, byte)| *byte == b'\n' && (i == 0 || bytes[i - 1] != b'\r'))
+    {
+        anyhow::bail!("bare LF in HTTP head");
+    }
+    for line in bytes.split(|byte| *byte == b'\n').skip(1) {
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        if line[..colon].eq_ignore_ascii_case(b"content-length") {
+            let value = line[colon + 1..]
+                .strip_suffix(b"\r")
+                .unwrap_or(&line[colon + 1..]);
+            let value = value.strip_prefix(b" ").unwrap_or(value);
+            if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                anyhow::bail!("invalid content length syntax");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_request_head(bytes: &[u8]) -> Result<RequestHead> {
+    validate_head_lines(bytes)?;
     let mut raw_headers = [httparse::EMPTY_HEADER; MAX_HEADER_COUNT];
     let mut parsed = httparse::Request::new(&mut raw_headers);
     match parsed.parse(bytes)? {
-        httparse::Status::Complete(_) => {}
+        httparse::Status::Complete(n) if n == bytes.len() => {}
+        httparse::Status::Complete(_) => anyhow::bail!("trailing bytes in HTTP head"),
         httparse::Status::Partial => anyhow::bail!("incomplete request head"),
     }
     let method = parsed
@@ -727,10 +889,12 @@ fn parse_request_head(bytes: &[u8]) -> Result<RequestHead> {
 }
 
 fn parse_response_head(bytes: &[u8]) -> Result<ResponseHead> {
+    validate_head_lines(bytes)?;
     let mut raw_headers = [httparse::EMPTY_HEADER; MAX_HEADER_COUNT];
     let mut parsed = httparse::Response::new(&mut raw_headers);
     match parsed.parse(bytes)? {
-        httparse::Status::Complete(_) => {}
+        httparse::Status::Complete(n) if n == bytes.len() => {}
+        httparse::Status::Complete(_) => anyhow::bail!("trailing bytes in HTTP head"),
         httparse::Status::Partial => anyhow::bail!("incomplete response head"),
     }
     let status = parsed
@@ -805,23 +969,19 @@ enum BodyFraming {
 }
 
 fn body_framing(headers: &[HeaderField]) -> std::result::Result<BodyFraming, ()> {
-    let mut lengths = Vec::new();
+    let mut content_length = None;
     for header in headers
         .iter()
         .filter(|h| h.name.eq_ignore_ascii_case("content-length"))
     {
-        for part in header.value.split(',') {
-            let parsed = part.trim().parse::<u64>().map_err(|_| ())?;
-            lengths.push(parsed);
+        if content_length.is_some()
+            || header.value.is_empty()
+            || !header.value.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(());
         }
+        content_length = Some(header.value.parse::<u64>().map_err(|_| ())?);
     }
-    let content_length = if lengths.is_empty() {
-        None
-    } else if lengths.iter().all(|len| *len == lengths[0]) {
-        Some(lengths[0])
-    } else {
-        return Err(());
-    };
 
     let mut transfer_tokens = Vec::new();
     for header in headers
@@ -854,6 +1014,42 @@ fn body_framing(headers: &[HeaderField]) -> std::result::Result<BodyFraming, ()>
     } else {
         Ok(BodyFraming::None)
     }
+}
+
+fn validate_connection_framing(headers: &[HeaderField]) -> Result<()> {
+    let tokens = connection_tokens(headers);
+    if [
+        "content-length",
+        "transfer-encoding",
+        "host",
+        "te",
+        "trailer",
+        "upgrade",
+    ]
+    .iter()
+    .any(|name| tokens.contains(*name))
+    {
+        anyhow::bail!("connection nominates framing or routing header");
+    }
+    Ok(())
+}
+
+fn validate_request_framing(request: &RequestHead) -> Result<BodyFraming> {
+    validate_connection_framing(&request.headers)?;
+    let has_te = request
+        .headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("transfer-encoding"));
+    let has_cl = request
+        .headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("content-length"));
+    if (request.version == 0 && has_te)
+        || (request.method.eq_ignore_ascii_case("CONNECT") && (has_te || has_cl))
+    {
+        anyhow::bail!("unsupported request framing");
+    }
+    body_framing(&request.headers).map_err(|_| anyhow::anyhow!("invalid request framing"))
 }
 
 fn head_requests_close(headers: &[HeaderField], version: u8) -> bool {
@@ -1019,59 +1215,63 @@ async fn handle_connect(
     mut shutdown_rx: watch::Receiver<bool>,
     header_read_timeout: Duration,
 ) -> Result<()> {
-    let Some(mut upstream) =
-        connect_upstream(upstream_addr, &request.target, &mut shutdown_rx).await?
-    else {
-        return Ok(());
-    };
-    let rewritten = rewrite_request_head(request);
-    if !write_all_cancellable(&mut upstream.writer, &rewritten, &mut shutdown_rx).await? {
-        return Ok(());
-    }
-
-    let response_head = match upstream
-        .reader
-        .read_head(
-            MAX_PROXY_HEADER_BYTES,
-            header_read_timeout,
-            &mut shutdown_rx,
-        )
-        .await?
-    {
-        HeadRead::Complete(head) => head,
-        _ => return Ok(()),
-    };
-    let Ok(response) = parse_response_head(&response_head) else {
-        return Ok(());
-    };
-    let close_after = head_requests_close(&response.headers, response.version);
-    let rewritten_response = rewrite_response_head(&response, close_after);
-    if !write_all_cancellable(&mut client_writer, &rewritten_response, &mut shutdown_rx).await? {
-        return Ok(());
-    }
-
-    if !(200..300).contains(&response.status) {
-        let framing = body_framing(&response.headers).unwrap_or(BodyFraming::None);
-        let no_body = response_has_no_body(&request.method, response.status);
-        if !no_body {
-            match framing {
-                BodyFraming::None => {
-                    let _ = upstream
-                        .reader
-                        .forward_until_eof(&mut client_writer, &mut shutdown_rx)
-                        .await?;
-                }
-                framing => {
-                    let _ = forward_body(
-                        framing,
-                        &mut upstream.reader,
-                        &mut client_writer,
-                        &mut shutdown_rx,
-                    )
-                    .await?;
-                }
+    let mut upstream =
+        match connect_upstream(upstream_addr, &request.target, &mut shutdown_rx).await {
+            Ok(Some(upstream)) => upstream,
+            Ok(None) => return Ok(()),
+            Err(_) => {
+                send_simple_response(
+                    &mut client_writer,
+                    "502 Bad Gateway",
+                    None,
+                    &mut shutdown_rx,
+                )
+                .await?;
+                return Ok(());
             }
+        };
+    let handshake: Result<Option<ResponseHead>> = async {
+        let rewritten = rewrite_request_head(request);
+        if !write_all_cancellable(&mut upstream.writer, &rewritten, &mut shutdown_rx).await? {
+            return Ok(None);
         }
+        let HeadRead::Complete(head) = upstream
+            .reader
+            .read_head(
+                MAX_PROXY_HEADER_BYTES,
+                header_read_timeout,
+                &mut shutdown_rx,
+            )
+            .await?
+        else {
+            anyhow::bail!("failed CONNECT handshake");
+        };
+        let response = parse_response_head(&head)?;
+        validate_connection_framing(&response.headers)?;
+        body_framing(&response.headers)
+            .map_err(|_| anyhow::anyhow!("invalid CONNECT response framing"))?;
+        if !(200..300).contains(&response.status) {
+            anyhow::bail!("upstream rejected CONNECT");
+        }
+        Ok(Some(response))
+    }
+    .await;
+    let response = match handshake {
+        Ok(Some(response)) => response,
+        Ok(None) => return Ok(()),
+        Err(_) => {
+            send_simple_response(
+                &mut client_writer,
+                "502 Bad Gateway",
+                None,
+                &mut shutdown_rx,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let rewritten_response = rewrite_response_head(&response, false);
+    if !write_all_cancellable(&mut client_writer, &rewritten_response, &mut shutdown_rx).await? {
         return Ok(());
     }
 
@@ -1101,6 +1301,9 @@ async fn relay_response(
             }
         };
         let response = parse_response_head(&response_head)?;
+        validate_connection_framing(&response.headers)?;
+        let framing = body_framing(&response.headers)
+            .map_err(|_| anyhow::anyhow!("invalid upstream response framing"))?;
         let response_close = head_requests_close(&response.headers, response.version);
         let mut close_after_response = response_close;
         let rewritten = rewrite_response_head(&response, response_close);
@@ -1110,26 +1313,31 @@ async fn relay_response(
 
         let no_body = response_has_no_body(request_method, response.status);
         if !no_body {
-            let framing = body_framing(&response.headers)
-                .map_err(|_| anyhow::anyhow!("invalid upstream response framing"))?;
-            match framing {
-                BodyFraming::None => {
-                    let completed = upstream
-                        .reader
-                        .forward_until_eof(client_writer, shutdown_rx)
-                        .await?;
-                    if !completed {
-                        return Ok(false);
+            let result: Result<bool> = async {
+                match framing {
+                    BodyFraming::None => {
+                        let completed = upstream
+                            .reader
+                            .forward_until_eof(client_writer, shutdown_rx)
+                            .await?;
+                        if !completed {
+                            return Ok(false);
+                        }
+                        close_after_response = true;
                     }
-                    close_after_response = true;
-                }
-                framing => {
-                    if !forward_body(framing, &mut upstream.reader, client_writer, shutdown_rx)
-                        .await?
-                    {
-                        return Ok(false);
+                    framing => {
+                        if !forward_body(framing, &mut upstream.reader, client_writer, shutdown_rx)
+                            .await?
+                        {
+                            return Ok(false);
+                        }
                     }
                 }
+                Ok(true)
+            }
+            .await;
+            if !matches!(result, Ok(true)) {
+                return Ok(false);
             }
         }
 
@@ -1205,6 +1413,20 @@ async fn handle_client(
             break;
         }
 
+        let request_framing = match validate_request_framing(&request) {
+            Ok(framing) => framing,
+            Err(_) => {
+                send_simple_response(
+                    &mut client_write,
+                    "400 Bad Request",
+                    Some("X-Atomium-Policy-Denied: ambiguous-framing"),
+                    &mut shutdown_rx,
+                )
+                .await?;
+                break;
+            }
+        };
+
         let header_text = String::from_utf8_lossy(&head);
         let Some(destination_host) = extract_destination_host(&header_text) else {
             send_simple_response(
@@ -1275,20 +1497,6 @@ async fn handle_client(
             .await?;
             break;
         }
-
-        let request_framing = match body_framing(&request.headers) {
-            Ok(framing) => framing,
-            Err(()) => {
-                send_simple_response(
-                    &mut client_write,
-                    "400 Bad Request",
-                    Some("X-Atomium-Policy-Denied: ambiguous-framing"),
-                    &mut shutdown_rx,
-                )
-                .await?;
-                break;
-            }
-        };
 
         if request.method.eq_ignore_ascii_case("CONNECT") {
             return handle_connect(
@@ -1377,4 +1585,107 @@ async fn handle_client(
 
     let _ = client_write.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+
+    #[test]
+    fn authority_rejects_userinfo_and_conflicting_host() {
+        for head in [
+            "GET http://127.0.0.1\\@allowed.example/ HTTP/1.1\r\n\r\n",
+            "GET http://user@allowed.example/ HTTP/1.1\r\n\r\n",
+            "GET http://allowed.example/ HTTP/1.1\r\nHost: other.example\r\n\r\n",
+            "CONNECT allowed.example:443 HTTP/1.1\r\nHost: other.example:443\r\n\r\n",
+            "GET http://allowed%2eexample/ HTTP/1.1\r\n\r\n",
+        ] {
+            assert!(extract_destination_host(head).is_none());
+        }
+    }
+
+    #[test]
+    fn nonpublic_literal_classification_and_ipv6_exact_policy() {
+        for host in [
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "64:ff9b::a00:1",
+            "2002:7f00:1::",
+            "0x000000007f000001",
+            "000000000000177.0.0.1",
+            "100::1",
+            "fec0::1",
+            "2001::1",
+            "64:ff9b:1::1",
+        ] {
+            assert!(is_nonpublic_ip_literal(host));
+            assert!(!exact_allowlist_match(host, None));
+            assert!(!exact_allowlist_match(host, Some(&["*.example".into()])));
+        }
+        assert!(normalize_host_port("[fe80::1%25en0]").is_none());
+        assert!(normalize_host_port("[invalid]").is_none());
+        let normalized = normalize_allowlist_pattern("[::1]").unwrap();
+        assert!(exact_allowlist_match("::1", Some(&[normalized])));
+    }
+
+    #[test]
+    fn request_parser_rejects_extra_bytes_and_bare_lf() {
+        for bytes in [
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\nx".as_slice(),
+            b"GET / HTTP/1.1\nHost: example.com\n\n",
+            b"GET / HTTP/1.1\nHost: example.com\r\n\r\n",
+        ] {
+            assert!(parse_request_head(bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn content_length_is_single_decimal_value() {
+        for value in ["+1", "1 0", "1,1", "1,2", " 1", "1 "] {
+            assert!(body_framing(&[HeaderField {
+                name: "Content-Length".into(),
+                value: value.into()
+            }])
+            .is_err());
+        }
+        assert!(body_framing(&[
+            HeaderField {
+                name: "Content-Length".into(),
+                value: "1".into()
+            },
+            HeaderField {
+                name: "Content-Length".into(),
+                value: "1".into()
+            }
+        ])
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn bare_lf_header_still_obeys_size_limit() {
+        let mut reader = BufferedStream::new(b"GET / HTTP/1.1\nLong: too-long\n\n".as_slice());
+        let (_tx, mut rx) = watch::channel(false);
+        assert!(matches!(
+            reader
+                .read_head(16, Duration::from_secs(1), &mut rx)
+                .await
+                .unwrap(),
+            HeadRead::TooLarge
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_chunk_line_is_not_forwarded() {
+        for input in [
+            b"+1\r\nx\r\n0\r\n\r\n".as_slice(),
+            b"1;bad=\"unterminated\r\nx\r\n0\r\n\r\n",
+            b"1;bad=\x01\r\nx\r\n0\r\n\r\n",
+        ] {
+            let mut reader = BufferedStream::new(input);
+            let mut output = Vec::new();
+            let (_tx, mut rx) = watch::channel(false);
+            assert!(reader.forward_chunked(&mut output, &mut rx).await.is_err());
+            assert!(output.is_empty());
+        }
+    }
 }

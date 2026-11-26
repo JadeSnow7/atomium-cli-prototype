@@ -575,7 +575,7 @@ fn destination_host_parser_handles_ipv6_userinfo_conflicting_hosts_and_ports() {
             "GET http://user:pw@Example.COM:443/path HTTP/1.1\r\nHost: ignored.example\r\n\r\n"
         )
         .as_deref(),
-        Some("example.com")
+        None
     );
     assert_eq!(
         extract_destination_host("CONNECT [2001:4860:4860::8888]:443 HTTP/1.1\r\n\r\n").as_deref(),
@@ -964,10 +964,7 @@ async fn proxy_rejects_ambiguous_framing_malformed_requests_and_upgrade() {
         );
         s.write_all(req.as_bytes()).await.unwrap();
         let resp = read_response(&mut s).await;
-        assert!(
-            resp.starts_with("HTTP/1.1 501 Not Implemented"),
-            "got: {resp}"
-        );
+        assert!(resp.starts_with("HTTP/1.1 400 Bad Request"), "got: {resp}");
     }
 
     assert_eq!(upstream.accepts.load(Ordering::SeqCst), 0);
@@ -1126,4 +1123,175 @@ async fn proxy_revoke_interrupts_incomplete_request_body_forwarding() {
         .expect("revoked upstream connection must terminate promptly");
 
     server_task.abort();
+}
+
+#[tokio::test]
+async fn review_invalid_request_framing_never_reaches_upstream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = spawn_run_proxy(
+        "review",
+        "synthetic",
+        Some(listener.local_addr().unwrap().to_string()),
+    )
+    .await
+    .unwrap();
+    let auth = basic_auth("review", "synthetic");
+    for (method, version, extra) in [
+        (
+            "POST",
+            "1.1",
+            "Connection: Content-Length\r\nContent-Length: 4\r\n",
+        ),
+        (
+            "POST",
+            "1.1",
+            "Connection: Transfer-Encoding\r\nTransfer-Encoding: chunked\r\n",
+        ),
+        ("POST", "1.1", "Connection: Host\r\n"),
+        ("POST", "1.1", "Connection: TE\r\n"),
+        ("POST", "1.1", "Connection: Trailer\r\n"),
+        ("POST", "1.1", "Connection: Upgrade\r\n"),
+        ("POST", "1.1", "Content-Length: +1\r\n"),
+        ("POST", "1.1", "Content-Length:  1\r\n"),
+        ("POST", "1.1", "Content-Length: 1 \r\n"),
+        ("POST", "1.1", "Content-Length: 1,1\r\n"),
+        ("POST", "1.1", "Content-Length: 1\r\nContent-Length: 2\r\n"),
+        ("POST", "1.1", "Content-Length: 1\r\nContent-Length: 1\r\n"),
+        ("POST", "1.0", "Transfer-Encoding: chunked\r\n"),
+        ("CONNECT", "1.1", "Content-Length: 0\r\n"),
+        ("CONNECT", "1.1", "Transfer-Encoding: chunked\r\n"),
+    ] {
+        let target = if method == "CONNECT" {
+            "example.com:443"
+        } else {
+            "http://example.com/"
+        };
+        let mut client = TcpStream::connect(("127.0.0.1", proxy.local_port))
+            .await
+            .unwrap();
+        client.write_all(format!("{method} {target} HTTP/{version}\r\nHost: example.com\r\nProxy-Authorization: Basic {auth}\r\n{extra}\r\n0\r\n\r\n").as_bytes()).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), read_response(&mut client))
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 400"));
+    }
+    let mut client = TcpStream::connect(("127.0.0.1", proxy.local_port))
+        .await
+        .unwrap();
+    client.write_all(format!("GET http://example.com/ HTTP/1.1\nHost: example.com\nProxy-Authorization: Basic {auth}\n\n").as_bytes()).await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(2), read_response(&mut client))
+        .await
+        .unwrap();
+    assert!(response.starts_with("HTTP/1.1 400"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+    proxy.revoke();
+}
+
+#[tokio::test]
+async fn review_bad_response_is_rejected_before_head_and_stream_errors_close() {
+    for response in [
+        "HTTP/1.1 200 OK\r\nConnection: Content-Length\r\nContent-Length: 4\r\n\r\ndata",
+        "HTTP/1.1 200 OK\r\nConnection: Transfer-Encoding\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\nx",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\ninvalid\r\n",
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut pending = Vec::new();
+            read_head_buffered(&mut stream, &mut pending).await;
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let proxy = spawn_run_proxy("review-response", "synthetic", Some(addr.to_string())).await.unwrap();
+        let auth = basic_auth("review-response", "synthetic");
+        let mut client = TcpStream::connect(("127.0.0.1", proxy.local_port)).await.unwrap();
+        client.write_all(format!("GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic {auth}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut output)).await.unwrap().unwrap();
+        let output = String::from_utf8(output).unwrap();
+        if response.contains("invalid") {
+            assert!(output.starts_with("HTTP/1.1 200"));
+            assert!(!output.contains("502"));
+        } else {
+            assert!(output.starts_with("HTTP/1.1 502"));
+            assert!(!output.contains("200 OK"));
+        }
+        server.await.unwrap();
+        proxy.revoke();
+    }
+}
+
+#[tokio::test]
+async fn review_connect_failures_return_bad_gateway() {
+    for upstream_response in [
+        None,
+        Some("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = if let Some(response) = upstream_response {
+            Some(tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut pending = Vec::new();
+                read_head_buffered(&mut stream, &mut pending).await;
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }))
+        } else {
+            drop(listener);
+            None
+        };
+        let proxy = spawn_run_proxy("review-connect", "synthetic", Some(addr.to_string()))
+            .await
+            .unwrap();
+        let auth = basic_auth("review-connect", "synthetic");
+        let mut client = TcpStream::connect(("127.0.0.1", proxy.local_port))
+            .await
+            .unwrap();
+        client.write_all(format!("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic {auth}\r\n\r\n").as_bytes()).await.unwrap();
+        assert!(read_response(&mut client).await.starts_with("HTTP/1.1 502"));
+        if let Some(server) = server {
+            server.await.unwrap();
+        }
+        proxy.revoke();
+    }
+}
+
+#[tokio::test]
+async fn review_exact_ipv6_allowlist_forwards_to_mock() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut pending = Vec::new();
+        let head = read_head_buffered(&mut stream, &mut pending).await;
+        assert!(head.starts_with("GET http://[::1]/"));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let proxy = spawn_run_proxy_with_policy(
+        "review-ipv6",
+        "synthetic",
+        Some(addr.to_string()),
+        Some(vec!["[::1]".into()]),
+    )
+    .await
+    .unwrap();
+    let auth = basic_auth("review-ipv6", "synthetic");
+    let mut client = TcpStream::connect(("127.0.0.1", proxy.local_port))
+        .await
+        .unwrap();
+    client.write_all(format!("GET http://[::1]/ HTTP/1.1\r\nHost: [::1]\r\nProxy-Authorization: Basic {auth}\r\n\r\n").as_bytes()).await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(2), read_response(&mut client))
+        .await
+        .unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"));
+    server.await.unwrap();
+    proxy.revoke();
 }
