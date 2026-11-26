@@ -273,7 +273,7 @@ async fn account_and_run_subcommands_end_to_end_via_daemon_socket() {
     let secret_file = dir.path().join("oauth.json");
     std::fs::write(
         &secret_file,
-        br#"{"id_token_email":"cli@example.test","token":{"access_token":"cli-tok"}}"#,
+        br#"{"id_token_email":"cli@example.test","token":{"access_token":"cli-tok-synthetic-material"}}"#,
     )
     .expect("write synthetic oauth file");
 
@@ -294,10 +294,12 @@ async fn account_and_run_subcommands_end_to_end_via_daemon_socket() {
             .expect("exec atomium-cli");
         assert!(
             out.status.success(),
-            "atomium-cli {:?} failed: stderr={}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
+            "atomium-cli failed with status {}",
+            out.status
         );
+        assert!(!args.iter().any(|arg| arg.contains("cli-tok")));
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("cli-tok"));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("cli-tok"));
         serde_json::from_slice::<serde_json::Value>(&out.stdout)
             .expect("parse atomium-cli JSON stdout")
     };

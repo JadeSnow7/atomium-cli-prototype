@@ -1,3 +1,5 @@
+mod capture_source;
+
 use anyhow::{anyhow, Result};
 use atomium_core::ProfileStore;
 use atomium_protocol::{
@@ -7,7 +9,6 @@ use atomium_protocol::{
     TaskStatus, WorkspaceImportLimits, WorkspaceImportRequest,
 };
 use atomium_runtime::{MacOsSeatbeltBackend, RuntimeBackend};
-use base64::Engine;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -458,35 +459,21 @@ async fn main() -> Result<()> {
                                 .unwrap_or_else(|| atomium_core::AGY_KEYCHAIN_ACCOUNT.to_string()),
                         },
                     };
-                    let raw_secret_b64 = match source_file {
-                        Some(path) => {
-                            let meta = std::fs::symlink_metadata(&path).map_err(|e| {
-                                anyhow!("failed to stat source file {}: {e}", path.display())
-                            })?;
-                            if meta.file_type().is_symlink() || !meta.is_file() {
-                                return Err(anyhow!(
-                                    "source file {} must be a regular file, not a symlink or special file",
-                                    path.display()
-                                ));
-                            }
-                            Some(base64::engine::general_purpose::STANDARD.encode(
-                                std::fs::read(&path).map_err(|e| {
-                                    anyhow!("failed to read source file {}: {e}", path.display())
-                                })?,
-                            ))
-                        }
-                        None => None,
-                    };
                     let req = SubscriptionCaptureRequest {
                         profile_id,
                         display_name: name,
                         agent_kind: Some(agent_kind),
                         storage_mode: Some(storage_mode),
-                        raw_secret_b64,
+                        raw_secret_b64: None,
                         upstream_proxy_id,
                         timezone: tz,
                         lang,
                     };
+                    let req = capture_source::prepare_capture_request(
+                        req,
+                        source_file.as_deref(),
+                        &capture_source::HostKeychainReader,
+                    )?;
                     let res = rpc_call_expect_ok(
                         &sock,
                         "subscriptions.capture",

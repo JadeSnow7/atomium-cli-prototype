@@ -26,10 +26,10 @@ pub use lease::{
     LeaseManager, LeaseMode, LeaseRequest, ReclaimedLease,
 };
 pub use oauth_codec::{
-    agy_oauth_identity_key, agy_oauth_writeback_identity_matches, decode_agy_oauth_for_file,
-    default_agy_oauth_mode, encode_agy_oauth_for_keychain, project_isolated_oauth_file,
-    read_projected_oauth_file_confined, validate_agy_oauth_payload, AGY_DEFAULT_RELATIVE_PATH,
-    GO_KEYRING_B64_PREFIX,
+    agy_oauth_identity_key, agy_oauth_writeback_identity_matches, credential_key_is_sensitive,
+    decode_agy_oauth_for_file, default_agy_oauth_mode, encode_agy_oauth_for_keychain,
+    project_isolated_oauth_file, read_projected_oauth_file_confined, validate_agy_oauth_payload,
+    validate_credential_secret_lengths, AGY_DEFAULT_RELATIVE_PATH, GO_KEYRING_B64_PREFIX,
 };
 pub use profile::ProfileStore;
 pub use store::{ApprovalStore, IncompleteRun, RunStore};

@@ -75,6 +75,10 @@ PresenceProof {
 
 | 变更 | 原因 |
 | --- | --- |
+| 捕获的数据一律由可信客户端读取，包括宿主 Keychain；daemon 仅处理 `raw_secret_b64`。`ATOMIUM_USE_MACOS_KEYCHAIN` 只控制 Vault 主密钥存储 | 保持宿主读取职责位于客户端 |
+| OAuth 捕获、刷新写回及运行启动时，`access_token`、`refresh_token`、`id_token`、`client_secret`、`api_key`、`private_key`、`password`、`secret` 的字符串值均须至少 16 字节，包括嵌套字段；`token_type` 等元数据不受此限制。历史短凭据快照须重新捕获后才能运行。运行中一旦观察到含短凭据的投影，该 run 余下的 stdout/stderr 持续仅记录逐行摘要 | 防止短凭据进入审计，同时保持精确片段最短 16 字节 |
+| `runs.start` 同时拒绝小于 16 字节的历史 API key，以及含上述短敏感叶子的 ADC JSON。ADC 按自身 JSON 格式校验敏感叶子 | 在 spawn 前保护全部凭据类型，失败时释放租约 |
+| 已弃用的 `HostKeychainSlot` 模式从运行开始仅记录 stdout/stderr 的逐行摘要；daemon 在运行日志路径中不读取宿主 Keychain | 避免运行中刷新产生的未知凭据进入审计 |
 | `SubscriptionCaptureRequest` 删除 `source_file_path`；捕获请求启用严格字段校验。CLI 的 `--source-file` 改为由 CLI 在本进程读取文件后通过 `raw_secret_b64` 提交，守护进程不再按 RPC 调用方给定的宿主路径读取凭据 | 遵守“除 `workspaces.import.source_dir` 外 RPC 不接受任意宿主路径”的边界 |
 | JSON-RPC 单帧上限固定为 1 MiB，超限直接断开连接 | 防止单连接内存放大与审计存储资源耗尽 |
 | `subscriptions.capture` 的原始与规范化 OAuth 载荷上限为 256 KiB | 防止 Vault / SQLite / 事件存储资源耗尽 |

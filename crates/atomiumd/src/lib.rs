@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use atomium_core::{
     agy_oauth_writeback_identity_matches, decode_agy_oauth_for_file, default_agy_oauth_mode,
     encode_agy_oauth_for_keychain, is_process_alive, process_start_time,
@@ -161,45 +161,21 @@ fn validate_run_request_security(req: &RunStartRequest) -> std::result::Result<(
     Ok(())
 }
 
-fn credential_key_is_sensitive(key: &str) -> bool {
-    matches!(
-        key.to_ascii_lowercase().as_str(),
-        "access_token"
-            | "refresh_token"
-            | "id_token"
-            | "client_secret"
-            | "api_key"
-            | "authorization"
-            | "private_key"
-            | "password"
-            | "secret"
-            | "token"
-    )
-}
-
-fn collect_secret_fragments(
-    value: &serde_json::Value,
-    out: &mut Vec<String>,
-    sensitive_context: bool,
-) {
+fn collect_secret_fragments(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
-        serde_json::Value::String(s) => {
-            if sensitive_context && !s.is_empty() {
-                out.push(s.clone());
-            }
-        }
         serde_json::Value::Array(items) => {
             for item in items {
-                collect_secret_fragments(item, out, sensitive_context);
+                collect_secret_fragments(item, out);
             }
         }
         serde_json::Value::Object(map) => {
             for (key, item) in map {
-                collect_secret_fragments(
-                    item,
-                    out,
-                    sensitive_context || credential_key_is_sensitive(key),
-                );
+                if atomium_core::credential_key_is_sensitive(key) {
+                    if let Some(secret) = item.as_str().filter(|secret| secret.len() >= 16) {
+                        out.push(secret.to_owned());
+                    }
+                }
+                collect_secret_fragments(item, out);
             }
         }
         _ => {}
@@ -263,18 +239,19 @@ impl SecretRedactor {
                 new_fragments.push(text.to_string());
             }
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
-                collect_secret_fragments(&json, &mut new_fragments, false);
+                collect_secret_fragments(&json, &mut new_fragments);
             }
         }
         // Redact common base64 carrying forms as credential material too, not only literal plaintext.
         for fragment in new_fragments.clone() {
-            if fragment.len() >= 8 {
+            if fragment.len() >= 16 {
                 new_fragments.push(base64::engine::general_purpose::STANDARD.encode(&fragment));
             }
         }
         self.fragments.extend(new_fragments);
-        self.fragments
-            .sort_by_key(|fragment| std::cmp::Reverse(fragment.len()));
+        self.fragments.sort_unstable_by(|left, right| {
+            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+        });
         self.fragments.dedup();
     }
 
@@ -289,26 +266,36 @@ impl SecretRedactor {
                 }
             })
             .collect();
+        let mut ranges: Vec<(usize, usize)> = token_redaction_pattern()
+            .find_iter(&redacted)
+            .map(|found| (found.start(), found.end()))
+            .collect();
         for fragment in &self.fragments {
-            if !fragment.is_empty() && redacted.contains(fragment) {
-                redacted = redacted.replace(fragment, &redaction_replacement(fragment));
+            ranges.extend(
+                redacted
+                    .match_indices(fragment)
+                    .map(|(start, _)| (start, start + fragment.len())),
+            );
+        }
+        ranges.extend(
+            base64_candidate_pattern()
+                .find_iter(&redacted)
+                .filter(|found| shannon_entropy_bits_per_byte(found.as_str()) >= 4.2)
+                .map(|found| (found.start(), found.end())),
+        );
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut().filter(|last| start < last.1) {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
             }
         }
-        redacted = token_redaction_pattern()
-            .replace_all(&redacted, |caps: &regex::Captures<'_>| {
-                redaction_replacement(caps.get(0).map(|m| m.as_str()).unwrap_or_default())
-            })
-            .into_owned();
-        redacted = base64_candidate_pattern()
-            .replace_all(&redacted, |caps: &regex::Captures<'_>| {
-                let candidate = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
-                if shannon_entropy_bits_per_byte(candidate) >= 4.2 {
-                    redaction_replacement(candidate)
-                } else {
-                    candidate.to_string()
-                }
-            })
-            .into_owned();
+        for (start, end) in merged.into_iter().rev() {
+            let replacement = redaction_replacement(&redacted[start..end]);
+            redacted.replace_range(start..end, &replacement);
+        }
         if redacted.len() > MAX_LOG_LINE_BYTES {
             let mut end = MAX_LOG_LINE_BYTES;
             while !redacted.is_char_boundary(end) {
@@ -364,6 +351,45 @@ impl SecretRedactor {
             out.push(self.redact(arg));
         }
         out
+    }
+}
+
+#[derive(Default)]
+struct RunLogRedactor {
+    redactor: SecretRedactor,
+    projection_stamp: Option<(u64, u64, u64, i64, i64, i64, i64)>,
+    digest_only: bool,
+}
+
+impl RunLogRedactor {
+    fn refresh(&mut self, run_home: &Path, relative_path: Option<&str>) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let Some(relative_path) = relative_path else {
+            return Ok(());
+        };
+        let meta = std::fs::symlink_metadata(run_home.join(relative_path))?;
+        let stamp = (
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+        );
+        if self.projection_stamp != Some(stamp) {
+            if let Some(bytes) = read_projected_oauth_file_confined(run_home, relative_path)? {
+                let value = serde_json::from_slice(&bytes)?;
+                if atomium_core::validate_credential_secret_lengths(&value).is_err() {
+                    // A later valid projection cannot prove the child forgot the rejected value.
+                    self.digest_only = true;
+                } else {
+                    self.redactor.add_secret_bytes(&bytes);
+                }
+            }
+            self.projection_stamp = Some(stamp);
+        }
+        Ok(())
     }
 }
 
@@ -823,7 +849,7 @@ pub async fn run_daemon() -> Result<()> {
             DaemonState::open_with_providers(&db_path, &vault_dir, &runs_dir, &provider, keychain)?
         } else {
             let provider = FileMasterKeyProvider::new(vault_dir.join(".master-key"));
-            let keychain = Arc::new(InMemoryKeychainAdapter::new());
+            let keychain = Arc::new(atomium_core::MacOsKeychainAdapter::new());
             DaemonState::open_with_providers(&db_path, &vault_dir, &runs_dir, &provider, keychain)?
         };
 
@@ -882,40 +908,47 @@ async fn recv_live_event(
     }
 }
 
-async fn read_bounded_rpc_line<R>(reader: &mut BufReader<R>) -> Result<Option<String>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut out = Vec::new();
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return if out.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(String::from_utf8(out)?))
-            };
-        }
+#[derive(Default)]
+struct FrameReader {
+    buf: Vec<u8>,
+}
 
-        let newline_pos = available.iter().position(|b| *b == b'\n');
-        let take = newline_pos.map(|pos| pos + 1).unwrap_or(available.len());
-        if out.len().saturating_add(take) > MAX_RPC_FRAME_BYTES {
-            return Err(anyhow!(
-                "RPC frame exceeds {} byte daemon limit",
-                MAX_RPC_FRAME_BYTES
-            ));
-        }
-        out.extend_from_slice(&available[..take]);
-        reader.consume(take);
+impl FrameReader {
+    async fn read_line<R>(&mut self, reader: &mut BufReader<R>) -> Result<Option<String>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let out = &mut self.buf;
+        loop {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return if out.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(String::from_utf8(std::mem::take(out))?))
+                };
+            }
 
-        if newline_pos.is_some() {
-            if out.last() == Some(&b'\n') {
-                out.pop();
+            let newline_pos = available.iter().position(|b| *b == b'\n');
+            let take = newline_pos.map(|pos| pos + 1).unwrap_or(available.len());
+            if out.len().saturating_add(take) > MAX_RPC_FRAME_BYTES {
+                return Err(anyhow!(
+                    "RPC frame exceeds {} byte daemon limit",
+                    MAX_RPC_FRAME_BYTES
+                ));
             }
-            if out.last() == Some(&b'\r') {
-                out.pop();
+            out.extend_from_slice(&available[..take]);
+            reader.consume(take);
+
+            if newline_pos.is_some() {
+                if out.last() == Some(&b'\n') {
+                    out.pop();
+                }
+                if out.last() == Some(&b'\r') {
+                    out.pop();
+                }
+                return Ok(Some(String::from_utf8(std::mem::take(out))?));
             }
-            return Ok(Some(String::from_utf8(out)?));
         }
     }
 }
@@ -923,13 +956,14 @@ where
 pub async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
+    let mut frame_reader = FrameReader::default();
     let mut sub_rx: Option<broadcast::Receiver<TaskEvent>> = None;
     let mut last_pushed_seq: i64 = 0;
 
     loop {
         tokio::select! {
             biased;
-            line_res = read_bounded_rpc_line(&mut reader) => {
+            line_res = frame_reader.read_line(&mut reader) => {
                 let Some(line) = line_res? else {
                     break;
                 };
@@ -1757,9 +1791,10 @@ async fn handle_runs_start(
                     ..
                 } => {
                     let secret_bytes = state.vault.read_blob(vault_blob_id)?;
+                    let decoded = decode_agy_oauth_for_file(&secret_bytes)?;
+                    validate_agy_oauth_payload(&decoded)?;
                     match mode {
                         OAuthStorageMode::IsolatedFile { relative_home_path } => {
-                            let decoded = decode_agy_oauth_for_file(&secret_bytes)?;
                             let initial_digest = EncryptedVault::digest_hex(&decoded);
                             project_isolated_oauth_file(&run_home, relative_home_path, &decoded)?;
                             (
@@ -1781,7 +1816,6 @@ async fn handle_runs_start(
                                     )?;
                                 }
                             }
-                            let decoded = decode_agy_oauth_for_file(&secret_bytes)?;
                             let initial_digest = EncryptedVault::digest_hex(&decoded);
                             let encoded = encode_agy_oauth_for_keychain(&decoded);
                             state
@@ -1805,6 +1839,9 @@ async fn handle_runs_start(
                     vault_secret_id, ..
                 } => {
                     let secret_bytes = state.vault.read_blob(vault_secret_id)?;
+                    if secret_bytes.len() < 16 {
+                        return Err(anyhow!("API key credential must contain at least 16 bytes"));
+                    }
                     (
                         CredentialProjection::None,
                         None,
@@ -1813,6 +1850,9 @@ async fn handle_runs_start(
                 }
                 CredentialSpec::Adc { vault_blob_id, .. } => {
                     let secret_bytes = state.vault.read_blob(vault_blob_id)?;
+                    let value = serde_json::from_slice(&secret_bytes)
+                        .context("ADC credential must be valid JSON")?;
+                    atomium_core::validate_credential_secret_lengths(&value)?;
                     (
                         CredentialProjection::None,
                         None,
@@ -2060,21 +2100,47 @@ async fn handle_runs_start(
 
     tokio::spawn(async move {
         let _run_slot_permit = run_slot_permit;
+        let projected_relative_path = match &projection {
+            CredentialProjection::IsolatedFile {
+                relative_home_path, ..
+            } => Some(relative_home_path.clone()),
+            _ => None,
+        };
+        let log_redactor = Arc::new(std::sync::Mutex::new(RunLogRedactor {
+            redactor: secret_redactor,
+            projection_stamp: None,
+            digest_only: matches!(&projection, CredentialProjection::HostKeychainSlot { .. }),
+        }));
         let stdout_task = child.stdout.take().map(|out| {
             let st = sup_state.clone();
             let rid = sup_run_id.clone();
-            let redactor = secret_redactor.clone();
+            let log_redactor = log_redactor.clone();
+            let projected_relative_path = projected_relative_path.clone();
+            let run_home = run_home.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(out);
                 let mut emitted_bytes = 0usize;
                 let mut truncation_notified = false;
-                while let Ok(Some(line)) = read_bounded_child_line(&mut reader).await {
+                while let Ok(Some(mut line)) = read_bounded_child_line(&mut reader).await {
+                    if truncation_notified {
+                        continue;
+                    }
+                    let mut redactor = log_redactor.lock().expect("run redactor lock poisoned");
+                    // Refresh can switch this very line to digest-only output.
+                    if (emitted_bytes < MAX_LOG_STREAM_BYTES
+                        && redactor
+                            .refresh(&run_home, projected_relative_path.as_deref())
+                            .is_err())
+                        || redactor.digest_only
+                    {
+                        line = redaction_replacement(&line);
+                    }
                     emit_bounded_log_line(
                         &st,
                         &rid,
                         "stdout",
                         &line,
-                        &redactor,
+                        &redactor.redactor,
                         &mut emitted_bytes,
                         &mut truncation_notified,
                     );
@@ -2085,18 +2151,33 @@ async fn handle_runs_start(
         let stderr_task = child.stderr.take().map(|err_pipe| {
             let st = sup_state.clone();
             let rid = sup_run_id.clone();
-            let redactor = secret_redactor.clone();
+            let log_redactor = log_redactor.clone();
+            let projected_relative_path = projected_relative_path.clone();
+            let run_home = run_home.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(err_pipe);
                 let mut emitted_bytes = 0usize;
                 let mut truncation_notified = false;
-                while let Ok(Some(line)) = read_bounded_child_line(&mut reader).await {
+                while let Ok(Some(mut line)) = read_bounded_child_line(&mut reader).await {
+                    if truncation_notified {
+                        continue;
+                    }
+                    let mut redactor = log_redactor.lock().expect("run redactor lock poisoned");
+                    // Refresh can switch this very line to digest-only output.
+                    if (emitted_bytes < MAX_LOG_STREAM_BYTES
+                        && redactor
+                            .refresh(&run_home, projected_relative_path.as_deref())
+                            .is_err())
+                        || redactor.digest_only
+                    {
+                        line = redaction_replacement(&line);
+                    }
                     emit_bounded_log_line(
                         &st,
                         &rid,
                         "stderr",
                         &line,
-                        &redactor,
+                        &redactor.redactor,
                         &mut emitted_bytes,
                         &mut truncation_notified,
                     );
@@ -3014,5 +3095,82 @@ mod workspace_freeze_review_tests {
         assert!(state.active_runs.lock().await.is_empty());
         assert!(state.leases.list_active_leases().unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod gemini_review_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_observations_keep_each_secret_fragment_once() {
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "access_token": (["opaque-first-", "abcdefghijklmnop"].concat()),
+            "refresh_token": (["opaque-other-", "qrstuvwxyzabcdef"].concat())
+        }))
+        .unwrap();
+        let mut redactor = SecretRedactor::from_secret_bytes(&raw);
+        let count = redactor.fragments.len();
+        redactor.add_secret_bytes(&raw);
+        assert_eq!(redactor.fragments.len(), count);
+    }
+
+    #[test]
+    fn agy_leaf_secrets_do_not_disable_bearer_pattern() {
+        let raw = serde_json::json!({"auth_method":"consumer","id_token_email":"mock@example.test","token":{"access_token":"ya29.syntheticinitialaccess","refresh_token":"1//syntheticrefreshmaterial","token_type":"Bearer","expiry":"2026-11-26T00:00:00Z"}});
+        let redactor = SecretRedactor::from_secret_bytes(&serde_json::to_vec(&raw).unwrap());
+        assert!(redactor
+            .fragments
+            .iter()
+            .all(|fragment| fragment.len() >= 16));
+        let unrelated = format!("{}{}", "syntheticnew", "bearercredential");
+        assert!(!redactor
+            .redact(&format!("Authorization: Bearer {unrelated}"))
+            .contains(&unrelated));
+        assert_eq!(redactor.redact("ordinary Bearer"), "ordinary Bearer");
+    }
+
+    #[test]
+    fn projection_refresh_collects_new_tokens_and_keeps_observed_history() {
+        let root = std::env::temp_dir().join(format!("redactor-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = ["opaque-first-", "abcdefghijklmnop"].concat();
+        let second = ["opaque-second-", "qrstuvwxyzabcdef"].concat();
+        let mut redactor = RunLogRedactor::default();
+        for secret in [&first, &second] {
+            let raw = serde_json::to_vec(&serde_json::json!({"id_token_email":"mock@example.test","token":{"access_token":secret}})).unwrap();
+            atomium_core::project_isolated_oauth_file(&root, "oauth.json", &raw).unwrap();
+            redactor.refresh(&root, Some("oauth.json")).unwrap();
+        }
+        assert!(!redactor.redactor.redact(&first).contains(&first));
+        assert!(!redactor.redactor.redact(&second).contains(&second));
+        let count = redactor.redactor.fragments.len();
+        redactor.refresh(&root, Some("oauth.json")).unwrap();
+        assert_eq!(redactor.redactor.fragments.len(), count);
+        std::fs::remove_file(root.join("oauth.json")).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_rpc_read_retains_prefix() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(reader);
+        let mut frame_reader = FrameReader::default();
+        writer.write_all(b"prefix-").await.unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            frame_reader.read_line(&mut reader)
+        )
+        .await
+        .is_err());
+        writer.write_all(b"suffix\n").await.unwrap();
+        assert_eq!(
+            frame_reader
+                .read_line(&mut reader)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("prefix-suffix")
+        );
     }
 }

@@ -9,6 +9,44 @@ use std::path::{Component, Path, PathBuf};
 pub const AGY_DEFAULT_RELATIVE_PATH: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
 pub const GO_KEYRING_B64_PREFIX: &[u8] = b"go-keyring-base64:";
 
+pub fn credential_key_is_sensitive(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "access_token"
+            | "refresh_token"
+            | "id_token"
+            | "client_secret"
+            | "api_key"
+            | "private_key"
+            | "password"
+            | "secret"
+    )
+}
+
+pub fn validate_credential_secret_lengths(value: &serde_json::Value) -> Result<()> {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                validate_credential_secret_lengths(item)?;
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, item) in fields {
+                if credential_key_is_sensitive(key)
+                    && item.as_str().is_some_and(|secret| secret.len() < 16)
+                {
+                    return Err(anyhow!(
+                        "credential field {key} must contain at least 16 bytes"
+                    ));
+                }
+                validate_credential_secret_lengths(item)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Default macOS/Linux storage mode for `agy` OAuth credentials.
 /// Verified on macOS arm64 (`agy 1.5.16`): blocking Keychain/SecurityServer via Seatbelt
 /// causes `agy` to smoothly fall back to `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`
@@ -43,6 +81,7 @@ pub fn validate_agy_oauth_payload(bytes: &[u8]) -> Result<serde_json::Value> {
     }
     let value: serde_json::Value =
         serde_json::from_slice(bytes).context("oauth payload must be valid JSON")?;
+    validate_credential_secret_lengths(&value)?;
     let obj = value
         .as_object()
         .ok_or_else(|| anyhow!("oauth payload must be a JSON object"))?;
@@ -295,4 +334,45 @@ fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
         }
     }
     bytes
+}
+
+#[cfg(test)]
+mod credential_length_tests {
+    use super::*;
+
+    #[test]
+    fn credential_leaf_lengths_reject_short_material_and_accept_short_metadata() {
+        let valid = serde_json::json!({
+            "auth_method": "consumer",
+            "id_token_email": "length@example.test",
+            "token": {
+                "access_token": "synthetic-access-material",
+                "token_type": "Bearer",
+                "expiry": "soon"
+            }
+        });
+        assert!(validate_agy_oauth_payload(&serde_json::to_vec(&valid).unwrap()).is_ok());
+        for key in [
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "client_secret",
+            "api_key",
+            "private_key",
+            "password",
+            "secret",
+        ] {
+            for short in ["", "z", "zz9", "123456789012345"] {
+                let mut payload = valid.clone();
+                payload["nested"] = serde_json::json!([{key: short}]);
+                let result = validate_agy_oauth_payload(&serde_json::to_vec(&payload).unwrap());
+                assert!(result.is_err(), "short sensitive leaf was accepted");
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("at least 16 bytes"));
+                if !short.is_empty() {
+                    assert!(!error.contains(short));
+                }
+            }
+        }
+    }
 }

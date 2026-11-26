@@ -20,25 +20,30 @@
 ## 1. 启动守护进程
 
 ```bash
-# 只有在"捕获"这一步需要读取宿主 Keychain 中的 agy 槽位时，才打开 ATOMIUM_USE_MACOS_KEYCHAIN。
-# 打开后，Vault 主密钥也会存进 Login Keychain（com.atomium.vault / master-key）；
-# 不打开时使用 <db 所在目录>/vault/.master-key 文件。
-ATOMIUM_USE_MACOS_KEYCHAIN=1 cargo run -p atomiumd
+# 默认使用文件保存 Vault 主密钥。
+# ATOMIUM_USE_MACOS_KEYCHAIN=1 只改变 Vault 主密钥的存储位置。
+cargo run -p atomiumd
 ```
 
 默认路径：socket 为 `$TMPDIR/atomiumd.sock`，数据库为 `$TMPDIR/atomiumd.sqlite`，可以用 `ATOMIUM_SOCKET`、`ATOMIUM_DB`、`ATOMIUM_VAULT_DIR`、`ATOMIUM_RUNS_DIR` 覆盖。
 
 ## 2. 捕获订阅
 
-确认本机的 `agy` 当前登录的是订阅 A，然后执行：
+确认本机的 `agy` 当前登录的是要捕获的本人订阅，然后执行。
 
 ```bash
 cargo run -p atomium-cli -- subscription capture sub_a --name "Work Google" --tz "Asia/Shanghai"
 ```
 
-输出只包含 `content_digest` 和 `snapshot_version`，不会打印明文 token。`--tz` 和 `--lang` 是可选的**手动设置**，不传则跟随本机。
+CLI 在本进程通过 Security.framework 读取 agy 的 Keychain 槽位，macOS 可能弹出对 CLI 的访问授权。捕获数据由 CLI 规范化并通过 `raw_secret_b64` 提交，daemon 将其封存进 Vault。启动 daemon 无需为捕获设置 `ATOMIUM_USE_MACOS_KEYCHAIN=1`，该变量只决定 Vault 主密钥存储位置。
 
-如果要再添加一个订阅：在 `agy` 中退出并登录订阅 B，然后执行 `subscription capture sub_b --name "Personal Google"`。也可以用 `--source-file <json>` 从文件导入，这种方式不需要访问 Keychain。
+输出包含 `content_digest` 和 `snapshot_version`。`--tz` 和 `--lang` 是可选的手动设置，省略时跟随本机。
+
+文件捕获在各平台均可用，使用 `--source-file <json>`。文件须为普通文件且不超过 1 MiB。非 macOS 平台必须指定该选项。
+
+OAuth 数据中 `access_token`、`refresh_token`、`id_token`、`client_secret`、`api_key`、`private_key`、`password`、`secret` 的字符串值须至少 16 字节，包括嵌套字段。`token_type`、`expiry` 等元数据可以更短。捕获和刷新写回都会校验此规则，刷新被拒绝时保留原 Vault 快照。已有短凭据快照会阻止运行启动，请重新捕获有效凭据。运行中一旦观察到含短凭据的投影，该 run 后续 stdout/stderr 持续只记录逐行摘要。
+
+已弃用的 `HostKeychainSlot` 模式从运行开始就只记录 stdout/stderr 的逐行摘要，以覆盖运行中刷新的未知凭据。日志处理不会读取宿主 Keychain。默认 `IsolatedFile` 模式继续显示经过脱敏的正常输出。
 
 ## 3. 查看与运行
 

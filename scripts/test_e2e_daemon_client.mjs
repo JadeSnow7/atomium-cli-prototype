@@ -301,7 +301,7 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
       JSON.stringify({
         auth_method: "consumer",
         id_token_email: "e2e-stream@example.test",
-        token: { access_token: "e2e-tok-1" },
+        token: { access_token: "e2e-tok-1-synthetic-material" },
       }),
       "utf8",
     ).toString("base64");

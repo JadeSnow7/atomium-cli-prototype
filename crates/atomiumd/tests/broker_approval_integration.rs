@@ -519,7 +519,7 @@ async fn freeze_blocked_while_run_active_and_cancel_blocks_stale_approval() {
 
     // Capture a synthetic isolated_file account so we can start a real controlled run
     let secret_b64 = base64::engine::general_purpose::STANDARD.encode(
-        br#"{"auth_method":"consumer","id_token_email":"worker@example.test","token":{"access_token":"t1"}}"#,
+        br#"{"auth_method":"consumer","id_token_email":"worker@example.test","token":{"access_token":"t1-synthetic-oauth-material"}}"#,
     );
     let cap = client
         .call(

@@ -715,27 +715,26 @@ fn profile_store_crud_sorting_variants_and_state_transitions() {
 
 #[test]
 fn agy_oauth_payload_validation_and_identity_binding() {
-    let valid = br#"{"auth_method":"consumer","id_token_email":"Alice@Example.Test","token":{"access_token":"tok-1"}}"#;
+    let valid = br#"{"auth_method":"consumer","id_token_email":"Alice@Example.Test","token":{"access_token":"tok-1-synthetic-material"}}"#;
     assert!(validate_agy_oauth_payload(valid).is_ok());
     assert_eq!(agy_oauth_identity_key(valid).unwrap(), "alice@example.test");
 
     let same_identity =
-        br#"{"id_token_email":"alice@example.test","token":{"access_token":"tok-2"}}"#;
+        br#"{"id_token_email":"alice@example.test","token":{"access_token":"tok-2-synthetic-material"}}"#;
     let other_identity =
-        br#"{"id_token_email":"bob@example.test","token":{"access_token":"tok-2"}}"#;
+        br#"{"id_token_email":"bob@example.test","token":{"access_token":"tok-2-synthetic-material"}}"#;
     assert!(agy_oauth_writeback_identity_matches(valid, same_identity));
     assert!(!agy_oauth_writeback_identity_matches(valid, other_identity));
 
     for invalid in [
         br#"not-json"#.as_slice(),
         br#"{"id_token_email":"alice@example.test","token":"opaque"}"#.as_slice(),
-        br#"{"token":{"access_token":"tok-1"}}"#.as_slice(),
+        br#"{"token":{"access_token":"tok-1-synthetic-material"}}"#.as_slice(),
         br#"{"id_token_email":"alice@example.test","token":{"access_token":""}}"#.as_slice(),
     ] {
         assert!(
             validate_agy_oauth_payload(invalid).is_err(),
-            "invalid payload accepted: {}",
-            String::from_utf8_lossy(invalid)
+            "invalid payload accepted"
         );
     }
 }

@@ -207,8 +207,8 @@ async fn dual_distinct_isolated_file_subscriptions_run_concurrently_without_cont
     let srv = ServerHandle::start().await;
     let mut client = RpcClient::connect(&srv.sock_path).await;
 
-    let raw_a = br#"{"auth_method":"consumer","id_token_email":"alice@example.test","token":{"access_token":"tok-a-1"}}"#;
-    let raw_b = br#"{"auth_method":"consumer","id_token_email":"bob@example.test","token":{"access_token":"tok-b-1"}}"#;
+    let raw_a = br#"{"auth_method":"consumer","id_token_email":"alice@example.test","token":{"access_token":"tok-a-1-synthetic-material"}}"#;
+    let raw_b = br#"{"auth_method":"consumer","id_token_email":"bob@example.test","token":{"access_token":"tok-b-1-synthetic-material"}}"#;
     // Encode with go-keyring-base64: to prove daemon strips & decodes into pure JSON 0600 file.
     let wrapped_a_b64 =
         base64::engine::general_purpose::STANDARD.encode(encode_agy_oauth_for_keychain(raw_a));
@@ -331,8 +331,8 @@ PY
     assert_ne!(obs_a["home"], obs_b["home"], "HOME dirs must be distinct");
     assert_eq!(obs_a["email"], json!("alice@example.test"));
     assert_eq!(obs_b["email"], json!("bob@example.test"));
-    assert_eq!(obs_a["access_token"], json!("tok-a-1"));
-    assert_eq!(obs_b["access_token"], json!("tok-b-1"));
+    assert!(obs_a["access_token"] == json!("tok-a-1-synthetic-material"));
+    assert!(obs_b["access_token"] == json!("tok-b-1-synthetic-material"));
 
     // Verify true temporal overlap: max(start_a, start_b) < min(end_a, end_b)
     let start_max = obs_a["t_start"]
@@ -361,7 +361,7 @@ async fn token_refresh_automatically_writes_back_to_vault_and_bumps_snapshot_ver
     let srv = ServerHandle::start().await;
     let mut client = RpcClient::connect(&srv.sock_path).await;
 
-    let raw_v1 = br#"{"auth_method":"consumer","id_token_email":"refresh@example.test","token":{"access_token":"tok-v1"}}"#;
+    let raw_v1 = br#"{"auth_method":"consumer","id_token_email":"refresh@example.test","token":{"access_token":"tok-v1-synthetic-material"}}"#;
     let raw_v2 = br#"{"auth_method":"consumer","id_token_email":"refresh@example.test","token":{"access_token":"tok-v2-refreshed"}}"#;
     let v1_b64 = base64::engine::general_purpose::STANDARD.encode(raw_v1);
 
@@ -463,7 +463,7 @@ async fn same_account_exclusion_rejects_overlap_and_zombie_lease_marks_dirty_rec
     let srv = ServerHandle::start().await;
     let mut client = RpcClient::connect(&srv.sock_path).await;
 
-    let raw = br#"{"id_token_email":"solo@example.test","token":{"access_token":"tok-solo"}}"#;
+    let raw = br#"{"id_token_email":"solo@example.test","token":{"access_token":"tok-solo-synthetic-material"}}"#;
     let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
     let cap = client
         .call(
@@ -597,7 +597,7 @@ async fn runs_cancel_immediately_closes_inflight_egress_tcp_connection_and_clean
         }
     });
 
-    let raw = br#"{"id_token_email":"cancel@example.test","token":{"access_token":"tok-cancel"}}"#;
+    let raw = br#"{"id_token_email":"cancel@example.test","token":{"access_token":"tok-cancel-synthetic-material"}}"#;
     let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
     client
         .call(
@@ -730,7 +730,7 @@ async fn events_subscribe_streams_live_and_catches_up_after_disconnect_without_l
     let mut subscriber = RpcClient::connect(&srv.sock_path).await;
     let mut controller = RpcClient::connect(&srv.sock_path).await;
 
-    let raw = br#"{"id_token_email":"stream@example.test","token":{"access_token":"tok-stream"}}"#;
+    let raw = br#"{"id_token_email":"stream@example.test","token":{"access_token":"tok-stream-synthetic-material"}}"#;
     let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
     controller
         .call(
@@ -933,9 +933,9 @@ async fn host_keychain_slot_switch_writes_back_refreshed_previous_account() {
     let srv = ServerHandle::start().await;
     let mut client = RpcClient::connect(&srv.sock_path).await;
 
-    let raw_a = br#"{"id_token_email":"kc-a@example.test","token":{"access_token":"kc-tok-a"}}"#;
+    let raw_a = br#"{"id_token_email":"kc-a@example.test","token":{"access_token":"kc-tok-a-synthetic-material"}}"#;
     let raw_b_v1 =
-        br#"{"id_token_email":"kc-b@example.test","token":{"access_token":"kc-tok-b-1"}}"#;
+        br#"{"id_token_email":"kc-b@example.test","token":{"access_token":"kc-tok-b-1-synthetic-material"}}"#;
     let raw_b_v2 = br#"{"id_token_email":"kc-b@example.test","token":{"access_token":"kc-tok-b-2-refreshed"}}"#;
 
     // Seed mock keychain with Account A and capture in HostKeychainSlot mode.
@@ -1035,8 +1035,8 @@ async fn codex_review_regressions_orphan_recovery_capture_lock_dirty_switch_and_
     let mut client = RpcClient::connect(&srv.sock_path).await;
 
     // --- 1. subscriptions.capture rejected while active run holds exclusive OAuth lease ---
-    let raw_v1 = br#"{"id_token_email":"lock@example.test","token":{"access_token":"tok-lock-1"}}"#;
-    let raw_v2 = br#"{"id_token_email":"lock@example.test","token":{"access_token":"tok-lock-2"}}"#;
+    let raw_v1 = br#"{"id_token_email":"lock@example.test","token":{"access_token":"tok-lock-1-synthetic-material"}}"#;
+    let raw_v2 = br#"{"id_token_email":"lock@example.test","token":{"access_token":"tok-lock-2-synthetic-material"}}"#;
     let b64_v1 = base64::engine::general_purpose::STANDARD.encode(raw_v1);
     let b64_v2 = base64::engine::general_purpose::STANDARD.encode(raw_v2);
 
@@ -1094,8 +1094,8 @@ async fn codex_review_regressions_orphan_recovery_capture_lock_dirty_switch_and_
         .await;
 
     // --- 2. subscriptions.activate rejects DirtyReconcile target before touching host keychain ---
-    let kc_a = br#"{"id_token_email":"dirty-a@example.test","token":{"access_token":"dirty-a"}}"#;
-    let kc_b = br#"{"id_token_email":"dirty-b@example.test","token":{"access_token":"dirty-b"}}"#;
+    let kc_a = br#"{"id_token_email":"dirty-a@example.test","token":{"access_token":"dirty-a-synthetic-material"}}"#;
+    let kc_b = br#"{"id_token_email":"dirty-b@example.test","token":{"access_token":"dirty-b-synthetic-material"}}"#;
     srv.state
         .keychain()
         .write_generic_password(
@@ -1292,7 +1292,7 @@ wait $!
 }
 
 async fn capture_test_subscription(client: &mut RpcClient, profile_id: &str) {
-    let raw = br#"{"auth_method":"consumer","id_token_email":"iso@example.test","token":{"access_token":"tok-iso"}}"#;
+    let raw = br#"{"auth_method":"consumer","id_token_email":"iso@example.test","token":{"access_token":"tok-iso-synthetic-material"}}"#;
     let cap = client
         .call(
             json!("cap"),
@@ -1535,7 +1535,7 @@ async fn subscriptions_capture_rejects_removed_source_file_path_field() {
 async fn run_log_events_redact_oauth_material_and_bound_persisted_output() {
     let srv = ServerHandle::start().await;
     let mut client = RpcClient::connect(&srv.sock_path).await;
-    let secret_token = "zz9";
+    let secret_token = "opaque-synthetic-oauth-material";
     let raw = format!(
         r#"{{"auth_method":"consumer","id_token_email":"redact@example.test","token":{{"access_token":"{secret_token}"}}}}"#
     );
@@ -1552,8 +1552,9 @@ async fn run_log_events_redact_oauth_material_and_bound_persisted_output() {
         .await;
     assert!(cap.error.is_none(), "capture err: {:?}", cap.error);
 
+    // Keep the same 2,020,000-byte flood with fewer per-line SQLite commits.
     let script = format!(
-        "python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ[\"HOME\"],\"{AGY_DEFAULT_RELATIVE_PATH}\")))[\"token\"][\"access_token\"])'; cat \"$HOME/{AGY_DEFAULT_RELATIVE_PATH}\"; python3 -c 'import base64,os; print(base64.b64encode(open(os.path.join(os.environ[\"HOME\"],\"{AGY_DEFAULT_RELATIVE_PATH}\"),\"rb\").read()).decode())'; python3 -c 'for i in range(20000): print(\"x\" * 100)'"
+        "python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ[\"HOME\"],\"{AGY_DEFAULT_RELATIVE_PATH}\")))[\"token\"][\"access_token\"])'; cat \"$HOME/{AGY_DEFAULT_RELATIVE_PATH}\"; python3 -c 'import base64,os; print(base64.b64encode(open(os.path.join(os.environ[\"HOME\"],\"{AGY_DEFAULT_RELATIVE_PATH}\"),\"rb\").read()).decode())'; python3 -c 'for i in range(500): print(\"x\" * 4039)'"
     );
     let started = client
         .call(
@@ -1584,7 +1585,7 @@ async fn run_log_events_redact_oauth_material_and_bound_persisted_output() {
     );
     assert!(
         serialized.contains("<redacted:sha256:"),
-        "redaction marker missing from events: {serialized}"
+        "redaction marker missing from events"
     );
     let encoded_secret = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
     assert!(
@@ -1733,9 +1734,9 @@ async fn oauth_writeback_rejects_identity_switch_and_malformed_projection() {
     let srv = ServerHandle::start().await;
     let mut client = RpcClient::connect(&srv.sock_path).await;
     let original =
-        br#"{"id_token_email":"owner@example.test","token":{"access_token":"tok-owner-1"}}"#;
+        br#"{"id_token_email":"owner@example.test","token":{"access_token":"tok-owner-1-synthetic-material"}}"#;
     let attacker =
-        br#"{"id_token_email":"attacker@example.test","token":{"access_token":"tok-attacker-1"}}"#;
+        br#"{"id_token_email":"attacker@example.test","token":{"access_token":"tok-attacker-1-synthetic-material"}}"#;
 
     let cap = client
         .call(
@@ -1945,7 +1946,7 @@ async fn run_record_live_events_and_replay_redact_args_and_token_patterns() {
     let mut client = RpcClient::connect(&srv.sock_path).await;
     let oauth_token = "sk-oauthexact123456789012345";
     let raw = format!(
-        r#"{{"id_token_email":"pattern@example.test","token":{{"access_token":"{oauth_token}"}}}}"#
+        r#"{{"auth_method":"consumer","id_token_email":"pattern@example.test","token":{{"access_token":"{oauth_token}","refresh_token":"1//syntheticrefreshmaterial","token_type":"Bearer","expiry":"2026-11-26T00:00:00Z"}}}}"#
     );
     let cap = client
         .call(
@@ -1968,9 +1969,11 @@ async fn run_record_live_events_and_replay_redact_args_and_token_patterns() {
 
     let api_secret = "sk-argsecret123456789012345678";
     let token_secret = "ya29.argtokensecret1234567890";
-    let bearer_secret = "Bearer bearersecret12345678901234567890";
+    let bearer_token = format!("synthetic{}", uuid::Uuid::now_v7().simple());
+    let bearer_secret = format!("Bearer {bearer_token}");
+    let (bearer_prefix, bearer_suffix) = bearer_token.split_at(20);
     let script = format!(
-        "python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ[\"HOME\"],\"{AGY_DEFAULT_RELATIVE_PATH}\")))[\"token\"][\"access_token\"])'; echo '{bearer_secret}'"
+        "python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ[\"HOME\"],\"{AGY_DEFAULT_RELATIVE_PATH}\")))[\"token\"][\"access_token\"]); print(\"Authorization: Bearer \" + \"{bearer_prefix}\" + \"{bearer_suffix}\")'; echo 'ordinary Bearer'"
     );
     let started = client
         .call(
@@ -2002,16 +2005,31 @@ async fn run_record_live_events_and_replay_redact_args_and_token_patterns() {
         }
     }
     let live_json = serde_json::to_string(&live).unwrap();
-    for plaintext in [oauth_token, api_secret, token_secret, bearer_secret] {
+    for plaintext in [oauth_token, api_secret, token_secret, bearer_token.as_str()] {
         assert!(
             !live_json.contains(plaintext),
             "live events contain plaintext credential material"
         );
     }
 
-    let replay = srv.state.leases().query_events_after(0).unwrap();
+    let mut replay_client = RpcClient::connect(&srv.sock_path).await;
+    let replay_response = replay_client
+        .call(
+            json!("replay"),
+            "events.subscribe",
+            json!({ "after_seq": 0 }),
+        )
+        .await;
+    assert!(replay_response.error.is_none());
+    let replay_count = replay_response.result.unwrap()["replayed"]
+        .as_u64()
+        .unwrap();
+    let mut replay = Vec::new();
+    for _ in 0..replay_count {
+        replay.push(replay_client.next_push_event().await);
+    }
     let replay_json = serde_json::to_string(&replay).unwrap();
-    for plaintext in [oauth_token, api_secret, token_secret, bearer_secret] {
+    for plaintext in [oauth_token, api_secret, token_secret, bearer_token.as_str()] {
         assert!(
             !replay_json.contains(plaintext),
             "replayed events contain plaintext credential material"
@@ -2022,11 +2040,12 @@ async fn run_record_live_events_and_replay_redact_args_and_token_patterns() {
         let digest = EncryptedVault::digest_hex(secret.as_bytes());
         format!("<redacted:sha256:{}>", &digest[..12])
     }
+    assert!(live_json.contains("ordinary Bearer"));
     assert!(live_json.contains(&digest_marker(oauth_token)));
-    assert!(live_json.contains(&digest_marker(bearer_secret)));
+    assert!(live_json.contains(&digest_marker(&bearer_secret)));
 
     let record_json = serde_json::to_string(&final_rec).unwrap();
-    for plaintext in [api_secret, token_secret] {
+    for plaintext in [api_secret, token_secret, bearer_token.as_str()] {
         assert!(
             !record_json.contains(plaintext),
             "RunRecord contains plaintext argv secret"
@@ -2275,4 +2294,426 @@ async fn daemon_startup_marks_failed_export_recovery_inconsistent_and_emits_even
                     if category == "export_inconsistent" && detail.contains(&ws.workspace_id)
             )
     }));
+}
+
+#[tokio::test]
+async fn refreshed_projection_tokens_are_redacted_across_both_streams() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    capture_test_subscription(&mut client, "refresh_redact").await;
+    let script = format!(
+        r#"import json,os,sys,time
+p=os.path.join(os.environ['HOME'],'{AGY_DEFAULT_RELATIVE_PATH}')
+v=json.load(open(p))
+secret='opaque-refreshed-'+'abcdefghijklmno'
+v['token']['access_token']=secret
+with open(p,'w') as f: json.dump(v,f)
+print(secret,flush=True)
+time.sleep(0.2)
+v['token']['access_token']='second-observed-'+'qrstuvwxyzabcde'
+with open(p,'w') as f: json.dump(v,f)
+print(secret,file=sys.stderr,flush=True)
+"#
+    );
+    let started = client.call(json!("start"), "runs.start", json!({"profile_id":"refresh_redact","program":"/usr/bin/python3","args":["-c",script]})).await;
+    assert!(started.error.is_none());
+    let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+    let final_record = wait_for_run_done(&mut client, &run.run_id).await;
+    assert_eq!(final_record.status, TaskStatus::Completed);
+    let events = srv.state.leases().query_events_after(0).unwrap();
+    let secret = ["opaque-refreshed-", "abcdefghijklmno"].concat();
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(!serialized.contains(&secret));
+    assert!(!serde_json::to_string(&final_record)
+        .unwrap()
+        .contains(&secret));
+    for stream in ["stdout", "stderr"] {
+        assert!(events.iter().any(|event| matches!(&event.payload, TaskEventPayload::LogLine {stream: name,line} if name == stream && line.contains("<redacted:sha256:"))));
+    }
+}
+
+#[tokio::test]
+async fn short_credential_capture_is_rejected_without_storing_or_exposing_material() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    let raw = br#"{"id_token_email":"short@example.test","token":{"access_token":"zz9","token_type":"Bearer"}}"#;
+    let response = client
+        .call(
+            json!("short"),
+            "subscriptions.capture",
+            json!({
+                "profile_id":"short_capture", "display_name":"Short capture",
+                "raw_secret_b64":base64::engine::general_purpose::STANDARD.encode(raw)
+            }),
+        )
+        .await;
+    assert!(response.error.is_some(), "short capture must fail");
+    let error = response.error.unwrap();
+    assert_eq!(error.code, -32602);
+    assert!(error.message.contains("at least 16 bytes"));
+    assert!(!error.message.contains("zz9"));
+    assert!(srv.state.profiles().get("short_capture").unwrap().is_none());
+    assert!(srv.state.leases().list_active_leases().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn short_credential_in_existing_vault_blocks_start_and_releases_leases() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    let valid = br#"{"id_token_email":"legacy@example.test","token":{"access_token":"synthetic-legacy-material"}}"#;
+    let cap = client
+        .call(
+            json!("cap"),
+            "subscriptions.capture",
+            json!({
+                "profile_id":"short_legacy", "display_name":"Legacy",
+                "raw_secret_b64":base64::engine::general_purpose::STANDARD.encode(valid)
+            }),
+        )
+        .await;
+    assert!(cap.error.is_none());
+    let short = br#"{"id_token_email":"legacy@example.test","token":{"access_token":"zz9"}}"#;
+    let digest = srv
+        .state
+        .vault()
+        .write_blob("oauth_short_legacy", short)
+        .unwrap();
+    let mut profile = srv.state.profiles().get("short_legacy").unwrap().unwrap();
+    let atomium_protocol::CredentialSpec::OauthSnapshot { content_digest, .. } =
+        &mut profile.credential
+    else {
+        panic!("expected oauth snapshot")
+    };
+    *content_digest = digest;
+    srv.state.profiles().upsert(&profile).unwrap();
+    let started = client
+        .call(
+            json!("start"),
+            "runs.start",
+            json!({
+                "profile_id":"short_legacy", "program":"/usr/bin/true", "args":[]
+            }),
+        )
+        .await;
+    assert!(
+        started.error.is_some(),
+        "legacy short credential must block spawn"
+    );
+    let error = started.error.unwrap();
+    assert!(error.message.contains("at least 16 bytes"));
+    assert!(!error.message.contains("zz9"));
+    assert!(srv.state.runs().list().unwrap().is_empty());
+    assert!(srv.state.leases().list_active_leases().unwrap().is_empty());
+}
+
+async fn check_short_credential_projection_output(restore_valid_projection: bool) {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    let original = br#"{"id_token_email":"short-refresh@example.test","token":{"access_token":"synthetic-original-material","token_type":"Bearer"}}"#;
+    let cap = client
+        .call(
+            json!("cap"),
+            "subscriptions.capture",
+            json!({
+                "profile_id":"short_refresh", "display_name":"Short refresh",
+                "raw_secret_b64":base64::engine::general_purpose::STANDARD.encode(original)
+            }),
+        )
+        .await;
+    assert!(cap.error.is_none());
+    let script = write_executable_script(
+        srv.dir.path(),
+        "short-refresh.py",
+        &format!(
+            r#"#!/usr/bin/python3
+import json,os,sys,time
+p=os.path.join(os.environ['HOME'],'{AGY_DEFAULT_RELATIVE_PATH}')
+before=open(p).read()
+original=json.loads(before)
+v=json.loads(json.dumps(original))
+secret='zz'+'9'
+v['token']['access_token']=secret
+with open(p,'w') as f: json.dump(v,f)
+print(secret,flush=True)
+time.sleep(0.3)
+if {restore_valid_projection}:
+    with open(p,'w') as f: f.write(before)
+print('after refresh '+secret,file=sys.stderr,flush=True)
+"#,
+            restore_valid_projection = if restore_valid_projection {
+                "True"
+            } else {
+                "False"
+            }
+        ),
+    );
+    let started = client
+        .call(
+            json!("start"),
+            "runs.start",
+            json!({
+                "profile_id":"short_refresh", "program":script.to_string_lossy(), "args":[]
+            }),
+        )
+        .await;
+    assert!(started.error.is_none());
+    let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+    let final_record = wait_for_run_done(&mut client, &run.run_id).await;
+    assert_eq!(final_record.status, TaskStatus::Completed);
+    assert!(
+        !final_record.token_refreshed,
+        "short refreshed credentials must not replace Vault"
+    );
+    assert!(srv.state.vault().read_blob("oauth_short_refresh").unwrap() == original);
+    let events = srv.state.leases().query_events_after(0).unwrap();
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(
+        !serialized.contains("zz9"),
+        "short refreshed credential reached events"
+    );
+    for stream in ["stdout", "stderr"] {
+        let lines: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                TaskEventPayload::LogLine { stream: name, line }
+                    if event.run_id == run.run_id && name == stream =>
+                {
+                    Some(line)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!lines.is_empty());
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.starts_with("<redacted:sha256:") && line.ends_with('>')),
+            "tainted run output must contain only digest markers"
+        );
+    }
+    if !restore_valid_projection {
+        assert!(events.iter().any(|event| matches!(&event.payload, TaskEventPayload::LogLine {stream,line} if event.run_id == run.run_id && stream == "atomium" && line.contains("oauth write-back rejected"))));
+    }
+}
+
+#[tokio::test]
+async fn short_credential_refresh_is_rejected_and_output_is_digest_only() {
+    check_short_credential_projection_output(false).await;
+}
+
+#[tokio::test]
+async fn short_credential_observation_latches_digest_only_after_valid_restore() {
+    check_short_credential_projection_output(true).await;
+}
+
+async fn check_short_credential_kind(kind: &str) {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    let valid_oauth = br#"{"id_token_email":"kind@example.test","token":{"access_token":"synthetic-kind-material"}}"#;
+    let captured = client
+        .call(
+            json!("cap"),
+            "subscriptions.capture",
+            json!({
+                "profile_id":"credential_kind", "display_name":"Credential kind",
+                "raw_secret_b64":base64::engine::general_purpose::STANDARD.encode(valid_oauth)
+            }),
+        )
+        .await;
+    assert!(captured.error.is_none());
+    let mut profile = srv
+        .state
+        .profiles()
+        .get("credential_kind")
+        .unwrap()
+        .unwrap();
+    profile.credential = if kind == "api_key" {
+        atomium_protocol::CredentialSpec::ApiKey {
+            vault_secret_id: "kind_material".into(),
+            model_alias: "test".into(),
+            max_concurrent_runs: 1,
+        }
+    } else {
+        atomium_protocol::CredentialSpec::Adc {
+            vault_blob_id: "kind_material".into(),
+            project_id: None,
+            env_flag_name: "GOOGLE_APPLICATION_CREDENTIALS".into(),
+        }
+    };
+    srv.state.profiles().upsert(&profile).unwrap();
+    let short: &[u8] = if kind == "api_key" {
+        b"zz9"
+    } else {
+        br#"{"type":"service_account","private_key":"zz9","client_email":"kind@example.test"}"#
+    };
+    srv.state
+        .vault()
+        .write_blob("kind_material", short)
+        .unwrap();
+    let rejected = client
+        .call(
+            json!("start-short"),
+            "runs.start",
+            json!({
+                "profile_id":"credential_kind", "program":"/usr/bin/true", "args":[]
+            }),
+        )
+        .await;
+    assert!(
+        rejected.error.is_some(),
+        "short credential must block spawn"
+    );
+    let error = rejected.error.unwrap();
+    assert!(error.message.contains("at least 16 bytes"));
+    assert!(!error.message.contains("zz9"));
+    assert!(srv.state.runs().list().unwrap().is_empty());
+    assert!(srv.state.leases().list_active_leases().unwrap().is_empty());
+    let valid: &[u8] = if kind == "api_key" {
+        b"synthetic-api-key-material"
+    } else {
+        br#"{"type":"service_account","private_key":"synthetic-private-key-material","client_email":"kind@example.test"}"#
+    };
+    srv.state
+        .vault()
+        .write_blob("kind_material", valid)
+        .unwrap();
+    let started = client
+        .call(
+            json!("start-valid"),
+            "runs.start",
+            json!({
+                "profile_id":"credential_kind", "program":"/usr/bin/true", "args":[]
+            }),
+        )
+        .await;
+    assert!(started.error.is_none(), "valid credential must start");
+    let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+    assert_eq!(
+        wait_for_run_done(&mut client, &run.run_id).await.status,
+        TaskStatus::Completed
+    );
+    assert!(srv.state.leases().list_active_leases().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn short_credential_api_key_blocks_start_but_valid_material_starts() {
+    check_short_credential_kind("api_key").await;
+}
+
+#[tokio::test]
+async fn short_credential_adc_blocks_start_but_valid_material_starts() {
+    check_short_credential_kind("adc").await;
+}
+
+#[tokio::test]
+async fn host_keychain_slot_run_keeps_refreshed_output_digest_only_from_start() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    let original = br#"{"id_token_email":"host-slot@example.test","token":{"access_token":"synthetic-host-slot-material"}}"#;
+    let captured = client.call(json!("cap"), "subscriptions.capture", json!({
+        "profile_id":"host_slot_logs", "display_name":"Host slot logs",
+        "storage_mode":{"storage":"host_keychain_slot","service":"gemini","account":"antigravity"},
+        "raw_secret_b64":base64::engine::general_purpose::STANDARD.encode(original)
+    })).await;
+    assert!(captured.error.is_none());
+    let mut live_client = RpcClient::connect(&srv.sock_path).await;
+    let subscribed = live_client
+        .call(json!("live"), "events.subscribe", json!({"after_seq":0}))
+        .await;
+    assert!(subscribed.error.is_none());
+    let script = write_executable_script(
+        srv.dir.path(),
+        "host-slot-output.py",
+        r#"#!/usr/bin/python3
+import os,sys,time
+print('ordinary host slot output',flush=True)
+while not os.path.exists(os.path.join(os.environ['HOME'],'allow_output')):
+    time.sleep(0.01)
+secret='k'+'v9'
+print(secret,flush=True)
+print('refreshed '+secret,file=sys.stderr,flush=True)
+"#,
+    );
+    let started = client
+        .call(
+            json!("start"),
+            "runs.start",
+            json!({
+                "profile_id":"host_slot_logs","program":script.to_string_lossy(),"args":[]
+            }),
+        )
+        .await;
+    assert!(started.error.is_none());
+    let run: RunRecord = serde_json::from_value(started.result.unwrap()).unwrap();
+    let refreshed =
+        br#"{"id_token_email":"host-slot@example.test","token":{"access_token":"kv9"}}"#;
+    srv.state
+        .keychain()
+        .write_generic_password(
+            "gemini",
+            "antigravity",
+            &encode_agy_oauth_for_keychain(refreshed),
+        )
+        .unwrap();
+    fs::write(
+        srv.dir
+            .path()
+            .join("runs")
+            .join(&run.run_id)
+            .join("home/allow_output"),
+        b"ready",
+    )
+    .unwrap();
+    let final_record = wait_for_run_done(&mut client, &run.run_id).await;
+    assert_eq!(final_record.status, TaskStatus::Completed);
+    assert!(!final_record.token_refreshed);
+    assert!(srv.state.vault().read_blob("oauth_host_slot_logs").unwrap() == original);
+    let mut live = Vec::new();
+    loop {
+        let event = live_client.next_push_event().await;
+        let terminal = event.run_id == run.run_id
+            && matches!(&event.payload, TaskEventPayload::StatusChanged { status, .. } if *status == TaskStatus::Completed);
+        live.push(event);
+        if terminal {
+            break;
+        }
+    }
+    let mut replay_client = RpcClient::connect(&srv.sock_path).await;
+    let response = replay_client
+        .call(json!("replay"), "events.subscribe", json!({"after_seq":0}))
+        .await;
+    assert!(response.error.is_none());
+    let count = response.result.unwrap()["replayed"].as_u64().unwrap();
+    let mut replay = Vec::new();
+    for _ in 0..count {
+        replay.push(replay_client.next_push_event().await);
+    }
+    for events in [&live, &replay] {
+        assert!(
+            !serde_json::to_string(events).unwrap().contains("kv9"),
+            "refreshed host-slot value reached audit"
+        );
+        let lines: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                TaskEventPayload::LogLine { stream, line }
+                    if event.run_id == run.run_id
+                        && matches!(stream.as_str(), "stdout" | "stderr") =>
+                {
+                    Some(line)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.starts_with("<redacted:sha256:") && line.ends_with('>')),
+            "host-slot output must contain only digest markers"
+        );
+    }
+    assert!(!serde_json::to_string(&final_record)
+        .unwrap()
+        .contains("kv9"));
 }
