@@ -55,16 +55,12 @@ fn sample_profile(id: &str) -> IdentityProfile {
             content_digest: "sha256:abc".into(),
         },
         egress: EgressBinding {
-            proxy_id: "proxy-1".into(),
-            expected_country: "US".into(),
-            expected_region: None,
+            upstream_proxy_id: None,
             fail_closed: true,
-            exclusive_proxy_use: false,
         },
         locale_policy: LocalePolicy {
-            timezone: "UTC".into(),
-            lang: "en_US.UTF-8".into(),
-            auto_align_with_proxy: true,
+            timezone: Some("UTC".into()),
+            lang: Some("en_US.UTF-8".into()),
         },
         state: ProfileState::Active,
     }
@@ -83,7 +79,7 @@ fn help_lists_subcommands() {
         "probe",
         "daemon",
         "profile",
-        "account",
+        "subscription",
         "run",
         "workspace",
         "candidate",
@@ -277,12 +273,15 @@ async fn account_and_run_subcommands_end_to_end_via_daemon_socket() {
     let secret_file = dir.path().join("oauth.json");
     std::fs::write(
         &secret_file,
-        br#"{"id_token_email":"cli@example.test","token":{"access_token":"cli-tok"}}"#,
+        br#"{"id_token_email":"cli@example.test","token":{"access_token":"cli-tok-synthetic-material"}}"#,
     )
     .expect("write synthetic oauth file");
 
-    let state =
-        std::sync::Arc::new(atomiumd::DaemonState::open(&db_path).expect("open daemon state"));
+    let state = std::sync::Arc::new(
+        atomiumd::DaemonState::open(&db_path)
+            .expect("open daemon state")
+            .with_unsandboxed_dev_mode(true),
+    );
     let listener = atomiumd::bind_socket(&sock_path).expect("bind daemon socket");
     let daemon_task = tokio::spawn(async move {
         let _ = atomiumd::serve_listener(listener, state).await;
@@ -295,10 +294,12 @@ async fn account_and_run_subcommands_end_to_end_via_daemon_socket() {
             .expect("exec atomium-cli");
         assert!(
             out.status.success(),
-            "atomium-cli {:?} failed: stderr={}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
+            "atomium-cli failed with status {}",
+            out.status
         );
+        assert!(!args.iter().any(|arg| arg.contains("cli-tok")));
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("cli-tok"));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("cli-tok"));
         serde_json::from_slice::<serde_json::Value>(&out.stdout)
             .expect("parse atomium-cli JSON stdout")
     };
@@ -306,13 +307,13 @@ async fn account_and_run_subcommands_end_to_end_via_daemon_socket() {
     let sock_str = sock_path.to_string_lossy().into_owned();
     let secret_str = secret_file.to_string_lossy().into_owned();
 
-    // 1. account capture
+    // 1. subscription capture
     let cap = tokio::task::spawn_blocking({
         let sock_str = sock_str.clone();
         let secret_str = secret_str.clone();
         move || {
             run_cli(vec![
-                "account".into(),
+                "subscription".into(),
                 "--socket".into(),
                 sock_str,
                 "capture".into(),
@@ -329,12 +330,12 @@ async fn account_and_run_subcommands_end_to_end_via_daemon_socket() {
     assert_eq!(cap["profile_id"], json!("cli_acct"));
     assert_eq!(cap["snapshot_version"], json!(1));
 
-    // 2. account list
+    // 2. subscription list
     let list = tokio::task::spawn_blocking({
         let sock_str = sock_str.clone();
         move || {
             run_cli(vec![
-                "account".into(),
+                "subscription".into(),
                 "--socket".into(),
                 sock_str,
                 "list".into(),
@@ -343,36 +344,35 @@ async fn account_and_run_subcommands_end_to_end_via_daemon_socket() {
     })
     .await
     .unwrap();
-    assert_eq!(list["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(list["subscriptions"].as_array().unwrap().len(), 1);
 
-    // 3. account switch
+    // 3. subscription activate (HostKeychainSlot compat)
     let sw = tokio::task::spawn_blocking({
         let sock_str = sock_str.clone();
         move || {
             run_cli(vec![
-                "account".into(),
+                "subscription".into(),
                 "--socket".into(),
                 sock_str,
-                "switch".into(),
+                "activate".into(),
                 "cli_acct".into(),
             ])
         }
     })
     .await
     .unwrap();
-    assert_eq!(sw["switched"], json!(true));
+    assert_eq!(sw["activated"], json!(true));
 
-    // 4. account run --wait
+    // 4. subscription run --wait
     let run_done = tokio::task::spawn_blocking({
         let sock_str = sock_str.clone();
         move || {
             run_cli(vec![
-                "account".into(),
+                "subscription".into(),
                 "--socket".into(),
                 sock_str,
                 "run".into(),
                 "cli_acct".into(),
-                "--no-seatbelt".into(),
                 "--wait".into(),
                 "--".into(),
                 "/bin/sh".into(),
@@ -431,7 +431,6 @@ async fn account_and_run_subcommands_end_to_end_via_daemon_socket() {
                 "start".into(),
                 "--profile".into(),
                 "cli_acct".into(),
-                "--no-seatbelt".into(),
                 "--".into(),
                 "/bin/sleep".into(),
                 "15".into(),
@@ -474,8 +473,11 @@ async fn workspace_candidate_and_approval_cli_subcommands_end_to_end() {
     std::fs::create_dir_all(&host_repo).unwrap();
     std::fs::write(host_repo.join("hello.txt"), b"v1\n").unwrap();
 
-    let state =
-        std::sync::Arc::new(atomiumd::DaemonState::open(&db_path).expect("open daemon state"));
+    let state = std::sync::Arc::new(
+        atomiumd::DaemonState::open(&db_path)
+            .expect("open daemon state")
+            .with_unsandboxed_dev_mode(true),
+    );
     let listener = atomiumd::bind_socket(&sock_path).expect("bind daemon socket");
     let daemon_task = tokio::spawn(async move {
         let _ = atomiumd::serve_listener(listener, state).await;
@@ -659,4 +661,23 @@ async fn workspace_candidate_and_approval_cli_subcommands_end_to_end() {
     );
 
     daemon_task.abort();
+}
+
+#[test]
+fn approval_request_rejects_removed_target_dir_option() {
+    let output = Command::new(cli_bin())
+        .args([
+            "approval",
+            "request",
+            "--candidate-id",
+            "cand-1",
+            "--candidate-digest",
+            "sha256:cand",
+            "--target-dir",
+            "/tmp/untrusted-target",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--target-dir'"));
 }

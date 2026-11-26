@@ -1,10 +1,10 @@
 import type {
-  AccountSummary,
   ApprovalRequest,
   CandidateSnapshot,
   ExportResult,
   OAuthStorageMode,
   RunRecord,
+  SubscriptionSummary,
   TaskEvent,
   WorkspaceSnapshot,
 } from "@atomium/protocol-types";
@@ -17,7 +17,7 @@ import {
 } from "@atomium/client";
 
 export interface FeedbackNotice {
-  kind: "ok" | "error";
+  kind: "ok" | "info" | "error";
   title: string;
   detail: string;
   conflict?: BaselineConflictData | null;
@@ -27,7 +27,7 @@ export interface RunLaunchForm {
   profileId: string;
   program: string;
   argsText: string;
-  workspaceDir: string;
+  workspaceId: string;
   allowHostsText: string;
 }
 
@@ -36,7 +36,7 @@ export interface DesktopPanelState {
   socketPath: string;
   ping: DaemonPingResult | null;
   cursor: number;
-  accounts: AccountSummary[];
+  subscriptions: SubscriptionSummary[];
   runs: RunRecord[];
   workspaces: WorkspaceSnapshot[];
   candidates: CandidateSnapshot[];
@@ -53,7 +53,7 @@ export function createInitialPanelState(socketPath = "/tmp/atomiumd.sock"): Desk
     socketPath,
     ping: null,
     cursor: 0,
-    accounts: [],
+    subscriptions: [],
     runs: [],
     workspaces: [],
     candidates: [],
@@ -183,7 +183,7 @@ export function applyTaskEvent(prev: DesktopPanelState, ev: TaskEvent): DesktopP
 
 export interface DashboardSnapshot {
   ping: DaemonPingResult;
-  accounts: AccountSummary[];
+  subscriptions: SubscriptionSummary[];
   runs: RunRecord[];
   workspaces: WorkspaceSnapshot[];
   candidates: CandidateSnapshot[];
@@ -191,30 +191,30 @@ export interface DashboardSnapshot {
 }
 
 export async function refreshDashboard(client: AtomiumClient): Promise<DashboardSnapshot> {
-  const [ping, accounts, runs, workspaces, candidates, approvals] = await Promise.all([
+  const [ping, subscriptions, runs, workspaces, candidates, approvals] = await Promise.all([
     client.ping(),
-    client.listAccounts(),
+    client.listSubscriptions(),
     client.listRuns(),
     client.listWorkspaces(),
     client.listCandidates(),
     client.listApprovals(),
   ]);
-  return { ping, accounts, runs, workspaces, candidates, approvals };
+  return { ping, subscriptions, runs, workspaces, candidates, approvals };
 }
 
-export async function switchAccountAction(
+export async function activateSubscriptionAction(
   client: AtomiumClient,
   profileId: string,
 ): Promise<FeedbackNotice> {
   try {
-    const res = await client.switchAccount(profileId);
+    const res = await client.activateSubscription(profileId);
     return {
       kind: "ok",
-      title: `Switched account to ${res.profile_id}`,
+      title: `Activated host slot for ${res.profile_id}`,
       detail: `mode=${res.mode}${res.previous_writeback ? " (previous token written back to Vault)" : ""}`,
     };
   } catch (err) {
-    return errorToNotice("Account switch failed", err);
+    return errorToNotice("Subscription activation failed", err);
   }
 }
 
@@ -240,10 +240,9 @@ export async function startRunAction(
       program: form.program.trim(),
       args: parseArgsLine(form.argsText),
       env: {},
-      workspace_dir: form.workspaceDir.trim() ? form.workspaceDir.trim() : null,
+      workspace_id: form.workspaceId.trim() ? form.workspaceId.trim() : null,
       upstream_proxy_addr: null,
       allowed_egress_hosts: parseAllowHosts(form.allowHostsText),
-      use_seatbelt: null,
       timeout_ms: null,
     });
     return {
@@ -288,7 +287,6 @@ export async function requestCandidateApprovalAction(
       candidate_digest: candidate.candidate_digest,
       run_id: candidate.run_id,
       action_kind: "export_patch",
-      target_dir: null,
       summary: null,
     });
     return {
@@ -301,6 +299,19 @@ export async function requestCandidateApprovalAction(
     };
   } catch (err) {
     return { approval: null, notice: errorToNotice("Failed to request approval", err) };
+  }
+}
+
+export function exportVerificationFeedback(
+  verified: boolean | null | undefined,
+): { kind: FeedbackNotice["kind"]; label: string; title: string } {
+  switch (verified) {
+    case true:
+      return { kind: "ok", label: "true", title: "Approved & exported" };
+    case false:
+      return { kind: "error", label: "false", title: "Export verification failed for" };
+    default:
+      return { kind: "info", label: "unknown", title: "Export verification unknown for" };
   }
 }
 
@@ -319,12 +330,13 @@ export async function resolveApprovalAction(
     });
     if (approved && res.export_result) {
       const r = res.export_result;
+      const verification = exportVerificationFeedback(r.post_verify_ok);
       return {
         receipt: r,
         notice: {
-          kind: "ok",
-          title: `Approved & exported ${r.candidate_id}`,
-          detail: `Applied +${r.applied_added} ~${r.applied_modified} -${r.applied_deleted} to ${r.target_dir}`,
+          kind: verification.kind,
+          title: `${verification.title} ${r.candidate_id}`,
+          detail: `Applied +${r.applied_added} ~${r.applied_modified} -${r.applied_deleted} to ${r.target_dir}. post_verify_ok=${verification.label}`,
         },
       };
     }
@@ -339,6 +351,16 @@ export async function resolveApprovalAction(
       },
     };
   } catch (err) {
+    if (err instanceof AtomiumRpcError && err.isExportInconsistent()) {
+      return {
+        receipt: null,
+        notice: {
+          kind: "error",
+          title: "Export Inconsistent — Manual Recovery Required",
+          detail: "Further exports are blocked. Preserve the export journal and backups, manually inspect and reconcile the host workspace, then import the verified directory as a new workspace before exporting again.",
+        },
+      };
+    }
     if (err instanceof AtomiumRpcError && err.isBaselineConflict()) {
       const conflict = err.asBaselineConflict();
       const drifted = conflict?.drifted_paths.length

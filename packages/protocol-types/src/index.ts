@@ -1,8 +1,5 @@
 // Auto-exported protocol bindings from crates/atomium-protocol (ts-rs).
 // Do not hand-edit files under ./generated/.
-export type { AccountCaptureRequest } from "./generated/AccountCaptureRequest";
-export type { AccountSummary } from "./generated/AccountSummary";
-export type { AccountSwitchRequest } from "./generated/AccountSwitchRequest";
 export type { ApprovalCreateRequest } from "./generated/ApprovalCreateRequest";
 export type { ApprovalRequest } from "./generated/ApprovalRequest";
 export type { ApprovalResolveRequest } from "./generated/ApprovalResolveRequest";
@@ -28,6 +25,9 @@ export type { RunCancelRequest } from "./generated/RunCancelRequest";
 export type { RunRecord } from "./generated/RunRecord";
 export type { RunStartRequest } from "./generated/RunStartRequest";
 export type { SnapshotFileEntry } from "./generated/SnapshotFileEntry";
+export type { SubscriptionActivateRequest } from "./generated/SubscriptionActivateRequest";
+export type { SubscriptionCaptureRequest } from "./generated/SubscriptionCaptureRequest";
+export type { SubscriptionSummary } from "./generated/SubscriptionSummary";
 export type { TaskEvent } from "./generated/TaskEvent";
 export type { TaskEventPayload } from "./generated/TaskEventPayload";
 export type { TaskStatus } from "./generated/TaskStatus";

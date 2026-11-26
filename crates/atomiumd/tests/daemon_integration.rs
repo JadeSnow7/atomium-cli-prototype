@@ -82,7 +82,11 @@ impl ServerHandle {
         let dir = TempDirGuard::new("atmd");
         let db_path = dir.path().join("d.sqlite");
         let sock_path = dir.path().join("d.sock");
-        let state = Arc::new(atomiumd::DaemonState::open(&db_path).expect("open daemon state"));
+        let state = Arc::new(
+            atomiumd::DaemonState::open(&db_path)
+                .expect("open daemon state")
+                .with_unsandboxed_dev_mode(true),
+        );
         let listener = atomiumd::bind_socket(&sock_path).expect("bind socket");
         let server_state = state.clone();
         let task = tokio::spawn(async move {
@@ -169,16 +173,12 @@ fn sample_profile(id: &str, display_name: &str) -> IdentityProfile {
             content_digest: "sha256:deadbeef".into(),
         },
         egress: EgressBinding {
-            proxy_id: "proxy-us-1".into(),
-            expected_country: "US".into(),
-            expected_region: Some("us-west".into()),
+            upstream_proxy_id: None,
             fail_closed: true,
-            exclusive_proxy_use: true,
         },
         locale_policy: LocalePolicy {
-            timezone: "America/Los_Angeles".into(),
-            lang: "en_US.UTF-8".into(),
-            auto_align_with_proxy: false,
+            timezone: Some("America/Los_Angeles".into()),
+            lang: Some("en_US.UTF-8".into()),
         },
         state: ProfileState::Active,
     }
@@ -618,4 +618,97 @@ async fn e2e_atomiumd_binary_serves_requests_and_cleans_up() {
     assert_eq!(profiles[0].id, "e2e-acct");
 
     guard.kill_and_reap();
+}
+
+#[tokio::test]
+async fn sqlite_database_is_created_owner_only() {
+    let srv = ServerHandle::start().await;
+    let db_path = srv._dir.path().join("d.sqlite");
+    let mode = std::fs::metadata(&db_path)
+        .expect("sqlite metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "sqlite db must be owner-only");
+}
+
+#[tokio::test]
+async fn rpc_frames_above_daemon_limit_close_connection() {
+    let srv = ServerHandle::start().await;
+    let mut stream = UnixStream::connect(&srv.sock_path).await.expect("connect");
+    let oversized = "A".repeat(atomiumd::MAX_RPC_FRAME_BYTES + 1);
+    if let Err(error) = stream.write_all(oversized.as_bytes()).await {
+        assert!(expected_oversized_disconnect(&error));
+    } else if let Err(error) = stream.write_all(b"\n").await {
+        assert!(expected_oversized_disconnect(&error));
+    }
+    let _ = stream.shutdown().await;
+    let mut buf = Vec::new();
+    if let Err(error) = tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut buf).await {
+        assert!(expected_oversized_disconnect(&error));
+    }
+    assert!(
+        buf.is_empty(),
+        "oversized frame must close connection without a partial protocol response, got {} bytes",
+        buf.len()
+    );
+}
+
+#[tokio::test]
+async fn subscribed_capture_frame_survives_two_hundred_event_interruptions() {
+    let srv = ServerHandle::start().await;
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    assert!(client
+        .call(
+            json!("subscribe"),
+            "events.subscribe",
+            json!({"after_seq":0})
+        )
+        .await
+        .error
+        .is_none());
+    let raw = serde_json::to_vec(&json!({"jsonrpc":"2.0", "id":"fragmented", "method":"subscriptions.capture", "params":{"profile_id":"fragmented","display_name":"Fragmented","raw_secret_b64":"A".repeat(600 * 1024)}})).unwrap();
+    let chunk_size = raw.len().div_ceil(200);
+    let mut pieces = 0;
+    for fragment in raw.chunks(chunk_size) {
+        client.writer.write_all(fragment).await.unwrap();
+        tokio::task::yield_now().await;
+        srv.state
+            .emit_event(
+                "rpc-fragment",
+                &TaskEventPayload::LogLine {
+                    stream: "test".into(),
+                    line: "fragment ready".into(),
+                },
+            )
+            .unwrap();
+        let event: Value = serde_json::from_str(&client.next_line().await).unwrap();
+        assert_eq!(event["method"], "events.push");
+        pieces += 1;
+    }
+    assert_eq!(pieces, 200);
+    client.writer.write_all(b"\n").await.unwrap();
+    let response = client.next_response().await;
+    assert_eq!(response.id, json!("fragmented"));
+    assert_eq!(response.error.unwrap().code, -32602);
+}
+
+fn expected_oversized_disconnect(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+#[test]
+fn oversized_disconnect_accepts_broken_pipe_and_reset_only() {
+    for kind in [
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::ConnectionReset,
+    ] {
+        assert!(expected_oversized_disconnect(&std::io::Error::from(kind)));
+    }
+    assert!(!expected_oversized_disconnect(&std::io::Error::from(
+        std::io::ErrorKind::PermissionDenied
+    )));
 }

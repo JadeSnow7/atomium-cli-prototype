@@ -3,7 +3,7 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -258,6 +258,7 @@ impl MasterKeyProvider for FileMasterKeyProvider {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
+                .mode(0o600)
                 .open(&tmp_path)
                 .context("open tmp master key file")?;
             fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;

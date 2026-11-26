@@ -6,7 +6,8 @@ pub use backend::RuntimeBackend;
 pub use linux_stub::LinuxContainerStubBackend;
 pub use macos_seatbelt::{
     build_seatbelt_command, build_seatbelt_command_with_extra_read_paths, render_sbpl,
-    render_sbpl_with_extra_read_paths, run_in_seatbelt, MacOsSeatbeltBackend, SeatbeltConfig,
+    render_sbpl_with_extra_read_paths, run_in_seatbelt, KeychainPolicy, MacOsSeatbeltBackend,
+    SeatbeltConfig,
 };
 
 #[cfg(test)]
@@ -22,9 +23,9 @@ mod tests {
             run_tmp_dir: PathBuf::from("/tmp/tmp"),
             run_cache_dir: PathBuf::from("/tmp/cache"),
             allowed_proxy_port: Some(43210),
-            block_keychain: true,
-            timezone: "UTC".into(),
-            lang: "en_US.UTF-8".into(),
+            keychain_policy: KeychainPolicy::Deny,
+            timezone: Some("UTC".into()),
+            lang: Some("en_US.UTF-8".into()),
         };
         let sbpl = render_sbpl(&cfg);
         assert!(sbpl.contains("(deny default)"));

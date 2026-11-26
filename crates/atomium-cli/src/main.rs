@@ -1,10 +1,12 @@
+mod capture_source;
+
 use anyhow::{anyhow, Result};
 use atomium_core::ProfileStore;
 use atomium_protocol::{
-    AccountCaptureRequest, AccountSwitchRequest, ApprovalCreateRequest, ApprovalResolveRequest,
-    CandidateFreezeRequest, JsonRpcRequest, JsonRpcResponse, OAuthStorageMode, RunCancelRequest,
-    RunStartRequest, TaskEvent, TaskEventPayload, TaskStatus, WorkspaceImportLimits,
-    WorkspaceImportRequest,
+    ApprovalCreateRequest, ApprovalResolveRequest, CandidateFreezeRequest, JsonRpcRequest,
+    JsonRpcResponse, OAuthStorageMode, RunCancelRequest, RunStartRequest,
+    SubscriptionActivateRequest, SubscriptionCaptureRequest, TaskEvent, TaskEventPayload,
+    TaskStatus, WorkspaceImportLimits, WorkspaceImportRequest,
 };
 use atomium_runtime::{MacOsSeatbeltBackend, RuntimeBackend};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -45,12 +47,12 @@ enum Commands {
         #[arg(long)]
         db: Option<PathBuf>,
     },
-    /// Manage multi-account OAuth profiles via atomiumd Unix Socket JSON-RPC
-    Account {
+    /// Manage AI subscriptions (credentials sealed in the encrypted Vault) via atomiumd
+    Subscription {
         #[arg(long, global = true)]
         socket: Option<PathBuf>,
         #[command(subcommand)]
-        action: AccountCommands,
+        action: SubscriptionCommands,
     },
     /// Start, inspect, and cancel isolated runs via atomiumd Unix Socket JSON-RPC
     Run {
@@ -83,8 +85,8 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
-enum AccountCommands {
-    /// Capture OAuth credentials into the encrypted Vault and register a profile
+enum SubscriptionCommands {
+    /// Capture subscription credentials into the encrypted Vault and register a profile
     Capture {
         profile_id: String,
         #[arg(long)]
@@ -101,28 +103,29 @@ enum AccountCommands {
         keychain_account: Option<String>,
         #[arg(long)]
         source_file: Option<PathBuf>,
+        /// Optional enterprise upstream proxy reference
         #[arg(long)]
-        proxy_id: Option<String>,
+        upstream_proxy_id: Option<String>,
+        /// Manual timezone (default: follow host)
         #[arg(long)]
         tz: Option<String>,
+        /// Manual LANG / LC_ALL (default: follow host)
         #[arg(long)]
         lang: Option<String>,
     },
-    /// List managed accounts, states, versions, and active leases
+    /// List managed subscriptions, states, versions, and active leases
     List,
-    /// Switch active account (HostKeychainSlot write-back + atomic swap)
-    Switch { profile_id: String },
-    /// Launch a command bound to a managed account profile
+    /// Deprecated HostKeychainSlot compat mode: write a subscription into the host keychain slot
+    Activate { profile_id: String },
+    /// Launch a command bound to a managed subscription profile
     Run {
         profile_id: String,
         #[arg(long)]
-        workspace: Option<PathBuf>,
+        workspace_id: Option<String>,
         #[arg(long)]
         upstream_proxy: Option<String>,
         #[arg(long = "allow-host")]
         allow_hosts: Vec<String>,
-        #[arg(long)]
-        no_seatbelt: bool,
         #[arg(long)]
         timeout_ms: Option<i64>,
         #[arg(long)]
@@ -139,13 +142,11 @@ enum RunCommands {
         #[arg(long)]
         profile: String,
         #[arg(long)]
-        workspace: Option<PathBuf>,
+        workspace_id: Option<String>,
         #[arg(long)]
         upstream_proxy: Option<String>,
         #[arg(long = "allow-host")]
         allow_hosts: Vec<String>,
-        #[arg(long)]
-        no_seatbelt: bool,
         #[arg(long)]
         timeout_ms: Option<i64>,
         #[arg(long)]
@@ -187,13 +188,11 @@ enum WorkspaceCommands {
 
 #[derive(Subcommand)]
 enum CandidateCommands {
-    /// Freeze a working copy into a read-only candidate snapshot with diff and patch_digest
+    /// Freeze a workspace's brokered working copy into a read-only candidate snapshot
     Freeze {
         workspace_id: String,
         #[arg(long)]
         run_id: Option<String>,
-        #[arg(long)]
-        workspace_dir: Option<PathBuf>,
     },
     /// List frozen candidate snapshots
     List {
@@ -220,8 +219,6 @@ enum ApprovalCommands {
         run_id: Option<String>,
         #[arg(long)]
         action_kind: Option<String>,
-        #[arg(long)]
-        target_dir: Option<PathBuf>,
         #[arg(long)]
         summary: Option<String>,
     },
@@ -344,10 +341,9 @@ async fn wait_for_run_terminal(sock_path: &Path, run_id: &str) -> Result<serde_j
 async fn execute_run_start(
     sock_path: &Path,
     profile_id: String,
-    workspace: Option<PathBuf>,
+    workspace_id: Option<String>,
     upstream_proxy: Option<String>,
     allow_hosts: Vec<String>,
-    no_seatbelt: bool,
     timeout_ms: Option<i64>,
     wait: bool,
     command: Vec<String>,
@@ -360,10 +356,9 @@ async fn execute_run_start(
         program: program.clone(),
         args: args.to_vec(),
         env: HashMap::new(),
-        workspace_dir: workspace.map(|p| p.to_string_lossy().into_owned()),
+        workspace_id,
         upstream_proxy_addr: upstream_proxy,
         allowed_egress_hosts: allow_hosts,
-        use_seatbelt: if no_seatbelt { Some(false) } else { None },
         timeout_ms,
     };
     let started =
@@ -433,10 +428,10 @@ async fn main() -> Result<()> {
             let profiles = store.list()?;
             println!("{}", serde_json::to_string_pretty(&profiles)?);
         }
-        Commands::Account { socket, action } => {
+        Commands::Subscription { socket, action } => {
             let sock = resolve_socket_path(socket);
             match action {
-                AccountCommands::Capture {
+                SubscriptionCommands::Capture {
                     profile_id,
                     name,
                     agent_kind,
@@ -445,7 +440,7 @@ async fn main() -> Result<()> {
                     keychain_service,
                     keychain_account,
                     source_file,
-                    proxy_id,
+                    upstream_proxy_id,
                     tz,
                     lang,
                 } => {
@@ -462,42 +457,50 @@ async fn main() -> Result<()> {
                                 .unwrap_or_else(|| atomium_core::AGY_KEYCHAIN_ACCOUNT.to_string()),
                         },
                     };
-                    let req = AccountCaptureRequest {
+                    let req = SubscriptionCaptureRequest {
                         profile_id,
                         display_name: name,
                         agent_kind: Some(agent_kind),
                         storage_mode: Some(storage_mode),
                         raw_secret_b64: None,
-                        source_file_path: source_file.map(|p| p.to_string_lossy().into_owned()),
-                        proxy_id,
-                        expected_country: None,
-                        expected_region: None,
+                        upstream_proxy_id,
                         timezone: tz,
                         lang,
                     };
+                    let req = capture_source::prepare_capture_request(
+                        req,
+                        source_file.as_deref(),
+                        &capture_source::HostKeychainReader,
+                    )?;
+                    let res = rpc_call_expect_ok(
+                        &sock,
+                        "subscriptions.capture",
+                        serde_json::to_value(req)?,
+                    )
+                    .await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                SubscriptionCommands::List => {
                     let res =
-                        rpc_call_expect_ok(&sock, "accounts.capture", serde_json::to_value(req)?)
+                        rpc_call_expect_ok(&sock, "subscriptions.list", serde_json::json!({}))
                             .await?;
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
-                AccountCommands::List => {
-                    let res =
-                        rpc_call_expect_ok(&sock, "accounts.list", serde_json::json!({})).await?;
+                SubscriptionCommands::Activate { profile_id } => {
+                    let req = SubscriptionActivateRequest { profile_id };
+                    let res = rpc_call_expect_ok(
+                        &sock,
+                        "subscriptions.activate",
+                        serde_json::to_value(req)?,
+                    )
+                    .await?;
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
-                AccountCommands::Switch { profile_id } => {
-                    let req = AccountSwitchRequest { profile_id };
-                    let res =
-                        rpc_call_expect_ok(&sock, "accounts.switch", serde_json::to_value(req)?)
-                            .await?;
-                    println!("{}", serde_json::to_string_pretty(&res)?);
-                }
-                AccountCommands::Run {
+                SubscriptionCommands::Run {
                     profile_id,
-                    workspace,
+                    workspace_id,
                     upstream_proxy,
                     allow_hosts,
-                    no_seatbelt,
                     timeout_ms,
                     wait,
                     command,
@@ -505,10 +508,9 @@ async fn main() -> Result<()> {
                     execute_run_start(
                         &sock,
                         profile_id,
-                        workspace,
+                        workspace_id,
                         upstream_proxy,
                         allow_hosts,
-                        no_seatbelt,
                         timeout_ms,
                         wait,
                         command,
@@ -522,10 +524,9 @@ async fn main() -> Result<()> {
             match action {
                 RunCommands::Start {
                     profile,
-                    workspace,
+                    workspace_id,
                     upstream_proxy,
                     allow_hosts,
-                    no_seatbelt,
                     timeout_ms,
                     wait,
                     command,
@@ -533,10 +534,9 @@ async fn main() -> Result<()> {
                     execute_run_start(
                         &sock,
                         profile,
-                        workspace,
+                        workspace_id,
                         upstream_proxy,
                         allow_hosts,
-                        no_seatbelt,
                         timeout_ms,
                         wait,
                         command,
@@ -619,12 +619,10 @@ async fn main() -> Result<()> {
                 CandidateCommands::Freeze {
                     workspace_id,
                     run_id,
-                    workspace_dir,
                 } => {
                     let req = CandidateFreezeRequest {
                         workspace_id,
                         run_id,
-                        run_workspace_dir: workspace_dir.map(|p| p.to_string_lossy().into_owned()),
                         limits: None,
                     };
                     let res =
@@ -674,7 +672,6 @@ async fn main() -> Result<()> {
                     candidate_digest,
                     run_id,
                     action_kind,
-                    target_dir,
                     summary,
                 } => {
                     let req = ApprovalCreateRequest {
@@ -682,7 +679,6 @@ async fn main() -> Result<()> {
                         candidate_digest,
                         run_id,
                         action_kind,
-                        target_dir: target_dir.map(|p| p.to_string_lossy().into_owned()),
                         summary,
                     };
                     let res =

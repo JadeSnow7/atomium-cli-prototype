@@ -161,7 +161,8 @@ button.success {
   background: rgba(239, 68, 68, 0.12);
 }
 
-.badge.info {
+.badge.info,
+.banner.info {
   color: #93c5fd;
   border-color: rgba(76, 154, 255, 0.45);
   background: rgba(76, 154, 255, 0.12);

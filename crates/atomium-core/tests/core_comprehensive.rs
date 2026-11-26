@@ -1,6 +1,7 @@
 use atomium_core::{
-    decode_agy_oauth_for_file, default_agy_oauth_mode, encode_agy_oauth_for_keychain,
-    project_isolated_oauth_file, read_projected_oauth_file, EncryptedVault, LeaseManager,
+    agy_oauth_identity_key, agy_oauth_writeback_identity_matches, decode_agy_oauth_for_file,
+    default_agy_oauth_mode, encode_agy_oauth_for_keychain, project_isolated_oauth_file,
+    read_projected_oauth_file_confined, validate_agy_oauth_payload, EncryptedVault, LeaseManager,
     LeaseMode, LeaseRequest, ProfileStore, AGY_DEFAULT_RELATIVE_PATH, GO_KEYRING_B64_PREFIX,
 };
 use atomium_protocol::{
@@ -9,7 +10,7 @@ use atomium_protocol::{
 };
 use base64::Engine;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -43,16 +44,12 @@ fn make_profile(id: &str, cred: CredentialSpec, state: ProfileState) -> Identity
         agent_kind: "antigravity".into(),
         credential: cred,
         egress: EgressBinding {
-            proxy_id: "proxy-us-1".into(),
-            expected_country: "US".into(),
-            expected_region: Some("CA".into()),
+            upstream_proxy_id: None,
             fail_closed: true,
-            exclusive_proxy_use: true,
         },
         locale_policy: LocalePolicy {
-            timezone: "America/Los_Angeles".into(),
-            lang: "en_US.UTF-8".into(),
-            auto_align_with_proxy: false,
+            timezone: Some("America/Los_Angeles".into()),
+            lang: Some("en_US.UTF-8".into()),
         },
         state,
     }
@@ -717,6 +714,89 @@ fn profile_store_crud_sorting_variants_and_state_transitions() {
 }
 
 #[test]
+fn agy_oauth_payload_validation_and_identity_binding() {
+    let valid = br#"{"auth_method":"consumer","id_token_email":"Alice@Example.Test","token":{"access_token":"tok-1-synthetic-material"}}"#;
+    assert!(validate_agy_oauth_payload(valid).is_ok());
+    assert_eq!(agy_oauth_identity_key(valid).unwrap(), "alice@example.test");
+
+    let same_identity =
+        br#"{"id_token_email":"alice@example.test","token":{"access_token":"tok-2-synthetic-material"}}"#;
+    let other_identity =
+        br#"{"id_token_email":"bob@example.test","token":{"access_token":"tok-2-synthetic-material"}}"#;
+    assert!(agy_oauth_writeback_identity_matches(valid, same_identity));
+    assert!(!agy_oauth_writeback_identity_matches(valid, other_identity));
+
+    for invalid in [
+        br#"not-json"#.as_slice(),
+        br#"{"id_token_email":"alice@example.test","token":"opaque"}"#.as_slice(),
+        br#"{"token":{"access_token":"tok-1-synthetic-material"}}"#.as_slice(),
+        br#"{"id_token_email":"alice@example.test","token":{"access_token":""}}"#.as_slice(),
+    ] {
+        assert!(
+            validate_agy_oauth_payload(invalid).is_err(),
+            "invalid payload accepted"
+        );
+    }
+}
+
+#[test]
+fn read_projected_oauth_file_confined_rejects_symlink_components() {
+    let dir = TempDir::new("atomium-oauth-symlink");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let raw = br#"{"id_token_email":"alice@example.test","token":{"access_token":"tok-1"}}"#;
+    let projected = project_isolated_oauth_file(&home, AGY_DEFAULT_RELATIVE_PATH, raw).unwrap();
+    assert_eq!(
+        read_projected_oauth_file_confined(&home, AGY_DEFAULT_RELATIVE_PATH)
+            .unwrap()
+            .as_deref(),
+        Some(raw.as_slice())
+    );
+
+    // A child-controlled symlink at the final credential path must not be followed.
+    let host_file = dir.path().join("host-secret");
+    fs::write(&host_file, b"host-secret-must-not-be-read").unwrap();
+    fs::remove_file(&projected).unwrap();
+    symlink(&host_file, &projected).unwrap();
+    assert!(read_projected_oauth_file_confined(&home, AGY_DEFAULT_RELATIVE_PATH).is_err());
+
+    // A symlinked parent directory below the isolated home must also fail closed.
+    let outside_dir = dir.path().join("outside");
+    fs::create_dir_all(&outside_dir).unwrap();
+    let rel_parent = home.join(".gemini");
+    fs::remove_dir_all(&rel_parent).unwrap();
+    symlink(&outside_dir, &rel_parent).unwrap();
+    assert!(read_projected_oauth_file_confined(&home, AGY_DEFAULT_RELATIVE_PATH).is_err());
+}
+
+#[test]
+fn read_projected_oauth_file_confined_rejects_fifo_and_oversized_files() {
+    let dir = TempDir::new("atomium-oauth-confined-special");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let raw = br#"{"id_token_email":"alice@example.test","token":{"access_token":"tok-1"}}"#;
+    let projected = project_isolated_oauth_file(&home, AGY_DEFAULT_RELATIVE_PATH, raw).unwrap();
+
+    fs::remove_file(&projected).unwrap();
+    let path = std::ffi::CString::new(projected.as_os_str().as_encoded_bytes()).unwrap();
+    let rc = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo failed");
+    assert!(read_projected_oauth_file_confined(&home, AGY_DEFAULT_RELATIVE_PATH).is_err());
+
+    fs::remove_file(&projected).unwrap();
+    fs::write(&projected, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+    assert!(read_projected_oauth_file_confined(&home, AGY_DEFAULT_RELATIVE_PATH).is_err());
+
+    // A hard link to a host inode is not a path symlink, but it still escapes the run-private
+    // file boundary and must be rejected through the link count.
+    fs::remove_file(&projected).unwrap();
+    let host_file = dir.path().join("host-hardlink-source");
+    fs::write(&host_file, raw).unwrap();
+    fs::hard_link(&host_file, &projected).unwrap();
+    assert!(read_projected_oauth_file_confined(&home, AGY_DEFAULT_RELATIVE_PATH).is_err());
+}
+
+#[test]
 fn oauth_codec_encoding_decoding_projection_and_validation() {
     let dir = TempDir::new("atomium-oauth-codec");
 
@@ -780,25 +860,32 @@ fn oauth_codec_encoding_decoding_projection_and_validation() {
         );
     }
 
-    // read_projected_oauth_file behavior
+    // Confined write-back read behavior.
     assert_eq!(
-        read_projected_oauth_file(&dir.path().join("nonexistent-token")).unwrap(),
+        read_projected_oauth_file_confined(dir.path(), "nonexistent-token").unwrap(),
         None
     );
 
     let empty_file = dir.path().join("empty-token");
     fs::write(&empty_file, b"").unwrap();
-    assert_eq!(read_projected_oauth_file(&empty_file).unwrap(), None);
+    assert_eq!(
+        read_projected_oauth_file_confined(dir.path(), "empty-token").unwrap(),
+        None
+    );
 
     assert_eq!(
-        read_projected_oauth_file(&projected).unwrap().as_deref(),
+        read_projected_oauth_file_confined(dir.path(), AGY_DEFAULT_RELATIVE_PATH)
+            .unwrap()
+            .as_deref(),
         Some(raw_json_v2.as_slice())
     );
 
     let wrapped_file = dir.path().join("wrapped-token");
     fs::write(&wrapped_file, &encoded).unwrap();
     assert_eq!(
-        read_projected_oauth_file(&wrapped_file).unwrap().as_deref(),
+        read_projected_oauth_file_confined(dir.path(), "wrapped-token")
+            .unwrap()
+            .as_deref(),
         Some(raw_json.as_slice())
     );
 }

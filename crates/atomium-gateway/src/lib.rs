@@ -1,7 +1,8 @@
 pub mod egress;
 
 pub use egress::{
-    extract_destination_host, host_matches_allowlist, spawn_run_proxy, spawn_run_proxy_with_policy,
+    extract_destination_host, host_matches_allowlist, normalize_allowlist_pattern, spawn_run_proxy,
+    spawn_run_proxy_with_policy, spawn_run_proxy_with_policy_and_config, EgressProxyConfig,
     EgressProxyHandle,
 };
 

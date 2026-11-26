@@ -1,7 +1,8 @@
 use crate::profile::ProfileStore;
+use crate::sqlite_security::SecureSqliteConnection;
 use anyhow::{bail, Context, Result};
 use atomium_protocol::{ProfileState, TaskEvent, TaskEventPayload};
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, TransactionBehavior};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -133,7 +134,7 @@ impl LeaseManager {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&db_path)?;
+        let conn = SecureSqliteConnection::open(&db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute_batch(
@@ -206,7 +207,7 @@ impl LeaseManager {
         holder_proc_start: i64,
     ) -> Result<()> {
         reqs.sort_by(|a, b| a.resource_key.cmp(&b.resource_key));
-        let mut conn = Connection::open(&self.db_path)?;
+        let mut conn = SecureSqliteConnection::open(&self.db_path)?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Self::now_secs();
@@ -280,7 +281,7 @@ impl LeaseManager {
     }
 
     pub fn renew(&self, run_id: &str, ttl_secs: i64) -> Result<usize> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let now = Self::now_secs();
         let updated = conn.execute(
             "UPDATE resource_leases SET expires_at = ?1 WHERE run_id = ?2",
@@ -290,7 +291,7 @@ impl LeaseManager {
     }
 
     pub fn release_all(&self, run_id: &str) -> Result<()> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         conn.execute(
             "DELETE FROM resource_leases WHERE run_id = ?1",
             params![run_id],
@@ -300,7 +301,7 @@ impl LeaseManager {
 
     /// 回收已过期租约并返回受影响的 resource_key（保留向后兼容）
     pub fn reclaim_expired(&self) -> Result<Vec<String>> {
-        let mut conn = Connection::open(&self.db_path)?;
+        let mut conn = SecureSqliteConnection::open(&self.db_path)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Self::now_secs();
         let keys: Vec<String> = {
@@ -337,7 +338,7 @@ impl LeaseManager {
     where
         F: FnMut(i64, i64) -> bool,
     {
-        let mut conn = Connection::open(&self.db_path)?;
+        let mut conn = SecureSqliteConnection::open(&self.db_path)?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Self::now_secs();
@@ -391,7 +392,7 @@ impl LeaseManager {
     }
 
     pub fn list_active_leases(&self) -> Result<Vec<ActiveLease>> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let now = Self::now_secs();
         let mut stmt = conn.prepare(
             "SELECT resource_key, lease_mode, affinity_owner, run_id, holder_pid, holder_proc_start, expires_at
@@ -414,7 +415,7 @@ impl LeaseManager {
     }
 
     pub fn append_event(&self, run_id: &str, payload: &TaskEventPayload) -> Result<TaskEvent> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let timestamp_ms = Self::now_ms();
         let payload_json = serde_json::to_string(payload)?;
         conn.execute(
@@ -431,7 +432,7 @@ impl LeaseManager {
     }
 
     pub fn query_events_after(&self, after_seq: i64) -> Result<Vec<TaskEvent>> {
-        let conn = Connection::open(&self.db_path)?;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
         let mut stmt = conn.prepare(
             "SELECT seq, run_id, timestamp_ms, payload_json FROM task_events WHERE seq > ?1 ORDER BY seq ASC",
         )?;

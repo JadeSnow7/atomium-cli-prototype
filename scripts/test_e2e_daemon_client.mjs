@@ -203,6 +203,8 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
         ATOMIUM_SOCKET: sockPath,
         ATOMIUM_DB: dbPath,
         RUST_LOG: "info",
+        // macOS exercises the real Seatbelt backend; other OSes have no isolation backend yet.
+        ...(process.platform === "darwin" ? {} : { ATOMIUM_DEV_UNSANDBOXED: "1" }),
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -241,16 +243,12 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
         max_concurrent_runs: 2,
       },
       egress: {
-        proxy_id: "proxy-direct",
-        expected_country: "US",
-        expected_region: null,
+        upstream_proxy_id: null,
         fail_closed: true,
-        exclusive_proxy_use: false,
       },
       locale_policy: {
         timezone: "America/Los_Angeles",
-        lang: "en-US",
-        auto_align_with_proxy: false,
+        lang: null,
       },
       state: "active",
     };
@@ -295,7 +293,7 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
       (err) => err instanceof Error && err.message.includes("[-32601]"),
     );
 
-    // 7. Live accounts.capture + runs.start + real-time events.push via AtomiumClient
+    // 7. Live subscriptions.capture + runs.start + real-time events.push via AtomiumClient
     const receivedEvents = [];
     client.onEvent((ev) => receivedEvents.push(ev));
 
@@ -303,14 +301,14 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
       JSON.stringify({
         auth_method: "consumer",
         id_token_email: "e2e-stream@example.test",
-        token: { access_token: "e2e-tok-1" },
+        token: { access_token: "e2e-tok-1-synthetic-material" },
       }),
       "utf8",
     ).toString("base64");
 
-    const captured = await client.call("accounts.capture", {
+    const captured = await client.call("subscriptions.capture", {
       profile_id: "e2e-oauth-acct",
-      display_name: "E2E OAuth Account",
+      display_name: "E2E OAuth Subscription",
       raw_secret_b64: syntheticOauth,
     });
     assert.equal(captured.profile_id, "e2e-oauth-acct");
@@ -320,7 +318,6 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
       profile_id: "e2e-oauth-acct",
       program: "/bin/sh",
       args: ["-c", "echo e2e-live-line"],
-      use_seatbelt: false,
     });
     assert.ok(startedRun.run_id);
 
@@ -379,7 +376,6 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
     const cand = await client.freezeCandidate({
       workspace_id: "e2e-ws-1",
       run_id: startedRun.run_id,
-      run_workspace_dir: null,
       limits: null,
     });
     assert.equal(cand.status, "frozen");
@@ -402,7 +398,6 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
       candidate_digest: cand.candidate_digest,
       run_id: startedRun.run_id,
       action_kind: "export_patch",
-      target_dir: null,
       summary: null,
     });
     assert.equal(appr.action_kind, "export_patch");
@@ -455,6 +450,7 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
     });
     assert.equal(exportRes.resolved, true);
     assert.equal(exportRes.export_result.exported, true);
+    assert.equal(exportRes.export_result.post_verify_ok, true);
     assert.equal(await fs.readFile(path.join(hostRepo, "src", "app.txt"), "utf8"), "candidate-v2\n");
     assert.equal(await fs.readFile(path.join(hostRepo, "added.txt"), "utf8"), "new-file\n");
     assert.equal(await fs.readFile(path.join(hostRepo, ".env"), "utf8"), "SECRET=exclude-me\n");

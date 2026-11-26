@@ -1,14 +1,14 @@
 import React from "react";
-import type { AccountSummary } from "@atomium/protocol-types";
+import type { SubscriptionSummary } from "@atomium/protocol-types";
 import { formatStorageMode, shortDigest } from "../panelController";
 
-export interface AccountsPanelProps {
-  accounts: AccountSummary[];
+export interface SubscriptionsPanelProps {
+  subscriptions: SubscriptionSummary[];
   busy: boolean;
-  onSwitchAccount: (profileId: string) => void;
+  onActivateHostSlot: (profileId: string) => void;
 }
 
-function accountStateClass(state: AccountSummary["state"]): string {
+function subscriptionStateClass(state: SubscriptionSummary["state"]): string {
   switch (state) {
     case "active":
       return "badge ok";
@@ -20,42 +20,50 @@ function accountStateClass(state: AccountSummary["state"]): string {
   }
 }
 
-export function AccountsPanel({ accounts, busy, onSwitchAccount }: AccountsPanelProps) {
+export function SubscriptionsPanel({
+  subscriptions,
+  busy,
+  onActivateHostSlot,
+}: SubscriptionsPanelProps) {
   return (
-    <section className="panel-card" aria-label="Accounts and Leases">
+    <section className="panel-card" aria-label="Subscriptions and Leases">
       <div className="panel-header">
-        <h2>Accounts &amp; Leases</h2>
-        <span className="badge info">{accounts.length} profiles</span>
+        <h2>Subscriptions &amp; Leases</h2>
+        <span className="badge info">{subscriptions.length} profiles</span>
       </div>
 
-      {accounts.length === 0 ? (
-        <p className="muted">No managed accounts captured yet.</p>
+      {subscriptions.length === 0 ? (
+        <p className="muted">No subscriptions captured yet.</p>
       ) : (
         <div className="item-list">
-          {accounts.map((acct) => (
+          {subscriptions.map((acct) => (
             <div key={acct.profile_id} className="item-row" data-profile-id={acct.profile_id}>
               <div className="row-top">
                 <div className="row-tags">
                   <strong className="mono">{acct.profile_id}</strong>
                   <span>{acct.display_name}</span>
-                  <span className={accountStateClass(acct.state)}>{acct.state}</span>
+                  <span className={subscriptionStateClass(acct.state)}>{acct.state}</span>
                   {acct.active_host_slot ? (
                     <span className="badge info">active host slot</span>
                   ) : null}
                 </div>
-                <button
-                  type="button"
-                  disabled={busy || acct.state !== "active"}
-                  onClick={() => onSwitchAccount(acct.profile_id)}
-                >
-                  Switch
-                </button>
+                {acct.storage_mode?.storage === "host_keychain_slot" ? (
+                  <button
+                    type="button"
+                    disabled={busy || acct.state !== "active"}
+                    onClick={() => onActivateHostSlot(acct.profile_id)}
+                  >
+                    Activate host slot (compat)
+                  </button>
+                ) : null}
               </div>
 
               <div className="meta-row">
                 <span className="mono">agent={acct.agent_kind}</span>
                 <span className="mono">mode={formatStorageMode(acct.storage_mode)}</span>
-                <span className="mono">proxy={acct.proxy_id}</span>
+                {acct.upstream_proxy_id ? (
+                  <span className="mono">upstream={acct.upstream_proxy_id}</span>
+                ) : null}
                 {acct.snapshot_version !== null ? (
                   <span className="mono">v{String(acct.snapshot_version)}</span>
                 ) : null}

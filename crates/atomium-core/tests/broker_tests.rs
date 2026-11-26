@@ -1,5 +1,6 @@
 use atomium_core::{
     compute_tree_digest, import_workspace, validate_relative_path, BrokerError, WorkspaceBroker,
+    MAX_WORKSPACE_IMPORT_FILES, MAX_WORKSPACE_IMPORT_FILE_BYTES, MAX_WORKSPACE_IMPORT_TOTAL_BYTES,
 };
 use atomium_protocol::{CandidateStatus, FileChangeKind, WorkspaceImportLimits};
 use std::fs;
@@ -199,6 +200,77 @@ fn import_excludes_git_credentials_and_build_caches_and_enforces_limits() {
     .unwrap_err();
     assert!(
         matches!(err_total_bytes, BrokerError::LimitExceeded(ref m) if m.contains("max_total_bytes"))
+    );
+}
+
+#[test]
+fn import_limits_cannot_exceed_daemon_side_hard_ceiling() {
+    let dir = TempDirGuard::new("broker-limit-ceiling");
+    let src = dir.path().join("repo");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("ok.txt"), b"ok").unwrap();
+
+    for limits in [
+        WorkspaceImportLimits {
+            max_files: MAX_WORKSPACE_IMPORT_FILES + 1,
+            max_total_bytes: 1024,
+            max_file_bytes: 1024,
+        },
+        WorkspaceImportLimits {
+            max_files: 10,
+            max_total_bytes: MAX_WORKSPACE_IMPORT_TOTAL_BYTES + 1,
+            max_file_bytes: 1024,
+        },
+        WorkspaceImportLimits {
+            max_files: 10,
+            max_total_bytes: 1024,
+            max_file_bytes: MAX_WORKSPACE_IMPORT_FILE_BYTES + 1,
+        },
+    ] {
+        let err = import_workspace(&src, &dir.path().join("dest"), &limits).unwrap_err();
+        assert!(
+            matches!(err, BrokerError::LimitExceeded(ref m) if m.contains("daemon ceiling")),
+            "expected daemon ceiling rejection, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn import_rejects_excessive_directory_depth_and_directory_count() {
+    let dir = TempDirGuard::new("broker-depth");
+    let src = dir.path().join("deep");
+    let mut nested = src.clone();
+    for i in 0..70 {
+        nested = nested.join(format!("d{i}"));
+    }
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("leaf.txt"), b"leaf").unwrap();
+
+    let err = import_workspace(
+        &src,
+        &dir.path().join("dest-deep"),
+        &WorkspaceImportLimits::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, BrokerError::LimitExceeded(ref m) if m.contains("directory depth")),
+        "expected depth rejection, got {err:?}"
+    );
+
+    let wide = dir.path().join("wide");
+    fs::create_dir_all(&wide).unwrap();
+    for i in 0..4100 {
+        fs::create_dir_all(wide.join(format!("d{i}"))).unwrap();
+    }
+    let err = import_workspace(
+        &wide,
+        &dir.path().join("dest-wide"),
+        &WorkspaceImportLimits::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, BrokerError::LimitExceeded(ref m) if m.contains("directory count")),
+        "expected directory count rejection, got {err:?}"
     );
 }
 

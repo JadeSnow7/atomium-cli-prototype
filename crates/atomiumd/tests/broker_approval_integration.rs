@@ -51,7 +51,11 @@ impl ServerHandle {
         let dir = TempDirGuard::new("atmd-broker");
         let db_path = dir.path().join("d.sqlite");
         let sock_path = dir.path().join("d.sock");
-        let state = Arc::new(atomiumd::DaemonState::open(&db_path).expect("open daemon state"));
+        let state = Arc::new(
+            atomiumd::DaemonState::open(&db_path)
+                .expect("open daemon state")
+                .with_unsandboxed_dev_mode(true),
+        );
         let listener = atomiumd::bind_socket(&sock_path).expect("bind socket");
         let task = tokio::spawn(async move {
             let _ = atomiumd::serve_listener(listener, state).await;
@@ -61,6 +65,25 @@ impl ServerHandle {
             sock_path,
             task,
         }
+    }
+
+    async fn restart(&mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+        let db_path = self._dir.path().join("d.sqlite");
+        let state = Arc::new(
+            atomiumd::DaemonState::open(&db_path)
+                .expect("reopen daemon state")
+                .with_unsandboxed_dev_mode(true),
+        );
+        self.sock_path = self
+            ._dir
+            .path()
+            .join(format!("r-{}.sock", SEQ.fetch_add(1, Ordering::Relaxed)));
+        let listener = atomiumd::bind_socket(&self.sock_path).expect("bind restarted socket");
+        self.task = tokio::spawn(async move {
+            let _ = atomiumd::serve_listener(listener, state).await;
+        });
     }
 }
 
@@ -228,23 +251,25 @@ async fn full_dual_role_broker_review_approval_and_atomic_export_loop() {
         & 0o777;
     assert_eq!(frozen_mode, 0o400, "reviewer frozen file must be read-only");
 
-    // 5. approvals.request rejects cross-directory target_dir outside imported workspace scope (-32012)
+    // 5. Approval creation rejects every caller-supplied host target, including legacy null.
     let other_dir = TempDirGuard::new("host-ws-other");
-    let bad_target = client
-        .call(
-            json!(61),
-            "approvals.request",
-            json!({
-                "candidate_id": cand.candidate_id,
-                "candidate_digest": cand.candidate_digest,
-                "target_dir": other_dir.path().to_string_lossy()
-            }),
-        )
-        .await;
-    assert_eq!(
-        bad_target.error.expect("cross-dir target rejected").code,
-        -32012
-    );
+    for target in [Value::Null, json!(other_dir.path().to_string_lossy())] {
+        let bad_target = client
+            .call(
+                json!(61),
+                "approvals.request",
+                json!({
+                    "candidate_id": cand.candidate_id,
+                    "candidate_digest": cand.candidate_digest,
+                    "target_dir": target
+                }),
+            )
+            .await;
+        assert_eq!(
+            bad_target.error.expect("caller target rejected").code,
+            -32602
+        );
+    }
 
     // 5b. approvals.request creates persistent approval and pushes real-time ApprovalRequested
     let req_appr = client
@@ -264,6 +289,7 @@ async fn full_dual_role_broker_review_approval_and_atomic_export_loop() {
     );
     let approval: ApprovalRequest = serde_json::from_value(req_appr.result.unwrap()).unwrap();
     assert_eq!(approval.action_kind, "export_patch");
+    assert_eq!(approval.target_dir.as_deref(), Some(ws.source_dir.as_str()));
     assert_eq!(approval.candidate_digest, cand.candidate_digest);
     assert_eq!(
         approval.baseline_digest.as_deref(),
@@ -324,6 +350,7 @@ async fn full_dual_role_broker_review_approval_and_atomic_export_loop() {
     let receipt: ExportResult =
         serde_json::from_value(resolve_val["export_result"].clone()).unwrap();
     assert!(receipt.exported);
+    assert_eq!(receipt.post_verify_ok, Some(true));
     assert_eq!(receipt.applied_added, 1);
     assert_eq!(receipt.applied_modified, 1);
 
@@ -514,12 +541,12 @@ async fn freeze_blocked_while_run_active_and_cancel_blocks_stale_approval() {
 
     // Capture a synthetic isolated_file account so we can start a real controlled run
     let secret_b64 = base64::engine::general_purpose::STANDARD.encode(
-        br#"{"auth_method":"consumer","id_token_email":"worker@example.test","token":{"access_token":"t1"}}"#,
+        br#"{"auth_method":"consumer","id_token_email":"worker@example.test","token":{"access_token":"t1-synthetic-oauth-material"}}"#,
     );
     let cap = client
         .call(
             json!(1),
-            "accounts.capture",
+            "subscriptions.capture",
             json!({
                 "profile_id": "broker_worker",
                 "display_name": "Broker Worker",
@@ -551,8 +578,7 @@ async fn freeze_blocked_while_run_active_and_cancel_blocks_stale_approval() {
                 "profile_id": "broker_worker",
                 "program": "/bin/sleep",
                 "args": ["15"],
-                "workspace_dir": ws.working_dir,
-                "use_seatbelt": false
+                "workspace_id": ws.workspace_id
             }),
         )
         .await;
@@ -627,4 +653,130 @@ async fn freeze_blocked_while_run_active_and_cancel_blocks_stale_approval() {
             .code,
         -32011
     );
+}
+
+#[tokio::test]
+async fn failed_journal_and_database_quarantine_writes_still_block_approval_after_restart() {
+    let mut srv = ServerHandle::start().await;
+    let host_dir = TempDirGuard::new("host-journal-fail");
+    fs::write(host_dir.path().join("a.txt"), b"baseline").unwrap();
+    let mut client = RpcClient::connect(&srv.sock_path).await;
+    let ws: WorkspaceSnapshot = serde_json::from_value(
+        client
+            .call(
+                json!(1),
+                "workspaces.import",
+                json!({"source_dir": host_dir.path()}),
+            )
+            .await
+            .result
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(Path::new(&ws.working_dir).join("a.txt"), b"updated").unwrap();
+    let candidate: CandidateSnapshot = serde_json::from_value(
+        client
+            .call(
+                json!(2),
+                "candidates.freeze",
+                json!({"workspace_id": ws.workspace_id}),
+            )
+            .await
+            .result
+            .unwrap(),
+    )
+    .unwrap();
+    let approval: ApprovalRequest = serde_json::from_value(
+        client
+            .call(
+                json!(3),
+                "approvals.request",
+                json!({
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_digest": candidate.candidate_digest
+                }),
+            )
+            .await
+            .result
+            .unwrap(),
+    )
+    .unwrap();
+    drop(client);
+    srv.task.abort();
+
+    let export_dir = srv._dir.path().join("broker/exports/exp-injected-failure");
+    fs::create_dir_all(export_dir.join("journal.json.tmp")).unwrap();
+    let journal = json!({
+        "phase": "rolling_back", "export_id": "exp-injected-failure",
+        "approval_id": approval.approval_id, "receipt": null,
+        "workspace_id": ws.workspace_id, "target_dir": host_dir.path(),
+        "operations": [{
+            "prepared": true,
+            "op": "write",
+            "final_path": host_dir.path().join("a.txt"),
+            "temp_path": null,
+            "backup_path": export_dir.join("missing-backup"),
+            "expected_sha256": null
+        }],
+        "done_ops": [0],
+        "post_verify_ok": false,
+        "error": "injected interrupted export"
+    });
+    fs::write(
+        export_dir.join("journal.json"),
+        serde_json::to_vec(&journal).unwrap(),
+    )
+    .unwrap();
+    let db = atomium_core::sqlite_security::SecureSqliteConnection::open(
+        srv._dir.path().join("d.sqlite"),
+    )
+    .unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER reject_quarantine
+         BEFORE INSERT ON workspace_export_inconsistencies
+         BEGIN
+             SELECT RAISE(ABORT, 'injected quarantine write failure');
+         END;",
+    )
+    .unwrap();
+    drop(db);
+
+    for _ in 0..2 {
+        srv.restart().await;
+        let mut client = RpcClient::connect(&srv.sock_path).await;
+        let response = client
+            .call(
+                json!(4),
+                "approvals.resolve",
+                json!({
+                    "approval_id": approval.approval_id,
+                    "candidate_digest": candidate.candidate_digest,
+                    "approved": true
+                }),
+            )
+            .await;
+        assert_eq!(
+            response.error.expect("workspace remains blocked").code,
+            -32018
+        );
+        assert_eq!(
+            fs::read(host_dir.path().join("a.txt")).unwrap(),
+            b"baseline"
+        );
+        let journal: Value =
+            serde_json::from_slice(&fs::read(export_dir.join("journal.json")).unwrap()).unwrap();
+        assert_eq!(journal["phase"], "rolling_back");
+        let db = atomium_core::sqlite_security::SecureSqliteConnection::open(
+            srv._dir.path().join("d.sqlite"),
+        )
+        .unwrap();
+        let count: usize = db
+            .query_row(
+                "SELECT count(*) FROM workspace_export_inconsistencies",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 }

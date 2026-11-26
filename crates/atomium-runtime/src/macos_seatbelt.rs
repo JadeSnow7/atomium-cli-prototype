@@ -1,11 +1,30 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use atomium_protocol::{CapabilitiesReport, ProbeEvidence};
+use atomium_protocol::{CapabilitiesReport, CredentialSpec, OAuthStorageMode, ProbeEvidence};
 use std::path::{Path, PathBuf};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 
 use crate::backend::RuntimeBackend;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeychainPolicy {
+    #[default]
+    Deny,
+    AllowLegacyHostSlot,
+}
+
+impl KeychainPolicy {
+    pub fn for_credential(credential: &CredentialSpec) -> Self {
+        match credential {
+            CredentialSpec::OauthSnapshot {
+                mode: OAuthStorageMode::HostKeychainSlot { .. },
+                ..
+            } => Self::AllowLegacyHostSlot,
+            _ => Self::Deny,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SeatbeltConfig {
@@ -15,10 +34,12 @@ pub struct SeatbeltConfig {
     pub run_cache_dir: PathBuf,
     /// 若为 Some(port)，仅放行 127.0.0.1:<port>；为 None 则完全断网
     pub allowed_proxy_port: Option<u16>,
-    /// OAuth isolatedFile 模式下阻断 Keychain，强制 CLI 回退读 $HOME 凭据文件
-    pub block_keychain: bool,
-    pub timezone: String,
-    pub lang: String,
+    /// Keychain 默认阻断；仅已弃用的 HostKeychainSlot 兼容模式显式放行
+    pub keychain_policy: KeychainPolicy,
+    /// 手动设置的时区；None 表示跟随本机（不注入 TZ）
+    pub timezone: Option<String>,
+    /// 手动设置的语言；None 表示跟随本机（不注入 LANG / LC_ALL）
+    pub lang: Option<String>,
 }
 
 fn escape_sbpl(path: &Path) -> String {
@@ -35,6 +56,26 @@ pub fn render_sbpl_with_extra_read_paths(
     cfg: &SeatbeltConfig,
     extra_read_paths: &[PathBuf],
 ) -> String {
+    // Rendering is pure. Production command builders supply canonical paths.
+    let mut ancestors = std::collections::BTreeSet::new();
+    for path in [
+        &cfg.workspace_dir,
+        &cfg.run_home_dir,
+        &cfg.run_tmp_dir,
+        &cfg.run_cache_dir,
+    ]
+    .into_iter()
+    .chain(extra_read_paths.iter())
+    {
+        ancestors.extend(path.ancestors().skip(1).map(Path::to_path_buf));
+    }
+    ancestors.extend(["/var", "/tmp", "/etc"].into_iter().map(PathBuf::from));
+    let mut ancestor_metadata =
+        String::from("; 隔离路径祖先仅开放元数据\n(allow file-read-metadata\n");
+    for path in ancestors {
+        ancestor_metadata.push_str(&format!("    (literal \"{}\")\n", escape_sbpl(&path)));
+    }
+    ancestor_metadata.push_str(")\n; 祖先元数据结束\n");
     let ws = escape_sbpl(&cfg.workspace_dir);
     let home = escape_sbpl(&cfg.run_home_dir);
     let tmp = escape_sbpl(&cfg.run_tmp_dir);
@@ -48,13 +89,8 @@ pub fn render_sbpl_with_extra_read_paths(
         for p in extra_read_paths {
             let esc = escape_sbpl(p);
             buf.push_str(&format!("    (literal \"{esc}\")\n"));
-            if let Some(parent) = p.parent() {
-                if p.is_dir() {
-                    buf.push_str(&format!("    (subpath \"{esc}\")\n"));
-                } else {
-                    let p_esc = escape_sbpl(parent);
-                    buf.push_str(&format!("    (literal \"{p_esc}\")\n"));
-                }
+            if p.is_dir() {
+                buf.push_str(&format!("    (subpath \"{esc}\")\n"));
             }
         }
         buf.push_str(")\n");
@@ -66,8 +102,9 @@ pub fn render_sbpl_with_extra_read_paths(
         None => "; network completely disabled (mode A)".to_string(),
     };
 
-    let keychain_rule = if cfg.block_keychain {
-        r#"
+    let keychain_rule = match cfg.keychain_policy {
+        KeychainPolicy::Deny => {
+            r#"
 (deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))
 (deny file-read* file-write*
     (subpath "/Library/Keychains")
@@ -76,8 +113,9 @@ pub fn render_sbpl_with_extra_read_paths(
     (regex #"^/Users/[^/]+/\.codex(/|$)")
 )
 "#
-    } else {
-        r#"
+        }
+        KeychainPolicy::AllowLegacyHostSlot => {
+            r#"
 ; HostKeychainSlot 模式：在 (deny default) 基线下显式放行 Keychain 访问
 (allow mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))
 (allow file-read* file-write*
@@ -85,6 +123,7 @@ pub fn render_sbpl_with_extra_read_paths(
     (regex #"^/Users/[^/]+/Library/Keychains(/|$)")
 )
 "#
+        }
     };
 
     format!(
@@ -98,7 +137,23 @@ pub fn render_sbpl_with_extra_read_paths(
 (allow process-info-pidinfo (target self))
 (allow ipc-posix-sem*)
 (allow sysctl-read)
-(allow file-read-metadata)
+; 主机身份/定位相关 sysctl 即使未来扩展允许列表也始终拒绝
+(deny sysctl-read
+    (sysctl-name "kern.hostname")
+    (sysctl-name "kern.hostid")
+    (sysctl-name "kern.uuid")
+    (sysctl-name "kern.hostuuid")
+    (sysctl-name "kern.bootsessionuuid")
+    (sysctl-name "kern.bootuuid")
+    (sysctl-name "kern.kernelcacheuuid")
+    (sysctl-name "kern.filesetuuid")
+    (sysctl-name "kern.apfsprebootuuid")
+    (sysctl-name "kern.bootargs")
+    (sysctl-name "hw.model")
+    (sysctl-name "hw.uuid")
+    (sysctl-name "hw.serial")
+    (sysctl-name "hw.serialnumber")
+)
 (allow mach-lookup
     (global-name "com.apple.system.logger")
     (global-name "com.apple.system.notification_center")
@@ -121,9 +176,36 @@ pub fn render_sbpl_with_extra_read_paths(
     (literal "/dev/null")
     (literal "/dev/urandom")
     (literal "/dev/random")
-    (literal "/private/etc/ssl")
     (subpath "/private/etc/ssl")
 )
+; file-read* 包含 metadata；以下规则仅补充系统路径祖先的 stat/readlink 权限
+(allow file-read-metadata
+    (literal "/")
+    (literal "/System")
+    (literal "/Library")
+    (literal "/Library/Apple")
+    (literal "/Library/Apple/System")
+    (literal "/Library/Apple/System/Library")
+    (literal "/Library/Developer")
+    (literal "/Library/Developer/CommandLineTools")
+    (literal "/private")
+    (literal "/private/etc")
+    (literal "/private/var")
+    (literal "/private/var/db")
+    (literal "/usr")
+    (literal "/usr/lib")
+    (literal "/usr/bin")
+    (literal "/usr/share")
+    (literal "/usr/local")
+    (literal "/bin")
+    (literal "/opt")
+    (literal "/opt/homebrew")
+    (literal "/Applications")
+    (literal "/Applications/Xcode.app")
+    (literal "/Applications/Xcode.app/Contents")
+    (literal "/Applications/Xcode.app/Contents/Developer")
+)
+{ancestor_metadata}
 (allow file-map-executable
     (subpath "/System")
     (subpath "/Library/Apple/System/Library")
@@ -171,7 +253,7 @@ pub fn build_seatbelt_command(
     program: &str,
     args: &[&str],
     extra_env: &[(&str, &str)],
-) -> Command {
+) -> Result<Command> {
     build_seatbelt_command_with_extra_read_paths(cfg, program, args, extra_env, &[])
 }
 
@@ -181,8 +263,30 @@ pub fn build_seatbelt_command_with_extra_read_paths(
     args: &[&str],
     extra_env: &[(&str, &str)],
     extra_read_paths: &[PathBuf],
-) -> Command {
-    let profile = render_sbpl_with_extra_read_paths(cfg, extra_read_paths);
+) -> Result<Command> {
+    let mut cfg = cfg.clone();
+    cfg.workspace_dir = cfg
+        .workspace_dir
+        .canonicalize()
+        .context("canonicalize workspace")?;
+    cfg.run_home_dir = cfg
+        .run_home_dir
+        .canonicalize()
+        .context("canonicalize run home")?;
+    cfg.run_tmp_dir = cfg
+        .run_tmp_dir
+        .canonicalize()
+        .context("canonicalize run tmp")?;
+    cfg.run_cache_dir = cfg
+        .run_cache_dir
+        .canonicalize()
+        .context("canonicalize run cache")?;
+    let extra_read_paths = extra_read_paths
+        .iter()
+        .map(|path| path.canonicalize())
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("canonicalize executable paths")?;
+    let profile = render_sbpl_with_extra_read_paths(&cfg, &extra_read_paths);
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-p").arg(profile).arg(program).args(args);
     cmd.current_dir(&cfg.workspace_dir);
@@ -195,13 +299,17 @@ pub fn build_seatbelt_command_with_extra_read_paths(
         "CLANG_MODULE_CACHE_PATH",
         cfg.run_cache_dir.join("clang-module-cache"),
     );
-    cmd.env("TZ", &cfg.timezone);
-    cmd.env("LANG", &cfg.lang);
-    cmd.env("LC_ALL", &cfg.lang);
+    if let Some(tz) = &cfg.timezone {
+        cmd.env("TZ", tz);
+    }
+    if let Some(lang) = &cfg.lang {
+        cmd.env("LANG", lang);
+        cmd.env("LC_ALL", lang);
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd
+    Ok(cmd)
 }
 
 pub async fn run_in_seatbelt(
@@ -210,7 +318,7 @@ pub async fn run_in_seatbelt(
     args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Result<std::process::Output> {
-    let mut cmd = build_seatbelt_command(cfg, program, args, extra_env);
+    let mut cmd = build_seatbelt_command(cfg, program, args, extra_env)?;
     cmd.output().await.context("failed to spawn sandbox-exec")
 }
 
@@ -242,9 +350,9 @@ impl RuntimeBackend for MacOsSeatbeltBackend {
             run_tmp_dir: std::fs::canonicalize(&tmp)?,
             run_cache_dir: std::fs::canonicalize(&cache)?,
             allowed_proxy_port: None,
-            block_keychain: true,
-            timezone: "UTC".into(),
-            lang: "en_US.UTF-8".into(),
+            keychain_policy: KeychainPolicy::Deny,
+            timezone: Some("UTC".into()),
+            lang: Some("en_US.UTF-8".into()),
         };
 
         let mut evidences = Vec::new();

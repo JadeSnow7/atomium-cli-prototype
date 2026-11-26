@@ -50,16 +50,12 @@ fn oauth_profile(id: &str, blob_id: &str) -> IdentityProfile {
             content_digest: "initial-digest".into(),
         },
         egress: EgressBinding {
-            proxy_id: format!("proxy-{id}"),
-            expected_country: "US".into(),
-            expected_region: None,
+            upstream_proxy_id: None,
             fail_closed: true,
-            exclusive_proxy_use: false,
         },
         locale_policy: LocalePolicy {
-            timezone: "UTC".into(),
-            lang: "en_US.UTF-8".into(),
-            auto_align_with_proxy: false,
+            timezone: Some("UTC".into()),
+            lang: Some("en_US.UTF-8".into()),
         },
         state: ProfileState::Active,
     }
