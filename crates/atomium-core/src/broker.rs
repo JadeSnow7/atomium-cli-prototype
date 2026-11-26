@@ -11,6 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -809,6 +810,15 @@ fn fsync_parent(path: &Path) -> std::io::Result<()> {
 }
 
 fn write_export_journal(export_dir: &Path, journal: &ExportJournal) -> std::io::Result<()> {
+    #[cfg(test)]
+    if EXPORT_JOURNAL_FAIL_PHASE.with(|hook| {
+        hook.borrow()
+            .as_deref()
+            .is_some_and(|phases| phases.split(',').any(|phase| phase == journal.phase))
+    }) && EXPORT_JOURNAL_FAIL_AFTER_OPS.with(|hook| journal.done_ops.len() >= hook.get())
+    {
+        return Err(std::io::Error::other("injected journal write failure"));
+    }
     fs::create_dir_all(export_dir)?;
     let journal_path = export_dir.join("journal.json");
     let tmp_path = export_dir.join("journal.json.tmp");
@@ -819,6 +829,12 @@ fn write_export_journal(export_dir: &Path, journal: &ExportJournal) -> std::io::
         file.sync_all()?;
     }
     fs::rename(&tmp_path, &journal_path)?;
+    #[cfg(test)]
+    if EXPORT_JOURNAL_FAIL_AFTER_RENAME.with(|hook| hook.get()) && journal.phase == "committed" {
+        return Err(std::io::Error::other(
+            "injected journal directory sync failure",
+        ));
+    }
     fsync_dir(export_dir)?;
     Ok(())
 }
@@ -879,6 +895,14 @@ fn restore_backup_preserving_mode(backup: &Path, final_path: &Path) -> std::io::
 
 #[cfg(test)]
 thread_local! {
+    static EXPORT_JOURNAL_FAIL_PHASE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    static EXPORT_JOURNAL_FAIL_AFTER_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EXPORT_JOURNAL_FAIL_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXPORT_ROLLBACK_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXPORT_COMPLETION_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXPORT_INCONSISTENCY_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXPORT_POST_VERIFY_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static EXPORT_PREPARE_FAIL_AT_OP: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
     static EXPORT_COMMIT_FAIL_AFTER_OPS: std::cell::Cell<Option<usize>> =
@@ -985,6 +1009,10 @@ fn infer_export_operation_state(op: &ExportJournalOperation) -> std::result::Res
 }
 
 fn rollback_export_journal(journal: &ExportJournal) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    if EXPORT_ROLLBACK_FAIL.with(|hook| hook.get()) {
+        return Err("injected rollback failure".into());
+    }
     if journal
         .done_ops
         .iter()
@@ -1087,6 +1115,7 @@ fn export_receipt(candidate: &CandidateSnapshot, approval_id: &str, target: &Pat
 pub struct WorkspaceBroker {
     db_path: PathBuf,
     broker_dir: PathBuf,
+    pending_exports: Mutex<BTreeMap<String, BTreeSet<String>>>,
 }
 
 impl WorkspaceBroker {
@@ -1144,10 +1173,38 @@ impl WorkspaceBroker {
             "#,
         )?;
 
-        Ok(Self {
+        let broker = Self {
             db_path,
             broker_dir,
-        })
+            pending_exports: Mutex::new(BTreeMap::new()),
+        };
+        let exports_root = broker.broker_dir.join("exports");
+        match fs::read_dir(exports_root) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_dir() {
+                        continue;
+                    }
+                    let path = entry.path().join("journal.json");
+                    match read_export_journal(&path) {
+                        Ok(journal) => {
+                            if journal.phase != "committed" && journal.phase != "rolled_back" {
+                                broker.track_pending_export(&journal);
+                            }
+                        }
+                        Err(BrokerError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                        }
+                        // Malformed historical journals retain the existing startup handling.
+                        Err(BrokerError::Storage(_)) => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        Ok(broker)
     }
 
     pub fn import_and_record(
@@ -1524,6 +1581,16 @@ impl WorkspaceBroker {
         &self,
         workspace_id: &str,
     ) -> std::result::Result<Option<String>, BrokerError> {
+        if self
+            .pending_exports
+            .lock()
+            .expect("pending export lock poisoned")
+            .contains_key(workspace_id)
+        {
+            return Ok(Some(
+                "an export journal requires recovery before another export".into(),
+            ));
+        }
         let conn = SecureSqliteConnection::open(&self.db_path)
             .map_err(|e| BrokerError::Storage(e.to_string()))?;
         let mut stmt = conn
@@ -1550,6 +1617,12 @@ impl WorkspaceBroker {
         workspace_id: &str,
         reason: &str,
     ) -> std::result::Result<(), BrokerError> {
+        #[cfg(test)]
+        if EXPORT_INCONSISTENCY_FAIL.with(|hook| hook.get()) {
+            return Err(BrokerError::Storage(
+                "injected inconsistency write failure".into(),
+            ));
+        }
         let conn = SecureSqliteConnection::open(&self.db_path)
             .map_err(|e| BrokerError::Storage(e.to_string()))?;
         conn.execute(
@@ -1562,8 +1635,93 @@ impl WorkspaceBroker {
         Ok(())
     }
 
-    /// Recover interrupted export journals at daemon startup. Prepared/committing journals are
-    /// rolled back; rollback failure marks the workspace inconsistent and blocks future exports.
+    fn track_pending_export(&self, journal: &ExportJournal) {
+        self.pending_exports
+            .lock()
+            .expect("pending export lock poisoned")
+            .entry(journal.workspace_id.clone())
+            .or_default()
+            .insert(journal.export_id.clone());
+    }
+
+    fn finish_export_journal(
+        &self,
+        export_dir: &Path,
+        journal: &ExportJournal,
+    ) -> std::result::Result<(), BrokerError> {
+        write_export_journal(export_dir, journal).map_err(|err| {
+            BrokerError::ExportInconsistent(format!(
+                "workspace {} requires export journal recovery: {err}",
+                journal.workspace_id
+            ))
+        })?;
+        let mut pending = self
+            .pending_exports
+            .lock()
+            .expect("pending export lock poisoned");
+        if let Some(exports) = pending.get_mut(&journal.workspace_id) {
+            exports.remove(&journal.export_id);
+            if exports.is_empty() {
+                pending.remove(&journal.workspace_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn quarantine_export(
+        &self,
+        export_dir: &Path,
+        journal: &mut ExportJournal,
+        reason: String,
+    ) -> BrokerError {
+        self.track_pending_export(journal);
+        journal.phase = "inconsistent".into();
+        journal.error = Some(reason.clone());
+        let mut errors = vec![reason];
+        if let Err(err) = write_export_journal(export_dir, journal) {
+            errors.push(format!("could not persist inconsistent journal: {err}"));
+        }
+        if let Err(err) =
+            self.mark_workspace_export_inconsistent(&journal.workspace_id, &errors.join("; "))
+        {
+            errors.push(format!("could not persist workspace quarantine: {err}"));
+        }
+        BrokerError::ExportInconsistent(format!(
+            "workspace {} export requires reconciliation: {}",
+            journal.workspace_id,
+            errors.join("; ")
+        ))
+    }
+
+    fn rollback_export(
+        &self,
+        export_dir: &Path,
+        journal: &mut ExportJournal,
+    ) -> std::result::Result<(), BrokerError> {
+        if journal.phase != "preparing" {
+            journal.phase = "rolling_back".into();
+            if let Err(err) = write_export_journal(export_dir, journal) {
+                journal.error = Some(format!(
+                    "{}; could not persist rollback intent: {err}",
+                    journal.error.as_deref().unwrap_or("export interrupted")
+                ));
+            }
+        }
+        let rollback = rollback_export_journal(journal).and_then(|()| {
+            if let Some(receipt) = &journal.receipt {
+                self.save_export_completion(receipt, false)
+                    .map_err(|err| err.to_string())?;
+            }
+            Ok(())
+        });
+        if let Err(reason) = rollback {
+            return Err(self.quarantine_export(export_dir, journal, reason));
+        }
+        journal.phase = "rolled_back".into();
+        self.finish_export_journal(export_dir, journal)
+    }
+
+    /// Recover interrupted exports before allowing new mutations of their workspaces.
     pub fn recover_interrupted_exports(&self) -> Vec<(String, String)> {
         let mut inconsistent = Vec::new();
         let exports_root = self.broker_dir.join("exports");
@@ -1582,54 +1740,51 @@ impl WorkspaceBroker {
             let Ok(mut journal) = read_export_journal(&journal_path) else {
                 continue;
             };
-            if journal.phase == "verifying" && verify_export_journal(&journal) {
-                let completion = (|| -> std::result::Result<(), BrokerError> {
+            if journal.phase == "committed" || journal.phase == "rolled_back" {
+                let pending = self
+                    .pending_exports
+                    .lock()
+                    .expect("pending export lock poisoned")
+                    .get(&journal.workspace_id)
+                    .is_some_and(|exports| exports.contains(&journal.export_id));
+                if pending {
+                    if let Err(err) = self.finish_export_journal(&export_dir, &journal) {
+                        inconsistent.push((journal.workspace_id.clone(), err.to_string()));
+                    }
+                }
+                continue;
+            }
+            self.track_pending_export(&journal);
+            let recovery = if journal.phase == "inconsistent" {
+                let reason = journal
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "export recovery failed".into());
+                Err(self.quarantine_export(&export_dir, &mut journal, reason))
+            } else if journal.phase == "verifying" && verify_export_journal(&journal) {
+                (|| -> std::result::Result<(), BrokerError> {
                     let receipt = journal.receipt.as_ref().ok_or_else(|| {
                         BrokerError::Storage("verifying journal lacks receipt".into())
                     })?;
                     self.save_export_completion(receipt, true)?;
                     journal.phase = "committed".into();
                     journal.post_verify_ok = Some(true);
-                    write_export_journal(&export_dir, &journal)?;
-                    Ok(())
-                })();
-                if let Err(err) = completion {
-                    let reason = err.to_string();
-                    let _ = self.mark_workspace_export_inconsistent(&journal.workspace_id, &reason);
-                    inconsistent.push((journal.workspace_id.clone(), reason));
-                }
-                continue;
-            }
-            if !matches!(
+                    self.finish_export_journal(&export_dir, &journal)
+                })()
+            } else if matches!(
                 journal.phase.as_str(),
                 "preparing" | "prepared" | "committing" | "verifying" | "rolling_back"
             ) {
-                continue;
+                self.rollback_export(&export_dir, &mut journal)
+            } else {
+                Err(BrokerError::ExportInconsistent(format!(
+                    "unknown export phase: {}",
+                    journal.phase
+                )))
+            };
+            if let Err(err) = recovery {
+                inconsistent.push((journal.workspace_id.clone(), err.to_string()));
             }
-            if journal.phase != "preparing" {
-                journal.phase = "rolling_back".into();
-                let _ = write_export_journal(&export_dir, &journal);
-            }
-            let rollback = rollback_export_journal(&journal).and_then(|()| {
-                if let Some(receipt) = &journal.receipt {
-                    self.save_export_completion(receipt, false)
-                        .map_err(|e| e.to_string())?;
-                }
-                Ok(())
-            });
-            match rollback {
-                Ok(()) => {
-                    journal.phase = "rolled_back".into();
-                    journal.error = None;
-                }
-                Err(reason) => {
-                    journal.phase = "inconsistent".into();
-                    journal.error = Some(reason.clone());
-                    let _ = self.mark_workspace_export_inconsistent(&journal.workspace_id, &reason);
-                    inconsistent.push((journal.workspace_id.clone(), reason));
-                }
-            }
-            let _ = write_export_journal(&export_dir, &journal);
         }
         inconsistent
     }
@@ -1877,6 +2032,7 @@ impl WorkspaceBroker {
             post_verify_ok: None,
             error: None,
         };
+        self.track_pending_export(&journal);
         write_export_journal(&export_dir, &journal)?;
 
         let prepare_res = (|| -> std::result::Result<(), BrokerError> {
@@ -1970,30 +2126,22 @@ impl WorkspaceBroker {
 
         if let Err(err) = prepare_res {
             journal.error = Some(err.to_string());
-            match rollback_export_journal(&journal) {
-                Ok(()) => {
-                    journal.phase = "rolled_back".into();
-                    let _ = write_export_journal(&export_dir, &journal);
-                    return Err(err);
-                }
-                Err(reason) => {
-                    journal.phase = "inconsistent".into();
-                    journal.error = Some(reason.clone());
-                    let _ = write_export_journal(&export_dir, &journal);
-                    let _ =
-                        self.mark_workspace_export_inconsistent(&candidate.workspace_id, &reason);
-                    return Err(BrokerError::ExportInconsistent(format!(
-                        "workspace {} export prepare failed and rollback failed: {reason}",
-                        candidate.workspace_id
-                    )));
-                }
-            }
+            self.rollback_export(&export_dir, &mut journal)?;
+            return Err(err);
         }
 
         journal.phase = "prepared".into();
-        write_export_journal(&export_dir, &journal)?;
+        if let Err(err) = write_export_journal(&export_dir, &journal) {
+            journal.error = Some(err.to_string());
+            self.rollback_export(&export_dir, &mut journal)?;
+            return Err(BrokerError::Io(err));
+        }
         journal.phase = "committing".into();
-        write_export_journal(&export_dir, &journal)?;
+        if let Err(err) = write_export_journal(&export_dir, &journal) {
+            journal.error = Some(err.to_string());
+            self.rollback_export(&export_dir, &mut journal)?;
+            return Err(BrokerError::Io(err));
+        }
 
         // 4. Commit one operation at a time. Every completed operation is appended to the
         // fsynced journal before the next operation starts, so startup recovery can reverse
@@ -2052,42 +2200,22 @@ impl WorkspaceBroker {
 
         if let Some(err) = commit_error {
             journal.error = Some(err.to_string());
-            journal.phase = "rolling_back".into();
-            write_export_journal(&export_dir, &journal)?;
-            match rollback_export_journal(&journal) {
-                Ok(()) => {
-                    journal.phase = "rolled_back".into();
-                    let _ = write_export_journal(&export_dir, &journal);
-                    for op in &journal.operations {
-                        if let Some(temp) = &op.temp_path {
-                            let _ = fs::remove_file(temp);
-                        }
-                    }
-                    for dir in &touched_dirs {
-                        let _ = fsync_dir(dir);
-                    }
-                    return Err(err);
-                }
-                Err(reason) => {
-                    journal.phase = "inconsistent".into();
-                    journal.error = Some(reason.clone());
-                    let _ = write_export_journal(&export_dir, &journal);
-                    let _ =
-                        self.mark_workspace_export_inconsistent(&candidate.workspace_id, &reason);
-                    return Err(BrokerError::ExportInconsistent(format!(
-                        "workspace {} export failed and rollback failed: {reason}",
-                        candidate.workspace_id
-                    )));
-                }
-            }
+            self.rollback_export(&export_dir, &mut journal)?;
+            return Err(err);
         }
 
         journal.phase = "verifying".into();
         journal.receipt = Some(export_receipt(&candidate, approval_id, &canonical_target));
-        write_export_journal(&export_dir, &journal)?;
+        if let Err(err) = write_export_journal(&export_dir, &journal) {
+            journal.error = Some(err.to_string());
+            self.rollback_export(&export_dir, &mut journal)?;
+            return Err(BrokerError::Io(err));
+        }
 
         // 5. Post-commit verification: re-scan affected files and compare their SHA-256 values.
         let post_verify_ok = verify_export_journal(&journal);
+        #[cfg(test)]
+        let post_verify_ok = post_verify_ok && !EXPORT_POST_VERIFY_FAIL.with(|hook| hook.get());
         journal.post_verify_ok = Some(post_verify_ok);
 
         if !post_verify_ok {
@@ -2095,38 +2223,22 @@ impl WorkspaceBroker {
                 "post-export verification failed; attempting rollback".into(),
             );
             journal.error = Some(verify_err.to_string());
-            journal.phase = "rolling_back".into();
-            write_export_journal(&export_dir, &journal)?;
-            match rollback_export_journal(&journal) {
-                Ok(()) => {
-                    journal.phase = "rolled_back".into();
-                    let _ = write_export_journal(&export_dir, &journal);
-                    for dir in &touched_dirs {
-                        let _ = fsync_dir(dir);
-                    }
-                    return Err(verify_err);
-                }
-                Err(reason) => {
-                    journal.phase = "inconsistent".into();
-                    journal.error = Some(reason.clone());
-                    let _ = write_export_journal(&export_dir, &journal);
-                    let _ =
-                        self.mark_workspace_export_inconsistent(&candidate.workspace_id, &reason);
-                    return Err(BrokerError::ExportInconsistent(format!(
-                        "workspace {} post-export verification failed and rollback failed: {reason}",
-                        candidate.workspace_id
-                    )));
-                }
-            }
+            self.rollback_export(&export_dir, &mut journal)?;
+            return Err(verify_err);
         }
 
         let receipt = journal
             .receipt
             .clone()
             .expect("verifying journal has receipt");
-        self.save_export_completion(&receipt, true)?;
+        self.save_export_completion(&receipt, true).map_err(|err| {
+            BrokerError::ExportInconsistent(format!(
+                "workspace {} requires completion recovery: {err}",
+                candidate.workspace_id
+            ))
+        })?;
         journal.phase = "committed".into();
-        write_export_journal(&export_dir, &journal)?;
+        self.finish_export_journal(&export_dir, &journal)?;
         // Backups remain available until both durable completion records exist.
         let _ = fs::remove_dir_all(&backup_root);
         for dir in &touched_dirs {
@@ -2140,6 +2252,12 @@ impl WorkspaceBroker {
         receipt: &ExportResult,
         exported: bool,
     ) -> std::result::Result<(), BrokerError> {
+        #[cfg(test)]
+        if EXPORT_COMPLETION_FAIL.with(|hook| hook.get()) {
+            return Err(BrokerError::Storage(
+                "injected completion write failure".into(),
+            ));
+        }
         let mut candidate = self
             .get_candidate(&receipt.candidate_id)?
             .ok_or_else(|| BrokerError::NotFound("export candidate missing".into()))?;
@@ -2253,6 +2371,36 @@ mod export_recovery_tests {
 
     fn open_broker(root: &Path) -> WorkspaceBroker {
         WorkspaceBroker::open(root.join("atomium.sqlite"), root.join("broker")).unwrap()
+    }
+
+    struct ExportFailures;
+
+    impl Drop for ExportFailures {
+        fn drop(&mut self) {
+            EXPORT_JOURNAL_FAIL_PHASE.with(|hook| *hook.borrow_mut() = None);
+            EXPORT_JOURNAL_FAIL_AFTER_OPS.with(|hook| hook.set(0));
+            EXPORT_COMMIT_FAIL_AFTER_OPS.with(|hook| hook.set(None));
+            EXPORT_COMPLETION_FAIL.with(|hook| hook.set(false));
+            EXPORT_INCONSISTENCY_FAIL.with(|hook| hook.set(false));
+            EXPORT_POST_VERIFY_FAIL.with(|hook| hook.set(false));
+            EXPORT_ROLLBACK_FAIL.with(|hook| hook.set(false));
+            EXPORT_JOURNAL_FAIL_AFTER_RENAME.with(|hook| hook.set(false));
+        }
+    }
+
+    fn export_test_candidate(
+        broker: &WorkspaceBroker,
+        candidate: &CandidateSnapshot,
+        host: &Path,
+    ) -> std::result::Result<ExportResult, BrokerError> {
+        broker.verify_and_export_candidate(
+            "appr-journal-failure",
+            &candidate.candidate_id,
+            &candidate.candidate_digest,
+            None,
+            None,
+            host,
+        )
     }
 
     fn host_tree_digest(path: &Path) -> String {
@@ -2601,6 +2749,252 @@ mod export_recovery_tests {
     fn review_fsync_missing_parent_is_harmless() {
         let root = TestDir::new("missing-parent");
         fsync_parent(&root.path.join("missing/file")).unwrap();
+    }
+
+    #[test]
+    fn opening_broker_propagates_journal_read_errors() {
+        let root = TestDir::new("journal-read-error");
+        let broker = open_broker(&root.path);
+        fs::create_dir_all(
+            broker
+                .broker_dir
+                .join("exports/exp-unreadable/journal.json"),
+        )
+        .unwrap();
+        assert!(WorkspaceBroker::open(&broker.db_path, &broker.broker_dir).is_err());
+    }
+
+    #[test]
+    fn journal_intent_failures_still_rollback_and_allow_safe_retry() {
+        for phase in [
+            "prepared",
+            "committing",
+            "committing_done",
+            "rolling_back",
+            "verifying",
+            "post_verify",
+        ] {
+            let root = TestDir::new("journal-intent");
+            let (broker, _ws, candidate, host) =
+                freeze_single_file_workspace(&root.path, "a.txt", b"original", b"updated");
+            fs::set_permissions(host.join("a.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+            let failures = ExportFailures;
+            let fail_phase = match phase {
+                "post_verify" => "rolling_back",
+                "committing_done" => "committing",
+                _ => phase,
+            };
+            EXPORT_JOURNAL_FAIL_AFTER_OPS
+                .with(|hook| hook.set(usize::from(phase == "committing_done")));
+            EXPORT_JOURNAL_FAIL_PHASE.with(|hook| *hook.borrow_mut() = Some(fail_phase.into()));
+            if phase == "rolling_back" {
+                EXPORT_COMMIT_FAIL_AFTER_OPS.with(|hook| hook.set(Some(1)));
+                // Two mutations make the second operation fail after the first changed the host.
+                let ws = broker
+                    .get_workspace(&candidate.workspace_id)
+                    .unwrap()
+                    .unwrap();
+                fs::write(Path::new(&ws.working_dir).join("b.txt"), b"added").unwrap();
+            }
+            let candidate = if phase == "rolling_back" {
+                broker
+                    .freeze_candidate(&candidate.workspace_id, None, None, None)
+                    .unwrap()
+                    .0
+            } else {
+                candidate
+            };
+            EXPORT_POST_VERIFY_FAIL.with(|hook| hook.set(phase == "post_verify"));
+            let result = export_test_candidate(&broker, &candidate, &host);
+            drop(failures);
+            assert!(result.is_err());
+            assert_eq!(host_tree_digest(&host), candidate.baseline_digest);
+            assert_eq!(
+                fs::metadata(host.join("a.txt"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert!(broker
+                .workspace_export_inconsistency(&candidate.workspace_id)
+                .unwrap()
+                .is_none());
+            export_test_candidate(&broker, &candidate, &host).unwrap();
+            let reopened = open_broker(&root.path);
+            assert!(reopened.recover_interrupted_exports().is_empty());
+            assert!(reopened.recover_interrupted_exports().is_empty());
+            assert_eq!(fs::read(host.join("a.txt")).unwrap(), b"updated");
+        }
+    }
+
+    #[test]
+    fn unresolved_rollback_journal_blocks_retry_until_recovery_is_durable() {
+        let root = TestDir::new("journal-terminal");
+        let (broker, _ws, candidate, host) =
+            freeze_single_file_workspace(&root.path, "a.txt", b"original", b"updated");
+        let failures = ExportFailures;
+        EXPORT_POST_VERIFY_FAIL.with(|hook| hook.set(true));
+        EXPORT_JOURNAL_FAIL_PHASE
+            .with(|hook| *hook.borrow_mut() = Some("rolling_back,rolled_back".into()));
+        assert!(matches!(
+            export_test_candidate(&broker, &candidate, &host),
+            Err(BrokerError::ExportInconsistent(_))
+        ));
+        assert_eq!(host_tree_digest(&host), candidate.baseline_digest);
+        assert!(matches!(
+            export_test_candidate(&broker, &candidate, &host),
+            Err(BrokerError::ExportInconsistent(_))
+        ));
+        drop(failures);
+        let reopened = open_broker(&root.path);
+        assert!(matches!(
+            export_test_candidate(&reopened, &candidate, &host),
+            Err(BrokerError::ExportInconsistent(_))
+        ));
+        let other_host = root.path.join("other-host");
+        fs::create_dir_all(&other_host).unwrap();
+        fs::write(other_host.join("b.txt"), b"old").unwrap();
+        let other_ws = reopened.import_and_record(&other_host, None, None).unwrap();
+        fs::write(Path::new(&other_ws.working_dir).join("b.txt"), b"new").unwrap();
+        let other_candidate = reopened
+            .freeze_candidate(&other_ws.workspace_id, None, None, None)
+            .unwrap()
+            .0;
+        reopened
+            .verify_and_export_candidate(
+                "appr-other-workspace",
+                &other_candidate.candidate_id,
+                &other_candidate.candidate_digest,
+                None,
+                None,
+                &other_host,
+            )
+            .unwrap();
+        assert!(reopened
+            .workspace_export_inconsistency(&candidate.workspace_id)
+            .unwrap()
+            .is_some());
+        assert!(reopened.recover_interrupted_exports().is_empty());
+        assert!(reopened.recover_interrupted_exports().is_empty());
+        assert_eq!(fs::read(other_host.join("b.txt")).unwrap(), b"new");
+        export_test_candidate(&reopened, &candidate, &host).unwrap();
+        assert!(reopened.recover_interrupted_exports().is_empty());
+        assert_eq!(fs::read(host.join("a.txt")).unwrap(), b"updated");
+    }
+
+    #[test]
+    fn renamed_terminal_journal_sync_failure_keeps_gate_until_retry_is_durable() {
+        let root = TestDir::new("journal-sync");
+        let (broker, _ws, candidate, host) =
+            freeze_single_file_workspace(&root.path, "a.txt", b"original", b"updated");
+        let failures = ExportFailures;
+        EXPORT_JOURNAL_FAIL_AFTER_RENAME.with(|hook| hook.set(true));
+        assert!(matches!(
+            export_test_candidate(&broker, &candidate, &host),
+            Err(BrokerError::ExportInconsistent(_))
+        ));
+        assert!(broker
+            .workspace_export_inconsistency(&candidate.workspace_id)
+            .unwrap()
+            .is_some());
+        assert_eq!(broker.recover_interrupted_exports().len(), 1);
+        drop(failures);
+        assert!(broker.recover_interrupted_exports().is_empty());
+        assert!(broker
+            .workspace_export_inconsistency(&candidate.workspace_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(fs::read(host.join("a.txt")).unwrap(), b"updated");
+    }
+
+    #[test]
+    fn completion_errors_preserve_verifying_export_for_idempotent_recovery() {
+        for phase in ["database", "committed"] {
+            let root = TestDir::new("completion-error");
+            let (broker, _ws, candidate, host) =
+                freeze_single_file_workspace(&root.path, "a.txt", b"original", b"updated");
+            let failures = ExportFailures;
+            EXPORT_COMPLETION_FAIL.with(|hook| hook.set(phase == "database"));
+            EXPORT_JOURNAL_FAIL_PHASE.with(|hook| *hook.borrow_mut() = Some(phase.into()));
+            assert!(matches!(
+                export_test_candidate(&broker, &candidate, &host),
+                Err(BrokerError::ExportInconsistent(_))
+            ));
+            assert_eq!(fs::read(host.join("a.txt")).unwrap(), b"updated");
+            assert_eq!(
+                broker
+                    .get_export_receipt("appr-journal-failure")
+                    .unwrap()
+                    .is_some(),
+                phase == "committed"
+            );
+            assert!(matches!(
+                export_test_candidate(&broker, &candidate, &host),
+                Err(BrokerError::ExportInconsistent(_))
+            ));
+            drop(failures);
+            let reopened = open_broker(&root.path);
+            assert!(reopened.recover_interrupted_exports().is_empty());
+            assert!(reopened.recover_interrupted_exports().is_empty());
+            assert!(reopened
+                .workspace_export_inconsistency(&candidate.workspace_id)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                reopened
+                    .get_candidate(&candidate.candidate_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                CandidateStatus::Exported
+            );
+            assert!(reopened
+                .get_export_receipt("appr-journal-failure")
+                .unwrap()
+                .is_some());
+            let conn = SecureSqliteConnection::open(&reopened.db_path).unwrap();
+            let count: usize = conn
+                .query_row("SELECT count(*) FROM export_receipts", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(fs::read(host.join("a.txt")).unwrap(), b"updated");
+        }
+    }
+
+    #[test]
+    fn rollback_and_quarantine_write_failures_remain_blocked_after_reopen() {
+        let root = TestDir::new("quarantine-error");
+        let (broker, _ws, candidate, host) =
+            freeze_single_file_workspace(&root.path, "a.txt", b"original", b"updated");
+        let failures = ExportFailures;
+        EXPORT_POST_VERIFY_FAIL.with(|hook| hook.set(true));
+        EXPORT_ROLLBACK_FAIL.with(|hook| hook.set(true));
+        EXPORT_INCONSISTENCY_FAIL.with(|hook| hook.set(true));
+        EXPORT_JOURNAL_FAIL_PHASE
+            .with(|hook| *hook.borrow_mut() = Some("rolling_back,inconsistent".into()));
+        assert!(matches!(
+            export_test_candidate(&broker, &candidate, &host),
+            Err(BrokerError::ExportInconsistent(_))
+        ));
+        assert!(matches!(
+            export_test_candidate(&broker, &candidate, &host),
+            Err(BrokerError::ExportInconsistent(_))
+        ));
+        drop(failures);
+        let reopened = open_broker(&root.path);
+        assert!(matches!(
+            export_test_candidate(&reopened, &candidate, &host),
+            Err(BrokerError::ExportInconsistent(_))
+        ));
+        assert!(reopened.recover_interrupted_exports().is_empty());
+        assert!(reopened.recover_interrupted_exports().is_empty());
+        assert_eq!(fs::read(host.join("a.txt")).unwrap(), b"updated");
+        assert!(reopened
+            .workspace_export_inconsistency(&candidate.workspace_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
