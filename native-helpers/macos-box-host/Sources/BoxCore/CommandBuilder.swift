@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 public struct CommandSpec: Equatable, Sendable {
     public let executable: String
@@ -130,7 +131,8 @@ public enum DsclCommandBuilder {
         ]
     }
 
-    public static func setPassword(id: BoxIdentifier, password: String) -> CommandSpec {
+    public static func setPassword(id: BoxIdentifier, password: String) throws -> CommandSpec {
+        try SecurityCommandBuilder.validatePassword(password)
         let userPath = "/Users/\(id.shortName)"
         let interactiveInput = "-passwd \(userPath) \(password)\nquit\n"
         return CommandSpec(
@@ -156,23 +158,48 @@ public enum DsclCommandBuilder {
     }
 }
 
+public enum SecurityCommandError: Error {
+    case invalidPassword
+    case invalidKeychainPath
+    case randomGenerationFailed(OSStatus)
+}
+
 public enum SecurityCommandBuilder {
-    public static func createKeychain(keychainPath: String, password: String) -> CommandSpec {
-        CommandSpec(
-            executable: "/usr/bin/security",
-            arguments: ["create-keychain", keychainPath],
-            redactedArguments: ["create-keychain", keychainPath],
-            stdinData: Data((password + "\n" + password + "\n").utf8)
-        )
+    public static func validatePassword(_ password: String) throws {
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+=-")
+        guard (16...128).contains(password.utf8.count), password.unicodeScalars.allSatisfy(allowed.contains) else {
+            throw SecurityCommandError.invalidPassword
+        }
     }
 
-    public static func unlockKeychain(keychainPath: String, password: String) -> CommandSpec {
-        CommandSpec(
-            executable: "/usr/bin/security",
-            arguments: ["unlock-keychain", keychainPath],
-            redactedArguments: ["unlock-keychain", keychainPath],
-            stdinData: Data((password + "\n").utf8)
-        )
+    public static func generatePassword() throws -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard status == errSecSuccess else {
+            throw SecurityCommandError.randomGenerationFailed(status)
+        }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func interactiveCommand(_ operation: String, keychainPath: String, password: String, expectedDirectory: String) throws -> CommandSpec {
+        try validatePassword(password)
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/-")
+        let components = keychainPath.split(separator: "/")
+        guard keychainPath.unicodeScalars.allSatisfy(allowed.contains),
+              keychainPath.hasPrefix(expectedDirectory + "/"),
+              expectedDirectory.hasPrefix("/"),
+              !components.contains(".."), !components.contains(".") else {
+            throw SecurityCommandError.invalidKeychainPath
+        }
+        return CommandSpec(executable: "/usr/bin/security", arguments: ["-i"], stdinData: Data("\(operation) -p \(password) \(keychainPath)\n".utf8))
+    }
+
+    public static func createKeychain(keychainPath: String, password: String, expectedDirectory: String) throws -> CommandSpec {
+        try interactiveCommand("create-keychain", keychainPath: keychainPath, password: password, expectedDirectory: expectedDirectory)
+    }
+
+    public static func unlockKeychain(keychainPath: String, password: String, expectedDirectory: String) throws -> CommandSpec {
+        try interactiveCommand("unlock-keychain", keychainPath: keychainPath, password: password, expectedDirectory: expectedDirectory)
     }
 }
 

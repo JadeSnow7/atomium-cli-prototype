@@ -244,7 +244,10 @@ enum BoxLauncher {
             try fm.createDirectory(atPath: identifier.tmpDirectory, withIntermediateDirectories: true)
         }
         try BoxLifecycle.setOwnerAndMode(path: identifier.tmpDirectory, uid: uid, gid: gid, mode: 0o700)
+        return boxRuntimeEnvironment(identifier: identifier)
+    }
 
+    static func boxRuntimeEnvironment(identifier: BoxIdentifier) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         for hostKey in [
             "__CF_USER_TEXT_ENCODING",

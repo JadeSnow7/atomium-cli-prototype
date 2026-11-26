@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import os
 
@@ -25,58 +26,7 @@ public enum ProcessRunner {
         environment: [String: String]? = nil,
         currentDirectoryPath: String? = nil
     ) throws -> ProcessResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: spec.executable)
-        process.arguments = spec.arguments
-        if let environment {
-            process.environment = environment
-        }
-        if let currentDirectoryPath {
-            process.currentDirectoryURL = URL(fileURLWithPath: currentDirectoryPath, isDirectory: true)
-        }
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        let stdinPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-        if spec.stdinData != nil {
-            process.standardInput = stdinPipe
-        }
-
-        let outBox = OSAllocatedUnfairLock(initialState: Data())
-        let errBox = OSAllocatedUnfairLock(initialState: Data())
-        let group = DispatchGroup()
-
-        group.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
-            let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            outBox.withLock { $0 = data }
-            group.leave()
-        }
-
-        group.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
-            let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            errBox.withLock { $0 = data }
-            group.leave()
-        }
-
-        try process.run()
-        if let stdinData = spec.stdinData {
-            let input = stdinPipe.fileHandleForWriting
-            input.write(stdinData)
-            input.closeFile()
-        }
-        process.waitUntilExit()
-        group.wait()
-
-        return ProcessResult(
-            exitCode: process.terminationStatus,
-            stdout: String(decoding: outBox.withLock { $0 }, as: UTF8.self),
-            stderr: String(decoding: errBox.withLock { $0 }, as: UTF8.self),
-            timedOut: false
-        )
+        try execute(spec, timeoutSeconds: nil, environment: environment, currentDirectoryPath: currentDirectoryPath)
     }
 
     public static func runWithTimeout(
@@ -84,6 +34,15 @@ public enum ProcessRunner {
         timeoutSeconds: Double = 5.0,
         environment: [String: String]? = nil,
         currentDirectoryPath: String? = nil
+    ) throws -> ProcessResult {
+        try execute(spec, timeoutSeconds: timeoutSeconds, environment: environment, currentDirectoryPath: currentDirectoryPath)
+    }
+
+    private static func execute(
+        _ spec: CommandSpec,
+        timeoutSeconds: Double?,
+        environment: [String: String]?,
+        currentDirectoryPath: String?
     ) throws -> ProcessResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: spec.executable)
@@ -122,20 +81,39 @@ public enum ProcessRunner {
             group.leave()
         }
 
+        let inputError = OSAllocatedUnfairLock<Int32?>(initialState: nil)
         try process.run()
         if let stdinData = spec.stdinData {
             let input = stdinPipe.fileHandleForWriting
-            input.write(stdinData)
-            input.closeFile()
+            // A child may close stdin before the write. Preserve EPIPE as an error
+            // instead of allowing SIGPIPE to terminate the helper.
+            guard fcntl(input.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
+                process.terminate()
+                throw ProcessRunnerError.stdinWriteFailed(errno)
+            }
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { group.leave() }
+                do {
+                    defer { input.closeFile() }
+                    try input.write(contentsOf: stdinData)
+                } catch {
+                    inputError.withLock { $0 = Int32((error as NSError).code) }
+                }
+            }
         }
 
-        let deadline = Date().addingTimeInterval(max(0.2, timeoutSeconds))
         var timedOut = false
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
+        if let timeoutSeconds {
+            let deadline = Date().addingTimeInterval(max(0.2, timeoutSeconds))
+            while process.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            timedOut = process.isRunning
+        } else {
+            process.waitUntilExit()
         }
-        if process.isRunning {
-            timedOut = true
+        if timedOut {
             process.terminate()
             Thread.sleep(forTimeInterval: 0.1)
             if process.isRunning {
@@ -143,7 +121,11 @@ public enum ProcessRunner {
             }
             process.waitUntilExit()
         }
-        _ = group.wait(timeout: .now() + 1.0)
+        process.waitUntilExit()
+        group.wait()
+        if let code = inputError.withLock({ $0 }), !timedOut {
+            throw ProcessRunnerError.stdinWriteFailed(code)
+        }
 
         return ProcessResult(
             exitCode: timedOut ? -1 : process.terminationStatus,
@@ -152,4 +134,8 @@ public enum ProcessRunner {
             timedOut: timedOut
         )
     }
+}
+
+public enum ProcessRunnerError: Error {
+    case stdinWriteFailed(Int32)
 }

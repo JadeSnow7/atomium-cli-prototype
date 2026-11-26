@@ -160,7 +160,10 @@ struct AtomiumBoxAgent {
             }
             let secret = rawSecret.trimmingCharacters(in: .whitespacesAndNewlines)
             let kcPath = "\(boxId.homeDirectory)/Library/Keychains/login.keychain-db"
-            let cmd = SecurityCommandBuilder.unlockKeychain(keychainPath: kcPath, password: secret)
+            guard let cmd = try? SecurityCommandBuilder.unlockKeychain(keychainPath: kcPath, password: secret, expectedDirectory: "\(boxId.homeDirectory)/Library/Keychains") else {
+                sendResponse(fd: fd, AgentResponse(ok: false, op: "keychain.unlock", error: "invalid_keychain_input"))
+                return
+            }
             let res = try? ProcessRunner.runWithTimeout(cmd, timeoutSeconds: 4.0)
             let ok = res?.succeeded ?? false
             sendResponse(fd: fd, AgentResponse(ok: ok, op: "keychain.unlock", error: ok ? nil : "unlock_failed"))

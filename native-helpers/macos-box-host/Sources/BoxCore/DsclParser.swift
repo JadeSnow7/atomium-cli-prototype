@@ -1,6 +1,12 @@
 import Foundation
 
 public enum DsclParser {
+    public static func commandSucceeded(_ result: ProcessResult) -> Bool {
+        result.succeeded && ![result.stdout, result.stderr].contains { output in
+            output.contains("DS Error") || output.contains("eDS")
+        }
+    }
+
     /// Parses `dscl . -list /Users UniqueID` or `dscl . -list /Groups PrimaryGroupID`
     /// into a dictionary mapping name -> numeric ID.
     public static func parseIdList(_ output: String) -> [String: UInt32] {

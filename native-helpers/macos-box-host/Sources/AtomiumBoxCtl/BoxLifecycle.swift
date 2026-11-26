@@ -35,7 +35,7 @@ enum BoxLifecycle {
 
     static func readAttribute(user shortName: String, key: String) -> String? {
         guard let result = try? ProcessRunner.run(DsclCommandBuilder.readUser(shortName: shortName, key: key)),
-              result.succeeded else {
+              DsclParser.commandSucceeded(result) else {
             return nil
         }
         return DsclParser.parseSingleAttribute(result.stdout, key: key)
@@ -43,7 +43,7 @@ enum BoxLifecycle {
 
     static func readGroupGid(_ groupName: String) -> UInt32? {
         guard let result = try? ProcessRunner.run(DsclCommandBuilder.readGroup(groupName: groupName, key: "PrimaryGroupID")),
-              result.succeeded,
+              DsclParser.commandSucceeded(result),
               let raw = DsclParser.parseSingleAttribute(result.stdout, key: "PrimaryGroupID") else {
             return nil
         }
@@ -54,7 +54,7 @@ enum BoxLifecycle {
         guard let result = try? ProcessRunner.run(DsclCommandBuilder.readUser(shortName: shortName, key: "UniqueID")) else {
             return false
         }
-        return result.succeeded
+        return DsclParser.commandSucceeded(result)
     }
 
     static func inspectAccount(shortName: String) -> BoxAccountRecord {
@@ -94,7 +94,7 @@ enum BoxLifecycle {
 
     static func listPrefixedAccounts() throws -> [BoxAccountRecord] {
         let listResult = try ProcessRunner.run(DsclCommandBuilder.listUsers())
-        guard listResult.succeeded else {
+        guard DsclParser.commandSucceeded(listResult) else {
             throw BoxCLIError.commandFailed("dscl list /Users", listResult.stderr)
         }
         let names = listResult.stdout
@@ -105,21 +105,12 @@ enum BoxLifecycle {
         return names.map(inspectAccount(shortName:))
     }
 
-    static func generateRandomSecretHex(byteCount: Int = 32) throws -> String {
-        var bytes = [UInt8](repeating: 0, count: byteCount)
-        let status = SecRandomCopyBytes(kSecRandomDefault, byteCount, &bytes)
-        guard status == errSecSuccess else {
-            throw BoxCLIError.internalError("SecRandomCopyBytes failed with status \(status)")
-        }
-        return bytes.map { String(format: "%02x", $0) }.joined()
-    }
-
     static func ensureGroupWithStatus(name: String, minGid: UInt32) throws -> (gid: UInt32, created: Bool) {
         if let existing = readGroupGid(name) {
             return (existing, false)
         }
         let groupsResult = try ProcessRunner.run(DsclCommandBuilder.listGroupIds())
-        guard groupsResult.succeeded else {
+        guard DsclParser.commandSucceeded(groupsResult) else {
             throw BoxCLIError.commandFailed("dscl list /Groups PrimaryGroupID", groupsResult.stderr)
         }
         let usedGids = Set(DsclParser.parseIdList(groupsResult.stdout).values)
@@ -169,7 +160,7 @@ enum BoxLifecycle {
         try appendDirectoryRecord(path: BoxConstants.runtimeDirectory, created: runtimeBoxesCreated)
 
         let usersResult = try ProcessRunner.run(DsclCommandBuilder.listUserUniqueIds())
-        guard usersResult.succeeded else {
+        guard DsclParser.commandSucceeded(usersResult) else {
             throw BoxCLIError.commandFailed("dscl list /Users UniqueID", usersResult.stderr)
         }
         let usedUids = Set(DsclParser.parseIdList(usersResult.stdout).values)
@@ -177,16 +168,25 @@ enum BoxLifecycle {
 
         for cmd in DsclCommandBuilder.createUserCommands(id: identifier, uid: newUid, primaryGid: primaryGid) {
             let result = try ProcessRunner.run(cmd)
-            guard result.succeeded else {
+            guard DsclParser.commandSucceeded(result) else {
                 throw BoxCLIError.commandFailed(cmd.displayShellCommand, result.stderr)
             }
         }
 
-        let password = try generateRandomSecretHex(byteCount: 32)
-        let passwdCmd = DsclCommandBuilder.setPassword(id: identifier, password: password)
-        let passwdResult = try ProcessRunner.run(passwdCmd)
-        guard passwdResult.succeeded else {
-            throw BoxCLIError.commandFailed(passwdCmd.displayShellCommand, passwdResult.stderr)
+        let password = try SecurityCommandBuilder.generatePassword()
+        let passwdCmd = try DsclCommandBuilder.setPassword(id: identifier, password: password)
+        let passwdResult = try ProcessRunner.runWithTimeout(passwdCmd)
+        guard DsclParser.commandSucceeded(passwdResult) else {
+            throw BoxCLIError.commandFailed(passwdCmd.displayShellCommand, "exit=\(passwdResult.exitCode), timed_out=\(passwdResult.timedOut)")
+        }
+        // Successful password authentication requires a real test account. Until that
+        // manual check, verify the account record without exposing its password.
+        let accountResult = try ProcessRunner.run(DsclCommandBuilder.readUser(shortName: identifier.shortName))
+        guard DsclParser.commandSucceeded(accountResult),
+              DsclParser.parseSingleAttribute(accountResult.stdout, key: "UniqueID") == String(newUid),
+              DsclParser.parseSingleAttribute(accountResult.stdout, key: "PrimaryGroupID") == String(primaryGid),
+              DsclParser.parseSingleAttribute(accountResult.stdout, key: "Comment") == identifier.commentMarker else {
+            throw BoxCLIError.commandFailed("dscl read account after password assignment", "account state verification failed")
         }
 
         let secretDirCreated = try ensureDirectoryOwned(path: BoxConstants.secretDirectory, uid: 0, gid: 0, mode: 0o700)
@@ -300,19 +300,71 @@ enum BoxLifecycle {
         return try? PrototypeManifestCodec.decode(data)
     }
 
+    static func currentPrototypeManifest() throws -> PrototypeManifest {
+        let path = BoxConstants.prototypeManifestPath
+        guard FileManager.default.fileExists(atPath: path) else { return PrototypeManifest() }
+        return try PrototypeManifestCodec.decode(Data(contentsOf: URL(fileURLWithPath: path)))
+    }
+
+    static func observeManifestGroupGid(_ name: String) throws -> UInt32? {
+        let result = try ProcessRunner.run(DsclCommandBuilder.readGroup(groupName: name, key: "PrimaryGroupID"))
+        if !result.succeeded || !DsclParser.commandSucceeded(result) {
+            if result.stdout.contains("eDSRecordNotFound") || result.stderr.contains("eDSRecordNotFound") { return nil }
+            throw BoxCLIError.commandFailed("dscl read manifest group", "directory service query failed")
+        }
+        guard let raw = DsclParser.parseSingleAttribute(result.stdout, key: "PrimaryGroupID"), let gid = UInt32(raw) else {
+            throw BoxCLIError.internalError("Invalid PrimaryGroupID in manifest resource observation")
+        }
+        return gid
+    }
+
+    static func observeManifestDirectory(_ path: String) throws -> PrototypeDirectoryObservation? {
+        var st = stat()
+        guard lstat(path, &st) == 0 else {
+            if errno == ENOENT { return nil }
+            throw BoxCLIError.internalError("lstat manifest resource failed: errno=\(errno)")
+        }
+        return PrototypeDirectoryObservation(inode: UInt64(st.st_ino), ownerUid: UInt32(st.st_uid), isDirectory: (st.st_mode & S_IFMT) == S_IFDIR)
+    }
+
+    static func persistPrototypeManifest(_ manifest: PrototypeManifest) throws {
+        let manifest = try manifest.observingExistingResources(groupGid: observeManifestGroupGid, directoryObservation: observeManifestDirectory)
+        let fm = FileManager.default
+        let path = BoxConstants.prototypeManifestPath
+        if manifest.isEmpty {
+            if fm.fileExists(atPath: path) { try fm.removeItem(atPath: path) }
+            return
+        }
+        _ = try ensureDirectoryOwned(path: BoxConstants.prototypeStateDirectory, uid: 0, gid: 0, mode: 0o700)
+        let tempPath = path + "." + UUID().uuidString + ".tmp"
+        let fd = open(tempPath, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard fd >= 0 else {
+            throw BoxCLIError.internalError("create manifest temporary file failed: errno=\(errno)")
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        do {
+            guard fchown(fd, 0, 0) == 0, fchmod(fd, 0o600) == 0 else {
+                throw BoxCLIError.internalError("secure manifest temporary file failed: errno=\(errno)")
+            }
+            try handle.write(contentsOf: PrototypeManifestCodec.encode(manifest))
+            try handle.synchronize()
+            try handle.close()
+            guard rename(tempPath, path) == 0 else {
+                throw BoxCLIError.internalError("atomic manifest rename failed: errno=\(errno)")
+            }
+        } catch {
+            if fm.fileExists(atPath: tempPath) { try fm.removeItem(atPath: tempPath) }
+            throw error
+        }
+    }
+
     static func writePrototypeManifest(
         groupRecord: PrototypeGroupRecord,
         directoryRecords: [PrototypeDirectoryRecord]
     ) throws {
-        _ = try ensureDirectoryOwned(path: BoxConstants.prototypeStateDirectory, uid: 0, gid: 0, mode: 0o700)
-        var manifest = loadPrototypeManifest() ?? PrototypeManifest()
-        manifest = manifest.addingGroup(groupRecord)
-        for record in directoryRecords {
-            manifest = manifest.addingCreatedDirectory(record)
-        }
-        let data = try PrototypeManifestCodec.encode(manifest)
-        try data.write(to: URL(fileURLWithPath: BoxConstants.prototypeManifestPath))
-        try setOwnerAndMode(path: BoxConstants.prototypeManifestPath, uid: 0, gid: 0, mode: 0o600)
+        var manifest = try currentPrototypeManifest().addingGroup(groupRecord)
+        for record in directoryRecords { manifest = manifest.addingCreatedDirectory(record) }
+        try persistPrototypeManifest(manifest)
     }
 
     static func octalPermissions(of path: String) throws -> String {
@@ -414,7 +466,7 @@ enum BoxLifecycle {
 
             let delCmd = DsclCommandBuilder.deleteUser(id: id)
             let delResult = try ProcessRunner.run(delCmd)
-            guard delResult.succeeded else {
+            guard DsclParser.commandSucceeded(delResult) else {
                 throw BoxCLIError.commandFailed(delCmd.displayShellCommand, delResult.stderr)
             }
 
@@ -428,6 +480,9 @@ enum BoxLifecycle {
             if fm.fileExists(atPath: id.socketDirectory) {
                 try fm.removeItem(atPath: id.socketDirectory)
             }
+            var manifest = try currentPrototypeManifest()
+            manifest = manifest.removingDirectory(at: homePath).removingDirectory(at: id.socketDirectory)
+            try persistPrototypeManifest(manifest)
             print("Destroyed \(id.shortName).")
         }
 
@@ -450,8 +505,7 @@ enum BoxLifecycle {
     }
 
     static func cleanupSharedPrototypeArtifacts() throws {
-        let manifest = loadPrototypeManifest()
-        if manifest == nil {
+        guard var manifest = loadPrototypeManifest() else {
             fputs("Warning: prototype manifest missing or unreadable at \(BoxConstants.prototypeManifestPath); no shared groups or directories will be removed.\n", stderr)
             return
         }
@@ -460,17 +514,23 @@ enum BoxLifecycle {
             let decision = PrototypeCleanupEvaluator.groupDecision(
                 manifest: manifest,
                 groupName: group,
-                currentGid: readGroupGid(group)
+                currentGid: try observeManifestGroupGid(group)
             )
+            if decision == .alreadyAbsent {
+                manifest = manifest.removingGroup(named: group)
+                try persistPrototypeManifest(manifest)
+            }
             guard decision.shouldDelete else {
                 print("Skipping group '\(group)': \(decision.skipReason).")
                 continue
             }
             let res = try ProcessRunner.run(DsclCommandBuilder.deleteGroup(groupName: group))
             if res.succeeded {
+                manifest = manifest.removingGroup(named: group)
+                try persistPrototypeManifest(manifest)
                 print("Deleted group '\(group)'.")
             } else {
-                fputs("Warning: failed to delete group '\(group)': \(res.stderr)\n", stderr)
+                throw BoxCLIError.commandFailed("delete group \(group)", res.stderr)
             }
         }
 
@@ -479,18 +539,20 @@ enum BoxLifecycle {
             let decision = PrototypeCleanupEvaluator.directoryDecision(
                 manifest: manifest,
                 path: dir,
-                current: observeDirectory(path: dir)
+                current: try observeManifestDirectory(dir)
             )
+            if decision == .alreadyAbsent {
+                manifest = manifest.removingDirectory(at: dir)
+                try persistPrototypeManifest(manifest)
+            }
             guard decision.shouldDelete else {
                 print("Skipping directory '\(dir)': \(decision.skipReason).")
                 continue
             }
-            do {
-                try fm.removeItem(atPath: dir)
-                print("Removed directory '\(dir)'.")
-            } catch {
-                fputs("Warning: failed to remove directory '\(dir)': \(error.localizedDescription)\n", stderr)
-            }
+            try fm.removeItem(atPath: dir)
+            manifest = manifest.removingDirectory(at: dir)
+            try persistPrototypeManifest(manifest)
+            print("Removed directory '\(dir)'.")
         }
     }
 }

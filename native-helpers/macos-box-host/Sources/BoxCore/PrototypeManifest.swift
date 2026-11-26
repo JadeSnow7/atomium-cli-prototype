@@ -64,18 +64,53 @@ public struct PrototypeManifest: Codable, Equatable, Sendable {
         let existing = merged[index]
         merged[index] = PrototypeGroupRecord(
             name: existing.name,
-            gid: existing.gid,
-            createdByTool: existing.createdByTool || record.createdByTool
+            gid: record.gid,
+            createdByTool: (existing.gid == record.gid && existing.createdByTool) || record.createdByTool
         )
         return PrototypeManifest(schema: schema, groups: merged, directories: directories)
     }
 
     public func addingCreatedDirectory(_ record: PrototypeDirectoryRecord) -> PrototypeManifest {
-        guard !directories.contains(where: { $0.path == record.path }) else {
-            return self
-        }
-        return PrototypeManifest(schema: schema, groups: groups, directories: directories + [record])
+        var updated = directories.filter { $0.path != record.path }
+        updated.append(record)
+        return PrototypeManifest(schema: schema, groups: groups, directories: updated)
     }
+
+    public var isEmpty: Bool { groups.isEmpty && directories.isEmpty }
+
+    public func removingGroup(named name: String) -> PrototypeManifest {
+        PrototypeManifest(schema: schema, groups: groups.filter { $0.name != name }, directories: directories)
+    }
+
+    public func removingDirectory(at path: String) -> PrototypeManifest {
+        PrototypeManifest(schema: schema, groups: groups, directories: directories.filter {
+            $0.path != path && !$0.path.hasPrefix(path + "/")
+        })
+    }
+
+    public func observingExistingResources(
+        groupGid: (String) throws -> UInt32?,
+        directoryObservation: (String) throws -> PrototypeDirectoryObservation?
+    ) throws -> PrototypeManifest {
+        let gids = try Dictionary(uniqueKeysWithValues: groups.compactMap { record in
+            try groupGid(record.name).map { (record.name, $0) }
+        })
+        let observations = try Dictionary(uniqueKeysWithValues: directories.compactMap { record in
+            try directoryObservation(record.path).map { (record.path, $0) }
+        })
+        return retainingExistingResources(groupGids: gids, directoryObservations: observations)
+    }
+
+    public func retainingExistingResources(
+        groupGids: [String: UInt32],
+        directoryObservations: [String: PrototypeDirectoryObservation]
+    ) -> PrototypeManifest {
+        PrototypeManifest(schema: schema, groups: groups.filter { groupGids[$0.name] == $0.gid }, directories: directories.filter { record in
+            guard let observed = directoryObservations[record.path] else { return false }
+            return observed.isDirectory && observed.inode == record.inode && observed.ownerUid == record.ownerUid
+        })
+    }
+
 }
 
 public enum PrototypeManifestError: Error, Equatable, CustomStringConvertible, Sendable {

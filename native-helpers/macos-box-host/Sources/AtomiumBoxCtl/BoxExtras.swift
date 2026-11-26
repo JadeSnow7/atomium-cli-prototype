@@ -80,7 +80,6 @@ enum BoxExtras {
     static func keychainInit(boxId rawBoxId: String) throws -> KeychainInitReport {
         try BoxLifecycle.requireRoot(for: "keychain-init")
         let (identifier, uid, gid) = try BoxLauncher.resolveManagedBox(rawBoxId)
-        let env = try BoxLauncher.prepareBoxRuntimeEnvironment(identifier: identifier, uid: uid, gid: gid)
 
         guard let rawSecret = try? String(contentsOfFile: identifier.secretPath, encoding: .utf8) else {
             throw BoxCLIError.notFound("Missing Box secret file at \(identifier.secretPath)")
@@ -91,17 +90,11 @@ enum BoxExtras {
         }
 
         let keychainsDir = "\(identifier.homeDirectory)/Library/Keychains"
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: keychainsDir) {
-            try fm.createDirectory(atPath: keychainsDir, withIntermediateDirectories: true)
-        }
-        try BoxLifecycle.setOwnerAndMode(path: "\(identifier.homeDirectory)/Library", uid: uid, gid: gid, mode: 0o700)
-        try BoxLifecycle.setOwnerAndMode(path: keychainsDir, uid: uid, gid: gid, mode: 0o700)
-
         let kcPath = "\(keychainsDir)/login.keychain-db"
-        if fm.fileExists(atPath: kcPath) {
-            try fm.removeItem(atPath: kcPath)
-        }
+        let createKeychain = try SecurityCommandBuilder.createKeychain(keychainPath: kcPath, password: secret, expectedDirectory: keychainsDir)
+        let unlockKeychain = try SecurityCommandBuilder.unlockKeychain(keychainPath: kcPath, password: secret, expectedDirectory: keychainsDir)
+        try BoxKeychainDirectory.prepare(homeDirectory: identifier.homeDirectory, uid: uid, gid: gid)
+        let env = BoxLauncher.boxRuntimeEnvironment(identifier: identifier)
 
         func runSecurityAsBox(_ secArgs: [String], redacted: [String]? = nil, stdinData: Data? = nil) throws -> ProcessResult {
             let prefix = ["/bin/launchctl", "asuser", String(uid), "/usr/bin/sudo", "-u", identifier.shortName, "-H"]
@@ -116,26 +109,27 @@ enum BoxExtras {
             return try ProcessRunner.runWithTimeout(spec, timeoutSeconds: 8.0, environment: env, currentDirectoryPath: identifier.homeDirectory)
         }
 
-        let createKeychain = SecurityCommandBuilder.createKeychain(keychainPath: kcPath, password: secret)
         let createRes = try runSecurityAsBox(
             createKeychain.arguments,
             redacted: createKeychain.redactedArguments,
             stdinData: createKeychain.stdinData
         )
         guard createRes.succeeded else {
-            throw BoxCLIError.commandFailed("security create-keychain", createRes.stderr)
+            throw BoxCLIError.commandFailed("security create-keychain", "exit=\(createRes.exitCode), timed_out=\(createRes.timedOut)")
         }
 
         _ = try runSecurityAsBox(["default-keychain", "-d", "user", "-s", kcPath])
         _ = try runSecurityAsBox(["login-keychain", "-d", "user", "-s", kcPath])
         _ = try runSecurityAsBox(["set-keychain-settings", kcPath])
 
-        let unlockKeychain = SecurityCommandBuilder.unlockKeychain(keychainPath: kcPath, password: secret)
         let unlockRes = try runSecurityAsBox(
             unlockKeychain.arguments,
             redacted: unlockKeychain.redactedArguments,
             stdinData: unlockKeychain.stdinData
         )
+        guard !unlockRes.timedOut else {
+            throw BoxCLIError.commandFailed("security unlock-keychain", "timed out")
+        }
         let listRes = try runSecurityAsBox(["list-keychains", "-d", "user"])
 
         return KeychainInitReport(

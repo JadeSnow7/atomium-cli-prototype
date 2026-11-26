@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import BoxCore
@@ -178,7 +179,7 @@ final class BoxCoreTests: XCTestCase {
         XCTAssertEqual(createCommands[7].shellCommand, "/usr/bin/dscl . -create /Users/atombox_s1a Comment atomium-box:s1a")
 
         let secret = "super-secret-value"
-        let passwd = DsclCommandBuilder.setPassword(id: id, password: secret)
+        let passwd = try DsclCommandBuilder.setPassword(id: id, password: secret)
         XCTAssertEqual(passwd.argv, ["/usr/bin/dscl", "."])
         XCTAssertFalse(passwd.arguments.contains(where: { $0.contains(secret) }))
         let passwdStdin = passwd.stdinData.map { String(decoding: $0, as: UTF8.self) } ?? ""
@@ -318,20 +319,20 @@ final class BoxCoreTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(AgentResponse.self, from: encodedResp), resp)
     }
 
-    func testSecurityCommandsKeepSecretsOutOfArgv() {
+    func testSecurityCommandsKeepSecretsOutOfArgv() throws {
         let secret = "keychain-test-secret"
         let path = "/tmp/example.keychain-db"
 
-        let create = SecurityCommandBuilder.createKeychain(keychainPath: path, password: secret)
-        XCTAssertEqual(create.arguments, ["create-keychain", path])
+        let create = try SecurityCommandBuilder.createKeychain(keychainPath: path, password: secret, expectedDirectory: "/tmp")
+        XCTAssertEqual(create.arguments, ["-i"])
         XCTAssertFalse(create.arguments.contains(where: { $0.contains(secret) }))
         let createStdin = create.stdinData.map { String(decoding: $0, as: UTF8.self) } ?? ""
-        XCTAssertEqual(createStdin.split(separator: "\n").count, 2)
+        XCTAssertTrue(createStdin.hasPrefix("create-keychain -p "))
         XCTAssertTrue(createStdin.contains(secret))
         XCTAssertFalse(create.displayShellCommand.contains(secret))
 
-        let unlock = SecurityCommandBuilder.unlockKeychain(keychainPath: path, password: secret)
-        XCTAssertEqual(unlock.arguments, ["unlock-keychain", path])
+        let unlock = try SecurityCommandBuilder.unlockKeychain(keychainPath: path, password: secret, expectedDirectory: "/tmp")
+        XCTAssertEqual(unlock.arguments, ["-i"])
         XCTAssertFalse(unlock.arguments.contains(where: { $0.contains(secret) }))
         let unlockStdin = unlock.stdinData.map { String(decoding: $0, as: UTF8.self) } ?? ""
         XCTAssertTrue(unlockStdin.contains(secret))
@@ -395,4 +396,98 @@ final class BoxCoreTests: XCTestCase {
             .delete
         )
     }
+    func testReviewDsclMarkersOverrideZeroExitStatus() {
+        XCTAssertFalse(DsclParser.commandSucceeded(ProcessResult(exitCode: 0, stdout: "DS Error: -14090", stderr: "")))
+        XCTAssertFalse(DsclParser.commandSucceeded(ProcessResult(exitCode: 0, stdout: "", stderr: "eDSAuthFailed")))
+        XCTAssertTrue(DsclParser.commandSucceeded(ProcessResult(exitCode: 0, stdout: "normal output", stderr: "")))
+    }
+
+    func testReviewManifestReplacesStaleIdentity() {
+        let old = PrototypeManifest(groups: [PrototypeGroupRecord(name: "test", gid: 700, createdByTool: true)],
+            directories: [PrototypeDirectoryRecord(path: "/tmp/test", inode: 1, ownerUid: 0)])
+        let updated = old.addingGroup(PrototypeGroupRecord(name: "test", gid: 701, createdByTool: false))
+            .addingCreatedDirectory(PrototypeDirectoryRecord(path: "/tmp/test", inode: 2, ownerUid: 0))
+        XCTAssertEqual(updated.groups[0].gid, 701)
+        XCTAssertFalse(updated.groups[0].createdByTool)
+        XCTAssertEqual(updated.directories[0].inode, 2)
+    }
+
+    func testInteractiveSecurityRejectsInvalidInput() throws {
+        let secret = String(repeating: "a", count: 32)
+        for invalid in ["short", String(repeating: "a", count: 129), secret + "\nquit", secret + "'", secret + " "] {
+            XCTAssertThrowsError(try SecurityCommandBuilder.createKeychain(keychainPath: "/tmp/test.keychain-db", password: invalid, expectedDirectory: "/tmp"))
+        }
+        for path in ["/other/test.keychain-db", "/tmp/../test.keychain-db", "/tmp/test keychain", "/tmp/test\nquit"] {
+            XCTAssertThrowsError(try SecurityCommandBuilder.unlockKeychain(keychainPath: path, password: secret, expectedDirectory: "/tmp"))
+        }
+        let command = try SecurityCommandBuilder.createKeychain(keychainPath: "/tmp/test.keychain-db", password: secret, expectedDirectory: "/tmp")
+        let expected = "create-keychain -p " + secret + " /tmp/test.keychain-db\n"
+        XCTAssertTrue(command.stdinData == Data(expected.utf8))
+        let generated = try SecurityCommandBuilder.generatePassword()
+        XCTAssertEqual(generated.utf8.count, 64)
+        XCTAssertNoThrow(try SecurityCommandBuilder.validatePassword(generated))
+    }
+
+    func testManifestDestroyAndReprovision() {
+        let group = PrototypeGroupRecord(name: "test", gid: 700, createdByTool: true)
+        let dir = PrototypeDirectoryRecord(path: "/tmp/test", inode: 1, ownerUid: 0)
+        let provisioned = PrototypeManifest().addingGroup(group).addingCreatedDirectory(dir)
+        let retained = provisioned.retainingExistingResources(groupGids: ["test": 701], directoryObservations: [dir.path: PrototypeDirectoryObservation(inode: 2, ownerUid: 0, isDirectory: true)])
+        XCTAssertTrue(retained.isEmpty)
+        let destroyed = provisioned.removingGroup(named: group.name).removingDirectory(at: dir.path)
+        XCTAssertTrue(destroyed.isEmpty)
+        XCTAssertEqual(destroyed.addingGroup(group).addingCreatedDirectory(dir), provisioned)
+    }
+
+    func testProcessRunnerHandlesClosedStdinAndTimeout() throws {
+        XCTAssertThrowsError(try ProcessRunner.run(CommandSpec(executable: "/usr/bin/true", arguments: [], stdinData: Data(repeating: 97, count: 1024 * 1024))))
+        let result = try ProcessRunner.runWithTimeout(CommandSpec(executable: "/bin/sleep", arguments: ["3"]), timeoutSeconds: 0.2)
+        XCTAssertTrue(result.timedOut)
+        XCTAssertFalse(result.succeeded)
+    }
+
+    func testManifestValidationPreservesObservationFailures() throws {
+        enum ObservationError: Error { case denied }
+        let manifest = PrototypeManifest(groups: [PrototypeGroupRecord(name: "test", gid: 700, createdByTool: true)], directories: [PrototypeDirectoryRecord(path: "/tmp/test", inode: 1, ownerUid: 0)])
+        XCTAssertThrowsError(try manifest.observingExistingResources(groupGid: { _ in throw ObservationError.denied }, directoryObservation: { _ in nil }))
+        XCTAssertThrowsError(try manifest.observingExistingResources(groupGid: { _ in 700 }, directoryObservation: { _ in throw ObservationError.denied }))
+        let absent = try manifest.observingExistingResources(groupGid: { _ in nil }, directoryObservation: { _ in nil })
+        XCTAssertTrue(absent.isEmpty)
+        XCTAssertEqual(PrototypeCleanupEvaluator.groupDecision(manifest: manifest, groupName: "test", currentGid: nil), .alreadyAbsent)
+        XCTAssertEqual(PrototypeCleanupEvaluator.directoryDecision(manifest: manifest, path: "/tmp/test", current: nil), .alreadyAbsent)
+    }
+
+    func testKeychainDirectoryPreparesOwnedFixture() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("atomium-keychain-dir-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try BoxKeychainDirectory.prepare(homeDirectory: root.path, uid: getuid(), gid: getgid())
+        let keychain = root.appendingPathComponent("Library/Keychains/login.keychain-db")
+        try Data("fixture".utf8).write(to: keychain)
+        try BoxKeychainDirectory.prepare(homeDirectory: root.path, uid: getuid(), gid: getgid())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: keychain.path))
+        for component in [".tmp", "Library", "Library/Keychains"] {
+            let attributes = try FileManager.default.attributesOfItem(atPath: root.appendingPathComponent(component).path)
+            XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o700)
+            XCTAssertEqual((attributes[.ownerAccountID] as? NSNumber)?.uint32Value, getuid())
+        }
+    }
+
+    func testKeychainDirectoryRejectsSymlinkComponentsInOwnedFixture() throws {
+        let fm = FileManager.default
+        for component in ["home", ".tmp", "Library", "Library/Keychains"] {
+            let root = fm.temporaryDirectory.appendingPathComponent("atomium-keychain-links-" + UUID().uuidString)
+            try fm.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: root) }
+            let target = root.appendingPathComponent("fixture-target")
+            try fm.createDirectory(at: target, withIntermediateDirectories: true)
+            let home = root.appendingPathComponent("home")
+            if component != "home" { try fm.createDirectory(at: home, withIntermediateDirectories: true) }
+            let link = component == "home" ? home : home.appendingPathComponent(component)
+            try fm.createDirectory(at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.createSymbolicLink(at: link, withDestinationURL: target)
+            XCTAssertThrowsError(try BoxKeychainDirectory.prepare(homeDirectory: home.path, uid: getuid(), gid: getgid()))
+        }
+    }
+
 }
