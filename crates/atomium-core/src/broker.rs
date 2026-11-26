@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -862,7 +862,13 @@ fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
 
 fn copy_file_contents_create_new(src: &Path, dst: &Path) -> std::io::Result<()> {
     let bytes = fs::read(src)?;
-    let mut file = OpenOptions::new().write(true).create_new(true).open(dst)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dst)?;
+    #[cfg(test)]
+    record_temp_file_creation(&file, true);
     file.write_all(&bytes)?;
     file.set_permissions(fs::metadata(src)?.permissions())?;
     file.sync_all()?;
@@ -894,7 +900,24 @@ fn restore_backup_preserving_mode(backup: &Path, final_path: &Path) -> std::io::
 }
 
 #[cfg(test)]
+fn record_temp_file_creation(file: &File, rollback: bool) {
+    TEMP_FILE_CREATIONS.with(|created| {
+        if let Some(counts) = created.borrow_mut().as_mut() {
+            let metadata = file.metadata().expect("stat newly created temporary file");
+            assert_eq!(
+                metadata.len(),
+                0,
+                "check permissions before writing content"
+            );
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            counts[usize::from(rollback)] += 1;
+        }
+    });
+}
+
+#[cfg(test)]
 thread_local! {
+    static TEMP_FILE_CREATIONS: std::cell::RefCell<Option<[usize; 2]>> = const { std::cell::RefCell::new(None) };
     static EXPORT_JOURNAL_FAIL_PHASE: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
     static EXPORT_JOURNAL_FAIL_AFTER_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2084,7 +2107,10 @@ impl WorkspaceBroker {
                         let mut f = OpenOptions::new()
                             .write(true)
                             .create_new(true)
+                            .mode(0o600)
                             .open(&temp_path)?;
+                        #[cfg(test)]
+                        record_temp_file_creation(&f, false);
                         f.write_all(&bytes)?;
                         let existing_mode = match fs::symlink_metadata(&final_path) {
                             Ok(meta) if meta.file_type().is_file() => {
@@ -2749,6 +2775,96 @@ mod export_recovery_tests {
     fn review_fsync_missing_parent_is_harmless() {
         let root = TestDir::new("missing-parent");
         fsync_parent(&root.path.join("missing/file")).unwrap();
+    }
+
+    #[test]
+    fn export_and_rollback_temp_files_are_private_under_permissive_umask() {
+        const CHILD_MARKER: &str = "ATOMIUM_TEST_TEMP_PERMISSION_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "broker::export_recovery_tests::export_and_rollback_temp_files_are_private_under_permissive_umask",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_MARKER, "1")
+                .output()
+                .expect("start isolated permissions test");
+            assert!(
+                output.status.success(),
+                "permissions subprocess failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                "permissions subprocess must execute exactly one test"
+            );
+            return;
+        }
+
+        // Only this filtered subprocess changes the process-wide mask.
+        unsafe {
+            libc::umask(0);
+        }
+        for original_mode in [0o600, 0o755] {
+            for rollback in [false, true] {
+                let root = TestDir::new("private-temp");
+                let host = root.path.join("host");
+                fs::create_dir_all(&host).unwrap();
+                fs::write(host.join("a.txt"), b"original").unwrap();
+                fs::set_permissions(
+                    host.join("a.txt"),
+                    fs::Permissions::from_mode(original_mode),
+                )
+                .unwrap();
+                let broker = open_broker(&root.path);
+                let ws = broker.import_and_record(&host, None, None).unwrap();
+                fs::write(Path::new(&ws.working_dir).join("a.txt"), b"updated").unwrap();
+                fs::write(Path::new(&ws.working_dir).join("b.txt"), b"added").unwrap();
+                let candidate = broker
+                    .freeze_candidate(&ws.workspace_id, None, None, None)
+                    .unwrap()
+                    .0;
+                TEMP_FILE_CREATIONS.with(|created| *created.borrow_mut() = Some([0, 0]));
+                let failures = ExportFailures;
+                EXPORT_POST_VERIFY_FAIL.with(|hook| hook.set(rollback));
+                let result = export_test_candidate(&broker, &candidate, &host);
+                drop(failures);
+                assert_eq!(result.is_err(), rollback);
+                TEMP_FILE_CREATIONS.with(|created| {
+                    let counts = created
+                        .borrow_mut()
+                        .take()
+                        .expect("creation observer enabled");
+                    assert_eq!(counts, [2, usize::from(rollback)]);
+                });
+                assert_eq!(
+                    fs::metadata(host.join("a.txt"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    original_mode
+                );
+                if rollback {
+                    assert_eq!(fs::read(host.join("a.txt")).unwrap(), b"original");
+                    assert!(!host.join("b.txt").exists());
+                } else {
+                    assert_eq!(fs::read(host.join("a.txt")).unwrap(), b"updated");
+                    assert_eq!(fs::read(host.join("b.txt")).unwrap(), b"added");
+                    assert_eq!(
+                        fs::metadata(host.join("b.txt"))
+                            .unwrap()
+                            .permissions()
+                            .mode()
+                            & 0o777,
+                        0o644
+                    );
+                }
+            }
+        }
     }
 
     #[test]
