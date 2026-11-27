@@ -554,6 +554,7 @@ pub struct DaemonCapabilities {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+#[serde(rename_all = "snake_case")]
 pub enum PrivacyStatus {
     Enforced,
     DefaultOnly,

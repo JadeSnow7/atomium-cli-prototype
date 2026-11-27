@@ -104,8 +104,10 @@ PresenceProof {
 
 - 新增 `daemon.capabilities`、`privacy.matrix`、`privacy.probe`、`daemon.panic` 和 `daemon.panic_clear`。`daemon.capabilities` 返回 `protocol_version = "1.3"`，在 `methods` 中列出这五个方法，在 `deprecated` 中列出 `subscriptions.activate`。本阶段 `portals` 为空数组。`PortalKind` 预先定义 `"url.open"` 的线格式。
 - 新增 `DaemonCapabilities`、`LaunchMode`、`ProbeCacheInfo`、`PortalKind`、`PrivacyStatus`、`PrivacyItem`、`PrivacyMatrix`、`PrivacyProbeRequest`、`PrivacyProbeResult`、`DaemonPanicRequest`、`DaemonPanicResult` 和 `DaemonPanicClearResult`。既有 `CapabilitiesReport` 新增可选的 `os_build`、`sbpl_template_digest`，`ProbeEvidence` 新增可选的 `mandatory`、`evidence_at_ms`。历史帧省略这些字段时仍可解码。
-- `privacy.probe` 省略 `probe_ids` 时重跑全量，指定子集时只更新对应证据。未知 `probe_ids` 或请求中出现未知字段返回 `-32602`。`daemon.panic.reason` 可省略，上限为 256 字节，入库前脱敏。超限或请求中出现未知字段返回 `-32602`。
+- `PrivacyStatus` 的线格式为 `enforced`、`default_only`、`host_visible`、`unverified`，替换首轮实现中的 PascalCase 值。`host_username` 和 `computer_name_scutil` 为 `host_visible`，`timezone_lang` 为 `default_only`。终端启动时 `tcc` 为 `host_visible`，LaunchAgent 在 E5 验证前为 `unverified`。
+- `privacy.probe` 省略 `probe_ids` 时重跑全量，指定子集时只更新对应证据。未知 `probe_ids` 或请求中出现未知字段返回 `-32602`。`daemon.panic.reason` 可省略，上限为 256 字节，入库前脱敏。超限或请求中出现未知字段返回 `-32602`。这两个方法均将省略的 `params` 和 `params: null` 按空对象处理。
 - `runs.start` 在熔断锁存期间返回 `-32002`，`data.kind = "panic_latched"`。必选探针失败返回 `-32003`，`data.kind = "isolation_probe_failed"`，并附上 `failed_probe_ids`。本次渲染策略装载失败返回 `-32003`，`data.kind = "isolation_policy_unloadable"`。同时观察到锁存时，优先返回 `panic_latched`。
+- 用户传入的 `program` 路径规范化失败时返回 `-32602`。预检通过后，正式 `RuntimeBackend::spawn` 返回错误时，`runs.start` 返回 `-32000`，运行沿用 `TaskStatus::Blocked`，`reason` 以 `spawn_failed:` 开头。守护进程发出一条相同状态及原因的 `StatusChanged` 事件，释放租约、删除运行目录并撤销本次网关。此变更沿用现有 `TaskStatus` 变体。
 - 事件仍通过 `events.push` 发送。本阶段沿用 `StatusChanged` 记录熔断，`reason = "daemon_panic"`。CLI、TypeScript 客户端和桌面端按 §1 容忍未来的未知事件类型。
 
 ## 5. v2 规划类型草案（随 Phase 1–4 验证落地）

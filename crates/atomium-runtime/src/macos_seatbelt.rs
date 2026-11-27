@@ -287,6 +287,16 @@ pub fn build_seatbelt_command_with_extra_read_paths(
         .collect::<std::io::Result<Vec<_>>>()
         .context("canonicalize executable paths")?;
     let profile = render_sbpl_with_extra_read_paths(&cfg, &extra_read_paths);
+    Ok(command_with_policy(&cfg, program, args, extra_env, profile))
+}
+
+fn command_with_policy(
+    cfg: &SeatbeltConfig,
+    program: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    profile: String,
+) -> Command {
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-p").arg(profile).arg(program).args(args);
     cmd.current_dir(&cfg.workspace_dir);
@@ -309,7 +319,7 @@ pub fn build_seatbelt_command_with_extra_read_paths(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    Ok(cmd)
+    cmd
 }
 
 pub async fn run_in_seatbelt(
@@ -346,28 +356,14 @@ impl RuntimeBackend for MacOsSeatbeltBackend {
             timezone: spec.timezone.clone(),
             lang: spec.lang.clone(),
         };
-        let mut extra_read_paths = Vec::new();
-        let prog_path = PathBuf::from(&spec.program);
-        if prog_path.is_absolute() {
-            if let Ok(canon_prog) = std::fs::canonicalize(&prog_path) {
-                extra_read_paths.push(canon_prog);
-            } else {
-                extra_read_paths.push(prog_path);
-            }
-        }
+        let profile = crate::probes::render_policy_for_spec(spec)?;
         let arg_refs: Vec<&str> = spec.args.iter().map(String::as_str).collect();
         let env_refs: Vec<(&str, &str)> = spec
             .extra_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        let mut cmd = build_seatbelt_command_with_extra_read_paths(
-            &cfg,
-            &spec.program,
-            &arg_refs,
-            &env_refs,
-            &extra_read_paths,
-        )?;
+        let mut cmd = command_with_policy(&cfg, &spec.program, &arg_refs, &env_refs, profile);
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());

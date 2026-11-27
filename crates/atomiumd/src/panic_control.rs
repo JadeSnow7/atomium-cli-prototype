@@ -7,7 +7,7 @@ pub(crate) async fn finish_record(
     state: &Arc<DaemonState>,
     record: &RunRecord,
     log_truncated: bool,
-) -> bool {
+) -> RunRecord {
     let store = state.runs.clone();
     let value = record.clone();
     match tokio::task::spawn_blocking(move || store.finalize_panic(&value, log_truncated)).await {
@@ -20,18 +20,19 @@ pub(crate) async fn finish_record(
             if new {
                 state.broadcast_event(event);
             }
-            true
+            record.clone()
         }
         _ => {
             let mut pending = record.clone();
             pending.status = TaskStatus::CleanupUnverified;
+            pending.cleanup_verified = false;
             state
                 .panic_cleanup
                 .lock()
                 .expect("panic cleanup memory poisoned")
-                .insert(record.run_id.clone(), (pending, log_truncated));
+                .insert(record.run_id.clone(), (pending.clone(), log_truncated));
             retry_cleanup(state);
-            false
+            pending
         }
     }
 }
@@ -41,37 +42,46 @@ pub(crate) async fn panic(
     reason: Option<String>,
 ) -> Result<DaemonPanicResult, RpcErr> {
     let started = Instant::now();
+    let deadline = started + Duration::from_secs(5) - Duration::from_millis(20);
     if reason.as_ref().is_some_and(|reason| reason.len() > 256) {
         return Err((-32602, "panic reason exceeds 256 bytes".into(), None));
     }
-    let _serial = state.panic_gate.lock().await;
-    let (pending, active, preflights) = {
-        let _spawn = state.spawn_gate.lock().await;
-        state.panic_latched.store(true, Ordering::SeqCst);
-        let preflights = std::mem::take(&mut *state.preflight_runs.lock().await);
-        for control in preflights.values() {
-            control.cancel.send_replace(true);
-        }
-        let pending = std::mem::take(&mut *state.pending_runs.lock().await);
-        for control in pending.values() {
-            control.cancel.send_replace(true);
-        }
-        let active = state
-            .active_runs
-            .lock()
-            .await
-            .iter()
-            .map(|(id, control)| {
-                (
-                    id.clone(),
-                    control.egress_handle.clone(),
-                    control.cancel_tx.clone(),
-                    control.done_notify.clone().notified_owned(),
-                )
-            })
-            .collect::<Vec<_>>();
-        (pending, active, preflights)
-    };
+    let _serial = tokio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        state.panic_gate.lock(),
+    )
+    .await
+    .map_err(|_| (-32000, "panic serialization deadline exceeded".into(), None))?;
+    let (pending, active, preflights) =
+        tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
+            let _spawn = state.spawn_gate.lock().await;
+            let mut preflight_registry = state.preflight_runs.lock().await;
+            let mut pending_registry = state.pending_runs.lock().await;
+            let active_registry = state.active_runs.lock().await;
+            state.panic_latched.store(true, Ordering::SeqCst);
+            let preflights = std::mem::take(&mut *preflight_registry);
+            for control in preflights.values() {
+                control.cancel.send_replace(true);
+            }
+            let pending = std::mem::take(&mut *pending_registry);
+            for control in pending.values() {
+                control.cancel.send_replace(true);
+            }
+            let active = active_registry
+                .iter()
+                .map(|(id, control)| {
+                    (
+                        id.clone(),
+                        control.egress_handle.clone(),
+                        control.cancel_tx.clone(),
+                        control.terminal.subscribe(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (pending, active, preflights)
+        })
+        .await
+        .map_err(|_| (-32000, "panic snapshot deadline exceeded".into(), None))?;
     // PR 1.1b acquires opener_gate here, after releasing spawn_gate.
     let persisted_reason = reason.map(|reason| {
         let redacted = crate::redact::SecretRedactor::default().redact(&reason);
@@ -80,27 +90,32 @@ pub(crate) async fn panic(
             atomium_core::EncryptedVault::digest_hex(redacted.as_bytes())
         )
     });
-    let remaining = Duration::from_secs(5)
-        .saturating_sub(started.elapsed())
-        .saturating_sub(Duration::from_millis(20));
-    let latch_persisted = if state.panic_persisted.load(Ordering::SeqCst) {
-        true
-    } else if remaining.is_zero() {
-        false
-    } else {
-        let store = state.runs.clone();
-        let timeout = remaining.min(Duration::from_millis(400));
-        let result = matches!(
-            tokio::task::spawn_blocking(move || store.persist_panic_with_timeout(
-                true,
-                persisted_reason.as_deref(),
-                timeout
-            ))
-            .await,
-            Ok(Ok(()))
-        );
-        state.panic_persisted.store(result, Ordering::SeqCst);
-        result
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let persist = async {
+        if state.panic_persisted.load(Ordering::SeqCst) {
+            true
+        } else if remaining.is_zero() {
+            false
+        } else {
+            let store = state.runs.clone();
+            let timeout = remaining.min(Duration::from_millis(400));
+            let result = matches!(
+                tokio::time::timeout(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(400)),
+                    tokio::task::spawn_blocking(move || store.persist_panic_with_timeout(
+                        true,
+                        persisted_reason.as_deref(),
+                        timeout
+                    ))
+                )
+                .await,
+                Ok(Ok(Ok(())))
+            );
+            state.panic_persisted.store(result, Ordering::SeqCst);
+            result
+        }
     };
     let mut revocations = tokio::task::JoinSet::new();
     for (id, slot, _, _) in &active {
@@ -114,10 +129,19 @@ pub(crate) async fn panic(
             }
         });
     }
-    let mut revoke_failed = std::collections::HashSet::new();
-    while let Some(result) = revocations.join_next().await {
-        if let Ok((id, false)) = result {
-            revoke_failed.insert(id);
+    let latch_persisted = persist.await;
+    let mut revoke_failed = active
+        .iter()
+        .map(|(id, _, _, _)| id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    while let Ok(Some(result)) = tokio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        revocations.join_next(),
+    )
+    .await
+    {
+        if let Ok((id, true)) = result {
+            revoke_failed.remove(&id);
         }
     }
     let mut preflight_waits = tokio::task::JoinSet::new();
@@ -133,82 +157,71 @@ pub(crate) async fn panic(
     }
     let mut waits = tokio::task::JoinSet::new();
     let mut stopped_runs = Vec::new();
-    for (id, _, cancel, done) in active {
-        stopped_runs.push(id.clone());
+    let active_ids = active
+        .iter()
+        .map(|(id, _, _, _)| id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for (id, _, cancel, mut terminal) in active {
         cancel.send_replace(Some("daemon_panic".into()));
         waits.spawn(async move {
-            let finished = tokio::time::timeout(Duration::from_millis(3500), done)
+            let finished =
+                tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
+                    while terminal.borrow().is_none() {
+                        if terminal.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
                 .await
                 .is_ok();
-            (id, finished)
+            let record = terminal.borrow().clone();
+            (id, finished, record)
         });
     }
     for (id, control) in pending {
-        stopped_runs.push(id.clone());
         waits.spawn(async move {
             let mut done = control.done.subscribe();
-            let finished = tokio::time::timeout(Duration::from_millis(3500), async {
-                while !*done.borrow_and_update() {
-                    if done.changed().await.is_err() {
-                        break;
+            let finished =
+                tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
+                    while !*done.borrow_and_update() {
+                        if done.changed().await.is_err() {
+                            break;
+                        }
                     }
-                }
-            })
-            .await
-            .is_ok();
-            (id, finished)
+                })
+                .await
+                .is_ok();
+            let terminal = control.terminal.borrow().clone();
+            (id, finished, terminal)
         });
     }
-    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+    let _ = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
         while preflight_waits.join_next().await.is_some() {}
     })
     .await;
     let mut cleanup_unverified = Vec::new();
     while let Some(result) = waits.join_next().await {
-        match result {
-            Ok((id, false)) => cleanup_unverified.push(id),
-            Ok((id, true)) => {
-                if revoke_failed.contains(&id)
-                    || state
-                        .panic_cleanup
-                        .lock()
-                        .expect("panic cleanup memory poisoned")
-                        .contains_key(&id)
-                    || state
-                        .runs
-                        .get(&id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|r| r.status == TaskStatus::CleanupUnverified)
+        let (id, finished, terminal) = result.map_err(|e| (-32000, e.to_string(), None))?;
+        if let Some(record) = terminal {
+            if matches!(
+                record.status,
+                TaskStatus::Stopped | TaskStatus::CleanupUnverified
+            ) && record.reason.as_deref() == Some("daemon_panic")
+            {
+                stopped_runs.push(id.clone());
+                if !finished
+                    || revoke_failed.contains(&id)
+                    || record.status == TaskStatus::CleanupUnverified
                 {
                     cleanup_unverified.push(id);
                 }
             }
-            Err(error) => return Err((-32000, error.to_string(), None)),
+        } else if active_ids.contains(&id) {
+            cleanup_unverified.push(id);
         }
     }
     stopped_runs.sort();
     stopped_runs.dedup();
-    for id in &cleanup_unverified {
-        if !state
-            .panic_cleanup
-            .lock()
-            .expect("panic cleanup memory poisoned")
-            .contains_key(id)
-        {
-            if let Ok(Some(mut record)) = state.runs.get(id) {
-                record.status = TaskStatus::CleanupUnverified;
-                record.cleanup_verified = false;
-                record.reason = Some("daemon_panic".into());
-                record.updated_at_ms = crate::state::now_ms();
-                state
-                    .panic_cleanup
-                    .lock()
-                    .expect("panic cleanup memory poisoned")
-                    .insert(id.clone(), (record, false));
-            }
-        }
-    }
     cleanup_unverified.sort();
     cleanup_unverified.dedup();
     retry_cleanup(state);
@@ -307,6 +320,64 @@ mod tests {
         )
         .unwrap();
         crate::session_engine::handle_runs_start(state, request).await
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn invalid_program_path_is_invalid_params_before_preparation() {
+        let (root, dev) = setup();
+        let state = Arc::new(
+            Arc::try_unwrap(dev)
+                .ok()
+                .unwrap()
+                .with_unsandboxed_dev_mode(false),
+        );
+        *state.probe_outcome_injector.lock().unwrap() =
+            Some(crate::state::ProbeOutcomeInjector::default());
+        let req = serde_json::from_value(
+            serde_json::json!({"profile_id":"test","program":"/atomium-invalid-program"}),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::session_engine::handle_runs_start(&state, req)
+                .await
+                .unwrap_err()
+                .0,
+            -32602
+        );
+        assert_zero_run_effects(&state);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn formal_spawn_failure_rolls_back_with_one_blocked_event() {
+        let (root, state) = setup();
+        let request: RunStartRequest = serde_json::from_value(serde_json::json!({"profile_id":"test","program":"/atomium-nonexistent-r2-program","args":[]})).unwrap();
+        let error = crate::session_engine::handle_runs_start(&state, request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, -32000);
+        let records = state.runs.list().unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.status, TaskStatus::Blocked);
+        assert!(record
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("spawn_failed:"));
+        let events = state.leases.query_events_after(0).unwrap();
+        assert_eq!(events.iter().filter(|e| e.run_id == record.run_id && matches!(&e.payload, TaskEventPayload::StatusChanged {status: TaskStatus::Blocked, reason} if reason == &record.reason)).count(), 1);
+        assert!(state.leases.list_active_leases().unwrap().is_empty());
+        assert!(!state.runs_dir.join(&record.run_id).exists());
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", record.proxy_port.unwrap()))
+                .await
+                .is_err()
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -416,6 +487,37 @@ mod tests {
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn injected_sqlite_lock_delay_does_not_block_panic_response() {
+        let (root, state) = setup();
+        let run = start(&state, "sleep 60").await.unwrap();
+        let db =
+            atomium_core::sqlite_security::SecureSqliteConnection::open(root.join("state.sqlite"))
+                .unwrap();
+        db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), panic(&state, None))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.elapsed_ms < 5000);
+        assert_eq!(response.cleanup_unverified, vec![run.run_id.clone()]);
+        assert_eq!(
+            crate::rpc::sessions::handle_runs_get(&state, &run.run_id)
+                .unwrap()
+                .status,
+            TaskStatus::CleanupUnverified
+        );
+        db.execute_batch("ROLLBACK").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.panic_cleanup.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(db);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn assert_zero_run_effects(state: &DaemonState) {
         assert!(state.runs.list().unwrap().is_empty());
         assert!(state.leases.list_active_leases().unwrap().is_empty());

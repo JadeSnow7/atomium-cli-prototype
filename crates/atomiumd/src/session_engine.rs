@@ -140,6 +140,24 @@ async fn cleanup_panic_directory(
     )
 }
 
+struct StartRegistration {
+    state: Arc<DaemonState>,
+    run_id: String,
+    done: watch::Sender<bool>,
+}
+impl Drop for StartRegistration {
+    fn drop(&mut self) {
+        let state = self.state.clone();
+        let id = self.run_id.clone();
+        let done = self.done.clone();
+        tokio::spawn(async move {
+            state.preflight_runs.lock().await.remove(&id);
+            state.pending_runs.lock().await.remove(&id);
+            done.send_replace(true);
+        });
+    }
+}
+
 pub(crate) async fn handle_runs_start(
     state: &Arc<DaemonState>,
     req: RunStartRequest,
@@ -148,9 +166,16 @@ pub(crate) async fn handle_runs_start(
     let run_id = format!("run-{}", uuid::Uuid::now_v7());
     let (cancel, _) = watch::channel(false);
     let (done, _) = watch::channel(false);
+    let (terminal, _) = watch::channel(None);
+    let _registration = StartRegistration {
+        state: state.clone(),
+        run_id: run_id.clone(),
+        done: done.clone(),
+    };
     let control = crate::state::PendingRunControl {
         cancel: cancel.clone(),
         done: done.clone(),
+        terminal: terminal.clone(),
     };
     let result = start_after_probes(state, req, &run_id, control).await;
     state.preflight_runs.lock().await.remove(&run_id);
@@ -262,6 +287,10 @@ async fn start_after_probes(
             timezone: profile.locale_policy.timezone.clone(),
             lang: profile.locale_policy.lang.clone(),
         };
+        if std::path::Path::new(&req.program).is_absolute() {
+            std::fs::canonicalize(&req.program)
+                .map_err(|_| (-32602, "program path cannot be canonicalized".into()))?;
+        }
         let policy = atomium_runtime::probes::render_policy_for_spec(&spec)
             .map_err(|_| (-32003, "isolation_policy_unloadable".into()))?;
         #[cfg(test)]
@@ -332,7 +361,7 @@ async fn start_after_probes(
             .pending_runs
             .lock()
             .await
-            .insert(run_id.clone(), control);
+            .insert(run_id.clone(), control.clone());
     }
 
     // 1. Atomically acquire multi-resource leases (Profile OAuth Exclusive / credential Shared).
@@ -374,6 +403,10 @@ async fn start_after_probes(
             .map_err(|e| (-32009, e.to_string()))?;
     }
 
+    if *pending_cancel.borrow() {
+        let _ = state.leases.release_all(&run_id);
+        return Err((-32002, "daemon panic latched".into()));
+    }
     // From here on, any early failure MUST release leases and clean up run_dir.
     let run_dir = state.runs_dir.join(&run_id);
 
@@ -390,6 +423,7 @@ async fn start_after_probes(
         )?;
         let run_home = &run_env.run_home_dir;
 
+        if *pending_cancel.borrow() { anyhow::bail!("daemon panic latched"); }
         // 2. Project OAuth credentials into isolated $HOME (0600 decoded JSON) or HostKeychainSlot.
         let (projection, initial_ver, secret_redactor) = match &profile.credential {
             CredentialSpec::OauthSnapshot {
@@ -481,6 +515,11 @@ async fn start_after_probes(
         }
     };
 
+    if *pending_cancel.borrow() {
+        let _ = runtime_backend.cleanup_run_env(&run_dir);
+        let _ = state.leases.release_all(&run_id);
+        return Err((-32002, "daemon panic latched".into()));
+    }
     // 3. Start per-run Fail-Closed Egress Proxy.
     let ephemeral_token = random_ephemeral_token();
     secret_redactor.add_secret_bytes(ephemeral_token.as_bytes());
@@ -615,20 +654,22 @@ async fn start_after_probes(
         };
         record.reason = Some("daemon_panic".into());
         record.updated_at_ms = now_ms();
-        crate::panic_control::finish_record(state, &record, false).await;
+        let terminal = crate::panic_control::finish_record(state, &record, false).await;
+        control.terminal.send_replace(Some(terminal));
         return Err((-32002, "panic_latched".into()));
     }
     state.pending_runs.lock().await.remove(&run_id);
     let (cancel_tx, mut cancel_rx) = watch::channel::<Option<String>>(None);
     let egress_slot = Arc::new(Mutex::new(Some(proxy_handle)));
     let done_notify = Arc::new(Notify::new());
+    let (active_terminal, _) = watch::channel(None);
 
     let mut spawned = match runtime_backend.spawn(prepared_cmd) {
         Ok(s) => s,
         Err(e) => {
             drop(spawn_guard);
             if let Some(proxy) = egress_slot.lock().await.take() {
-                drop(proxy.revoke());
+                let _ = proxy.revoke().await;
             }
             done_notify.notify_waiters();
             let _ = runtime_backend.cleanup_run_env(&run_dir);
@@ -656,6 +697,7 @@ async fn start_after_probes(
                 cancel_tx,
                 egress_handle: egress_slot.clone(),
                 done_notify: done_notify.clone(),
+                terminal: active_terminal.clone(),
                 workspace_dir: canon_ws,
             },
         );
@@ -1031,7 +1073,9 @@ async fn start_after_probes(
             };
             sup_record.reason = Some("daemon_panic".into());
             sup_record.updated_at_ms = now_ms();
-            crate::panic_control::finish_record(&sup_state, &sup_record, log_truncated).await;
+            let terminal =
+                crate::panic_control::finish_record(&sup_state, &sup_record, log_truncated).await;
+            active_terminal.send_replace(Some(terminal));
             sup_state.active_runs.lock().await.remove(&sup_run_id);
             done_notify.notify_waiters();
             return;
@@ -1069,6 +1113,7 @@ async fn start_after_probes(
             },
         );
 
+        active_terminal.send_replace(Some(sup_record));
         sup_state.active_runs.lock().await.remove(&sup_run_id);
         done_notify.notify_waiters();
     });
@@ -1166,5 +1211,57 @@ pub(crate) async fn invalidate_run_candidates_and_approvals(state: &DaemonState,
                 },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn panicking_start_removes_both_registrations_and_signals_done() {
+        let root =
+            std::env::temp_dir().join(format!("atomium-registration-{}", uuid::Uuid::now_v7()));
+        let state = Arc::new(DaemonState::open(&root.join("state.sqlite")).unwrap());
+        let (cancel, _) = watch::channel(false);
+        let (done, mut receiver) = watch::channel(false);
+        let (terminal, _) = watch::channel(None);
+        let control = crate::state::PendingRunControl {
+            cancel,
+            done: done.clone(),
+            terminal,
+        };
+        state
+            .preflight_runs
+            .lock()
+            .await
+            .insert("fixture".into(), control.clone());
+        state
+            .pending_runs
+            .lock()
+            .await
+            .insert("fixture".into(), control);
+        let guard = StartRegistration {
+            state: state.clone(),
+            run_id: "fixture".into(),
+            done,
+        };
+        assert!(tokio::spawn(async move {
+            let _guard = guard;
+            panic!("injected start task panic");
+        })
+        .await
+        .is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*receiver.borrow_and_update() {
+                receiver.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.preflight_runs.lock().await.is_empty());
+        assert!(state.pending_runs.lock().await.is_empty());
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

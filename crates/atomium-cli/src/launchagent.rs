@@ -58,8 +58,11 @@ pub(crate) fn render(program: &Path, env: &BTreeMap<String, String>, log: &Path)
         {
             bail!("{key} must be an absolute path");
         }
-        if key == "ATOMIUM_SOCKET" && value.len() > 103 {
-            bail!("socket path exceeds 103 bytes");
+        if key == "RUST_LOG" && !["error", "warn", "info"].contains(&value.as_str()) {
+            bail!("RUST_LOG must be error, warn or info");
+        }
+        if key == "ATOMIUM_SOCKET" {
+            atomium_runtime::probes::validate_control_socket_path(Path::new(value))?;
         }
     }
     let environment = env
@@ -119,6 +122,13 @@ fn quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
+fn inherited_environment(read: impl Fn(&str) -> Option<String>) -> BTreeMap<String, String> {
+    ALLOWED
+        .into_iter()
+        .filter_map(|key| read(key).map(|value| (key.to_owned(), value)))
+        .collect()
+}
+
 pub fn run(action: LaunchAgentAction) -> Result<()> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is required")?);
     let plist = home.join("Library/LaunchAgents/io.atomium.daemon.plist");
@@ -171,21 +181,35 @@ pub fn run(action: LaunchAgentAction) -> Result<()> {
         ("ATOMIUM_USE_MACOS_KEYCHAIN".into(), "true".into()),
         ("RUST_LOG".into(), "info".into()),
     ]);
-    for key in ALLOWED {
-        if let Ok(value) = std::env::var(key) {
-            env.insert(key.into(), value);
-        }
-    }
+    let inherited = inherited_environment(|key| std::env::var(key).ok());
+    eprintln!(
+        "Inherited environment keys: {}",
+        inherited
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    env.extend(inherited);
     let document = render(&program, &env, &logs.join("atomiumd.log"))?;
     match action {
         LaunchAgentAction::Print => print!("{document}"),
         LaunchAgentAction::Install { write: true } => {
-            for dir in [&support, &logs, plist.parent().expect("plist parent")] {
+            for dir in [&support, &logs] {
                 fs::DirBuilder::new()
                     .recursive(true)
                     .mode(0o700)
                     .create(dir)?;
                 fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+            }
+            let agents = plist.parent().expect("plist parent");
+            match fs::create_dir(agents) {
+                Ok(()) => fs::set_permissions(agents, fs::Permissions::from_mode(0o755))?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            if fs::metadata(agents)?.permissions().mode() & 0o022 != 0 {
+                eprintln!("Warning: LaunchAgents is writable by group or others");
             }
             let temporary = plist.with_extension(format!("{}.tmp", uuid::Uuid::now_v7()));
             fs::write(&temporary, document)?;
@@ -211,6 +235,8 @@ mod tests {
                 key.to_owned(),
                 if key == "ATOMIUM_USE_MACOS_KEYCHAIN" {
                     "true"
+                } else if key == "RUST_LOG" {
+                    "info"
                 } else {
                     "/tmp/value"
                 }
@@ -310,6 +336,50 @@ mod tests {
             assert!(!plist.contains(key));
         }
     }
+    #[test]
+    fn inherited_keys_include_only_present_allowlisted_names() {
+        let caller = BTreeMap::from([
+            ("RUST_LOG", "warn"),
+            ("OPENAI_API_KEY", "fixture"),
+            ("PATH", "/usr/bin"),
+            ("ATOMIUM_DB", "/tmp/db.sqlite"),
+        ]);
+        assert_eq!(
+            inherited_environment(|key| caller.get(key).map(|value| (*value).to_owned())),
+            BTreeMap::from([
+                ("ATOMIUM_DB".into(), "/tmp/db.sqlite".into()),
+                ("RUST_LOG".into(), "warn".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn log_filters_and_all_socket_forms_are_bounded() {
+        let program = Path::new("/opt/atomium/atomiumd");
+        let log = Path::new("/tmp/atomiumd.log");
+        for filter in ["debug", "trace", "info,hyper=trace", "warn,debug"] {
+            assert!(render(
+                program,
+                &BTreeMap::from([("RUST_LOG".into(), filter.into())]),
+                log
+            )
+            .is_err());
+        }
+        for length in 96..=103 {
+            let socket = format!("/tmp/{}", "x".repeat(length - 5));
+            let result = render(
+                program,
+                &BTreeMap::from([("ATOMIUM_SOCKET".into(), socket)]),
+                log,
+            );
+            if cfg!(target_os = "macos") && length > 95 {
+                assert!(result.is_err());
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn plist_lints_and_contains_only_expected_fields() {
@@ -320,6 +390,8 @@ mod tests {
                     key.to_owned(),
                     if key == "ATOMIUM_USE_MACOS_KEYCHAIN" {
                         "true"
+                    } else if key == "RUST_LOG" {
+                        "info"
                     } else {
                         "/tmp/value"
                     }

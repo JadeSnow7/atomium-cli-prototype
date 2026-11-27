@@ -118,6 +118,7 @@ flowchart TB
 1. **锁定系统版本与启动前强探针（Fail-Closed）**
    - Apple 将 `sandbox-exec` 与自定义 SBPL 视为已弃用的内部实现细节，行为可能随 macOS 大版本变化。
    - L1 运行时在能力报告中记录 `os_version`、`os_build` 和 `sbpl_template_digest`。守护进程按 OS build、模板摘要和后端版本缓存探针，缓存有效期为 24 小时。生产运行启动前须确认七项必选探针通过，并验证本次渲染的策略可以装载。任一必选探针或装载预检未通过时，守护进程在申请租约、创建运行目录和写入运行记录前返回 `-32003`。
+   - `direct_egress_denied` 在宿主与 Box 内用同一解释器和脚本尝试连接 RFC 5737 TEST-NET-1 地址 `192.0.2.1:80`。Box 返回 `EPERM` 或 `EACCES`，且宿主能够连接或仅遇到常规网络错误时，判定为通过。宿主也遭策略拒绝或无法归因时，探针失败。
 2. **`RuntimeBackend` 生命周期接口实心化**
    - P1.0 后，[`RuntimeBackend`](../crates/atomium-runtime/src/backend.rs) 负责环境准备、运行命令构造、管道进程启动、进程组终止与运行目录清理。`atomiumd` 负责协调凭据、工作区租约、出网、状态持久化和事件。
    - PR 1.1a 将本次策略的装载预检与正式启动分开。后端在私有临时夹具中验证策略，守护进程在预检后协调熔断锁存、待启动登记和正式进程启动。

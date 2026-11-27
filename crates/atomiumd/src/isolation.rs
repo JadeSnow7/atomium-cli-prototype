@@ -74,7 +74,14 @@ fn launch_mode() -> LaunchMode {
 
 async fn key(state: &DaemonState) -> anyhow::Result<CacheKey> {
     let os_build = if cfg!(target_os = "macos") {
-        atomium_runtime::probes::os_build().await?
+        static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        match BUILD.get() {
+            Some(build) => build.clone(),
+            None => {
+                let build = atomium_runtime::probes::os_build().await?;
+                BUILD.get_or_init(|| build).clone()
+            }
+        }
     } else {
         std::env::consts::OS.into()
     };
@@ -482,14 +489,18 @@ async fn matrix_with_mode(state: &DaemonState, mode: LaunchMode) -> Result<Priva
     ];
     let items = definitions.into_iter().map(|(id, probe)| {
         let evidence = cache.as_ref().and_then(|cache| cache.evidence.iter().find(|evidence| Some(evidence.probe_id.as_str()) == probe));
-        let status = if id == "tcc" && !matches!(mode, LaunchMode::LaunchAgent) {
+        let status = if matches!(id, "host_username" | "computer_name_scutil") || (id == "tcc" && !matches!(mode, LaunchMode::LaunchAgent)) {
             PrivacyStatus::HostVisible
+        } else if id == "timezone_lang" {
+            PrivacyStatus::DefaultOnly
         } else if valid && evidence.is_some_and(|evidence| evidence.passed) {
             PrivacyStatus::Enforced
         } else {
             PrivacyStatus::Unverified
         };
-        let note = if id == "tcc" {
+        let note = if id == "timezone_lang" {
+            "仅环境变量级，按 Profile 设置，默认跟随本机"
+        } else if id == "tcc" {
             "LaunchAgent classification alone does not establish TCC isolation; E5 evidence is required."
         } else {
             "Status follows current mandatory evidence and cache identity."
@@ -684,6 +695,15 @@ mod tests {
         let matrix = matrix_with_mode(&state, LaunchMode::LaunchAgent)
             .await
             .unwrap();
+        for (id, expected) in [
+            ("host_username", "host_visible"),
+            ("computer_name_scutil", "host_visible"),
+            ("timezone_lang", "default_only"),
+        ] {
+            let item = matrix.items.iter().find(|item| item.item_id == id).unwrap();
+            assert_eq!(serde_json::to_value(&item.status).unwrap(), expected);
+            assert!(!matches!(item.status, PrivacyStatus::Enforced));
+        }
         assert!(matches!(
             matrix
                 .items

@@ -38,6 +38,7 @@ pub(crate) struct ActiveRunControl {
     pub(crate) cancel_tx: watch::Sender<Option<String>>,
     pub(crate) egress_handle: Arc<Mutex<Option<EgressProxyHandle>>>,
     pub(crate) done_notify: Arc<Notify>,
+    pub(crate) terminal: watch::Sender<Option<atomium_protocol::RunRecord>>,
     pub(crate) workspace_dir: PathBuf,
 }
 
@@ -45,6 +46,7 @@ pub(crate) struct ActiveRunControl {
 pub(crate) struct PendingRunControl {
     pub(crate) cancel: watch::Sender<bool>,
     pub(crate) done: watch::Sender<bool>,
+    pub(crate) terminal: watch::Sender<Option<atomium_protocol::RunRecord>>,
 }
 
 #[cfg(test)]
@@ -413,6 +415,7 @@ pub async fn run_daemon() -> Result<()> {
         .init();
 
     let sock_path = default_socket_path();
+    atomium_runtime::probes::validate_control_socket_path(&sock_path)?;
     let db_path = default_db_path();
     let _instance_locks = crate::instance_lock::InstanceLocks::acquire(&db_path, &sock_path)?;
 

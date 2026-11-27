@@ -240,7 +240,7 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
     }
     const privacy = await client.privacyMatrix();
     assert.equal(privacy.items.length, 11);
-    assert.equal(privacy.items.find(item => item.item_id === "tcc").status, "HostVisible");
+    assert.equal(privacy.items.find(item => item.item_id === "tcc").status, "host_visible");
     await assert.rejects(client.privacyProbe({ probe_ids: ["unknown"] }), error => error.code === -32602);
     const probes = await client.privacyProbe({ probe_ids: null });
     assert.equal(probes.all_mandatory_passed, process.platform === "darwin");

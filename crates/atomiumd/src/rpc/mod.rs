@@ -93,7 +93,7 @@ pub async fn dispatch(
     match req.method.as_str() {
         "daemon.panic" => {
             let result = match serde_json::from_value::<atomium_protocol::DaemonPanicRequest>(
-                req.params.clone(),
+                object_params(&req.params),
             ) {
                 Ok(request) => crate::panic_control::panic(state, request.reason)
                     .await
@@ -131,7 +131,7 @@ pub async fn dispatch(
                     serde_json::to_value(r).map_err(|e| (-32000, e.to_string(), None))
                 }),
                 _ => match serde_json::from_value::<atomium_protocol::PrivacyProbeRequest>(
-                    req.params.clone(),
+                    object_params(&req.params),
                 ) {
                     Ok(request) => crate::isolation::refresh(state, request.probe_ids)
                         .await
@@ -437,5 +437,41 @@ pub async fn dispatch(
             rpc_err(id, -32601, format!("method not found: {other}")),
             vec![],
         ),
+    }
+}
+
+fn object_params(value: &serde_json::Value) -> serde_json::Value {
+    if value.is_null() {
+        serde_json::json!({})
+    } else {
+        value.clone()
+    }
+}
+
+#[cfg(test)]
+mod strict_optional_params_tests {
+    use super::*;
+    #[test]
+    fn null_is_empty_and_unknown_fields_are_rejected() {
+        for value in [serde_json::Value::Null, serde_json::json!({})] {
+            assert!(
+                serde_json::from_value::<atomium_protocol::DaemonPanicRequest>(object_params(
+                    &value
+                ))
+                .is_ok()
+            );
+            assert!(
+                serde_json::from_value::<atomium_protocol::PrivacyProbeRequest>(object_params(
+                    &value
+                ))
+                .is_ok()
+            );
+        }
+        let unknown = object_params(&serde_json::json!({"unknown":true}));
+        assert!(
+            serde_json::from_value::<atomium_protocol::DaemonPanicRequest>(unknown.clone())
+                .is_err()
+        );
+        assert!(serde_json::from_value::<atomium_protocol::PrivacyProbeRequest>(unknown).is_err());
     }
 }

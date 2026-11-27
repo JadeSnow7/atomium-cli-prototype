@@ -202,9 +202,24 @@ pub async fn preflight_policy(policy: &str) -> Result<Duration> {
     PolicyPreflight::spawn(policy)?.wait().await
 }
 
+pub fn validate_control_socket_path(path: &Path) -> Result<()> {
+    let canonical = canonicalize_planned_path(path)?;
+    let paths = socket_path_forms(path, canonical);
+    for (form, path) in paths {
+        if path.as_os_str().len() > 103 {
+            bail!("{form} socket path exceeds 103 bytes");
+        }
+    }
+    Ok(())
+}
+
 /// Every path form gets its own positive host control and sandbox connect.
 pub fn control_socket_paths(configured: &Path) -> Result<Vec<(String, PathBuf)>> {
     let canonical = fs::canonicalize(configured)?;
+    Ok(socket_path_forms(configured, canonical))
+}
+
+fn socket_path_forms(configured: &Path, canonical: PathBuf) -> Vec<(String, PathBuf)> {
     let mut paths = vec![
         ("configured".into(), configured.to_path_buf()),
         ("canonical".into(), canonical.clone()),
@@ -216,7 +231,7 @@ pub fn control_socket_paths(configured: &Path) -> Result<Vec<(String, PathBuf)>>
             }
         }
     }
-    Ok(paths)
+    paths
 }
 
 async fn boxed(cfg: &SeatbeltConfig, program: &str, args: &[&str]) -> Result<Output> {
@@ -239,6 +254,78 @@ fn evidence(id: &str, passed: bool, actual: String) -> ProbeEvidence {
         mandatory: Some(true),
         evidence_at_ms: Some(now_ms()),
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HostResult {
+    Connected,
+    NetError(i32),
+    PolicyDenied(i32),
+}
+
+fn connect_errno(output: &str) -> Option<i32> {
+    match output.trim() {
+        "connected" => Some(0),
+        value => value
+            .strip_prefix("errno=")?
+            .parse::<i32>()
+            .ok()
+            .filter(|errno| *errno > 0),
+    }
+}
+
+fn host_result(errno: Option<i32>) -> HostResult {
+    match errno {
+        Some(0) => HostResult::Connected,
+        Some(errno)
+            if matches!(
+                errno,
+                libc::ENETUNREACH
+                    | libc::EHOSTUNREACH
+                    | libc::ETIMEDOUT
+                    | libc::ECONNREFUSED
+                    | libc::ENETDOWN
+            ) =>
+        {
+            HostResult::NetError(errno)
+        }
+        _ => HostResult::PolicyDenied(errno.unwrap_or(-1)),
+    }
+}
+
+fn egress_passed(host: &HostResult, box_errno: i32) -> bool {
+    matches!(host, HostResult::Connected | HostResult::NetError(_))
+        && matches!(box_errno, libc::EPERM | libc::EACCES)
+}
+
+fn pasteboard_passed(host: i32, lookup: i32, empty: bool) -> bool {
+    matches!(host, 0 | 1102) && lookup == 1100 && empty
+}
+
+#[cfg(target_os = "macos")]
+fn host_pasteboard_lookup() -> i32 {
+    unsafe extern "C" {
+        static bootstrap_port: u32;
+        fn bootstrap_look_up(port: u32, name: *const std::ffi::c_char, service: *mut u32) -> i32;
+        fn mach_port_deallocate(task: u32, name: u32) -> i32;
+        static mach_task_self_: u32;
+    }
+    let mut service = 0;
+    unsafe {
+        let result = bootstrap_look_up(
+            bootstrap_port,
+            c"com.apple.pasteboard.1".as_ptr(),
+            &mut service,
+        );
+        if result == 0 {
+            mach_port_deallocate(mach_task_self_, service);
+        }
+        result
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn host_pasteboard_lookup() -> i32 {
+    -1
 }
 
 async fn connect_denied(
@@ -351,19 +438,38 @@ else:
         ));
     }
     if selected.is_none_or(|ids| ids.iter().any(|id| id == MANDATORY_PROBE_IDS[2])) {
-        let runnable = true;
-        let host_egress =
-            tokio::time::timeout(Duration::from_secs(2), TcpStream::connect("1.1.1.1:80")).await;
-        let host_ok = matches!(host_egress, Ok(Ok(_)));
-        let (denied, actual) = connect_denied(&cfg, py, "('1.1.1.1',80)", false).await?;
+        let script = "import socket,errno\ns=socket.socket()\ns.settimeout(0.5)\ntry:\n s.connect(('192.0.2.1',80))\n print('connected')\nexcept TimeoutError:\n print('errno='+str(errno.ETIMEDOUT))\nexcept OSError as e:\n print('errno='+str(e.errno))";
+        let host = Command::new(py)
+            .args(["-c", script])
+            .env_clear()
+            .output()
+            .await;
+        let host_text = host
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok());
+        let host = host_result(host_text.as_deref().and_then(connect_errno));
+        let output = boxed(&cfg, py, &["-c", script]).await?;
+        let box_errno = if output.status.success() {
+            std::str::from_utf8(&output.stdout)
+                .ok()
+                .and_then(connect_errno)
+        } else {
+            None
+        }
+        .unwrap_or(-1);
+        let host_label = match &host {
+            HostResult::Connected => "connected".into(),
+            HostResult::NetError(n) => format!("net_error(errno={n})"),
+            HostResult::PolicyDenied(n) => format!("policy_denied(errno={n})"),
+        };
         items.push(evidence(
             MANDATORY_PROBE_IDS[2],
-            runnable && host_ok && denied,
-            format!("host_connected={host_ok} {actual}"),
+            egress_passed(&host, box_errno),
+            format!("host_result={host_label} box errno={box_errno}"),
         ));
     }
     if selected.is_none_or(|ids| ids.iter().any(|id| id == MANDATORY_PROBE_IDS[3])) {
-        let runnable = true;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let positive = TcpStream::connect(("127.0.0.1", port)).await.is_ok();
@@ -371,19 +477,22 @@ else:
             connect_denied(&cfg, py, &format!("('127.0.0.1',{port})"), false).await?;
         items.push(evidence(
             MANDATORY_PROBE_IDS[3],
-            runnable && positive && denied,
+            positive && denied,
             format!("host_connected={positive} {actual}"),
         ));
     }
     if selected.is_none_or(|ids| ids.iter().any(|id| id == MANDATORY_PROBE_IDS[4])) {
-        let runnable = true;
         let canary_path = base.join("c.sock");
         let canary = UnixListener::bind(&canary_path)?;
         let targets = match control_socket {
-            Some(path) => control_socket_paths(path)?,
+            Some(path) => {
+                let mut paths = control_socket_paths(path)?;
+                paths.push(("canary".into(), canary_path));
+                paths
+            }
             None => vec![("canary".into(), canary_path)],
         };
-        let mut passed = runnable;
+        let mut passed = true;
         let mut records = Vec::new();
         for (form, path) in targets {
             let host_connected = UnixStream::connect(&path).await.is_ok();
@@ -411,14 +520,12 @@ else:
         ));
     }
     if selected.is_none_or(|ids| ids.iter().any(|id| id == MANDATORY_PROBE_IDS[5])) {
-        let runnable = true;
         // Raw ioreg output stays inside the child and is never put into evidence.
         // ctypes checks obsolete Darwin 7 behavior via uname at import. The
         // temporary major only selects modern dlopen flags and is never evidence.
         let script = "import os\nu=os.uname\nos.uname=lambda: type('KernelVersion',(),{'release':'8.0'})()\nimport ctypes as c,subprocess\nos.uname=u\np=subprocess.run(['/usr/sbin/ioreg','-rd1','-c','IOPlatformExpertDevice'],capture_output=True)\ni=c.CDLL('/System/Library/Frameworks/IOKit.framework/IOKit')\nf=c.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')\ni.IOServiceMatching.argtypes=[c.c_char_p]\ni.IOServiceMatching.restype=c.c_void_p\ni.IOServiceGetMatchingService.argtypes=[c.c_uint,c.c_void_p]\ni.IOServiceGetMatchingService.restype=c.c_uint\ni.IORegistryEntryCreateCFProperty.argtypes=[c.c_uint,c.c_void_p,c.c_void_p,c.c_uint]\ni.IORegistryEntryCreateCFProperty.restype=c.c_void_p\nf.CFStringCreateWithCString.argtypes=[c.c_void_p,c.c_char_p,c.c_uint]\nf.CFStringCreateWithCString.restype=c.c_void_p\nf.CFRelease.argtypes=[c.c_void_p]\ns=i.IOServiceGetMatchingService(0,i.IOServiceMatching(b'IOPlatformExpertDevice'))\nhidden=bool(s)\nfor name in [b'IOPlatformSerialNumber',b'IOPlatformUUID']:\n key=f.CFStringCreateWithCString(None,name,0x08000100)\n value=i.IORegistryEntryCreateCFProperty(s,key,None,0)\n hidden=hidden and not bool(value)\n if value: f.CFRelease(value)\n f.CFRelease(key)\ni.IOObjectRelease(s)\nprint('identity_hidden='+str(hidden and p.returncode==0 and b'IOPlatformSerialNumber' not in p.stdout and b'IOPlatformUUID' not in p.stdout))\n";
         let output = boxed(&cfg, py, &["-c", script]).await?;
-        let hidden =
-            runnable && output.status.success() && output.stdout == b"identity_hidden=True\n";
+        let hidden = output.status.success() && output.stdout == b"identity_hidden=True\n";
         items.push(evidence(
             MANDATORY_PROBE_IDS[5],
             hidden,
@@ -426,24 +533,26 @@ else:
         ));
     }
     if selected.is_none_or(|ids| ids.iter().any(|id| id == MANDATORY_PROBE_IDS[6])) {
-        let runnable = true;
         // bootstrap_look_up uses a host-confirmed service name. pbpaste only reads.
         let script = "import os\nu=os.uname\nos.uname=lambda: type('KernelVersion',(),{'release':'8.0'})()\nimport ctypes,subprocess\nos.uname=u\nl=ctypes.CDLL('/usr/lib/libSystem.B.dylib')\nb=ctypes.c_uint.in_dll(l,'bootstrap_port')\np=ctypes.c_uint()\nr=l.bootstrap_look_up(b,b'com.apple.pasteboard.1',ctypes.byref(p))\ns=subprocess.run(['/usr/bin/pbpaste'],capture_output=True)\nprint('lookup='+str(r))\nprint('read_empty='+str(s.returncode!=0 or not s.stdout))";
-        let host = Command::new(py).args(["-c", "import ctypes\nl=ctypes.CDLL('/usr/lib/libSystem.B.dylib')\nb=ctypes.c_uint.in_dll(l,'bootstrap_port')\np=ctypes.c_uint()\nprint(l.bootstrap_look_up(b,b'com.apple.pasteboard.1',ctypes.byref(p)))"]).output().await?;
-        let host_service = host.status.success() && host.stdout == b"0\n";
+        let host_lookup = host_pasteboard_lookup();
         let output = boxed(&cfg, py, &["-c", script]).await?;
         let actual = String::from_utf8(output.stdout)?;
-        let blocked = runnable
-            && host_service
-            && output.status.success()
-            && actual.contains("lookup=1100\n")
-            && actual.contains("read_empty=True\n")
-            && actual.contains("lookup=");
+        let blocked = output.status.success()
+            && pasteboard_passed(
+                host_lookup,
+                if actual.contains("lookup=1100\n") {
+                    1100
+                } else {
+                    -1
+                },
+                actual.contains("read_empty=True\n"),
+            );
         items.push(evidence(
             MANDATORY_PROBE_IDS[6],
             blocked,
             format!(
-                "host_service={host_service} pasteboard_blocked={blocked} {}",
+                "host_lookup={host_lookup} pasteboard_blocked={blocked} {}",
                 actual.trim().replace('\n', " ")
             ),
         ));
@@ -473,7 +582,7 @@ else:
         keychain_isolation: "unverified".into(),
         location_blocked: "unverified".into(),
         timezone_policy: "default_configured".into(),
-        notes: vec!["Offline canary evidence does not establish live control-socket isolation. Keychain and location have no dedicated evidence.".into()],
+        notes: vec![if control_socket.is_some() { "Live control-socket and canary evidence. Keychain and location have no dedicated evidence." } else { "Offline canary evidence does not establish live control-socket isolation. Keychain and location have no dedicated evidence." }.into()],
         os_build: Some(os_build().await?),
         sbpl_template_digest: Some(sbpl_template_digest()),
     };
@@ -483,6 +592,37 @@ else:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egress_and_pasteboard_matrix() {
+        for (host, boxed, expected) in [
+            (Some(0), libc::EPERM, true),
+            (Some(libc::ETIMEDOUT), libc::EPERM, true),
+            (Some(libc::ENETUNREACH), libc::EPERM, true),
+            (Some(libc::EPERM), libc::EPERM, false),
+            (Some(0), libc::ENETUNREACH, false),
+            (Some(0), 0, false),
+            (Some(0), libc::EACCES, true),
+            (Some(libc::EACCES), libc::EACCES, false),
+            (None, libc::EPERM, false),
+            (Some(0), -1, false),
+        ] {
+            assert_eq!(egress_passed(&host_result(host), boxed), expected);
+        }
+        assert_eq!(connect_errno("connected\n"), Some(0));
+        assert_eq!(connect_errno("errno=13\n"), Some(libc::EACCES));
+        assert_eq!(connect_errno("errno=0\n"), None);
+        assert_eq!(connect_errno("interpreter error"), None);
+        for (host, lookup, empty, expected) in [
+            (0, 1100, true, true),
+            (1102, 1100, true, true),
+            (1100, 1100, true, false),
+            (0, 0, true, false),
+            (0, 1100, false, false),
+        ] {
+            assert_eq!(pasteboard_passed(host, lookup, empty), expected);
+        }
+    }
 
     #[test]
     fn template_digest_and_planned_paths_are_stable() {
