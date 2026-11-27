@@ -328,6 +328,8 @@ fn host_pasteboard_lookup() -> i32 {
     -1
 }
 
+const DIRECT_EGRESS_PROBE_SCRIPT: &str = "import socket,errno\ns=socket.socket()\ns.settimeout(0.5)\ntry:\n s.connect(('192.0.2.1',80))\n print('connected')\nexcept (TimeoutError, socket.timeout):\n print('errno='+str(errno.ETIMEDOUT))\nexcept OSError as e:\n print('errno='+str(e.errno))";
+
 async fn connect_denied(
     cfg: &SeatbeltConfig,
     py: &str,
@@ -438,7 +440,7 @@ else:
         ));
     }
     if selected.is_none_or(|ids| ids.iter().any(|id| id == MANDATORY_PROBE_IDS[2])) {
-        let script = "import socket,errno\ns=socket.socket()\ns.settimeout(0.5)\ntry:\n s.connect(('192.0.2.1',80))\n print('connected')\nexcept TimeoutError:\n print('errno='+str(errno.ETIMEDOUT))\nexcept OSError as e:\n print('errno='+str(e.errno))";
+        let script = DIRECT_EGRESS_PROBE_SCRIPT;
         let host = Command::new(py)
             .args(["-c", script])
             .env_clear()
@@ -622,6 +624,35 @@ mod tests {
         ] {
             assert_eq!(pasteboard_passed(host, lookup, empty), expected);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn direct_egress_probe_script_handles_python39_socket_timeout() {
+        let system_python = Path::new("/usr/bin/python3");
+        if !system_python.exists() {
+            return;
+        }
+        let wrapped = format!(
+            "import socket\ndef _timeout(self, addr): raise socket.timeout('timed out')\nsocket.socket.connect = _timeout\n{DIRECT_EGRESS_PROBE_SCRIPT}"
+        );
+        let output = Command::new(system_python)
+            .args(["-c", &wrapped])
+            .env_clear()
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let errno = connect_errno(&stdout);
+        assert_eq!(errno, Some(libc::ETIMEDOUT), "stdout={stdout:?}");
+        let host = host_result(errno);
+        assert_eq!(host, HostResult::NetError(libc::ETIMEDOUT));
+        assert!(egress_passed(&host, libc::EPERM));
     }
 
     #[test]
