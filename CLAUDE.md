@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Atomium is a local endpoint-security workspace: desktop AI apps and CLI agents run inside isolated "Boxes" that see only what is granted. Every boundary crossing needs user approval and every egress is logged. Docs are written in Chinese. Read `docs/product-spec.md` (product decisions and red lines) and `docs/protocol-v2.md` (protocol conventions) before making non-trivial changes. `AGENTS.md` holds the same project rules as the summary below.
+Atomium is a local endpoint-security workspace: CLI agents and desktop AI tools run inside isolated "Boxes" that access only granted workspace copies, a dedicated egress gateway, and typed host capability portals. Every boundary crossing is policy-checked or user-approved, and every egress and export is logged with credential redaction. Docs are written in Chinese. Read `docs/product-spec.md` (product decisions and red lines), `docs/architecture-design.md` (layered architecture and security acceptance boundaries), and `docs/protocol-v2.md` (protocol conventions) before making non-trivial changes. `AGENTS.md` holds the same project rules as the summary below.
 
 ## Commands
 
@@ -48,16 +48,16 @@ CI (`.github/workflows/ci.yml`) runs on ubuntu and macos. The `CI Gate` job requ
 
 If any step fails before the spawn, the daemon must release the leases and remove the run dir. Cancel runs in a fixed order: revoke egress, then kill the process group, then clean up. Refreshed tokens are written back to the Vault atomically. Orphaned leases and processes are reclaimed (zombie lease self-healing).
 
-**TS side:** `@atomium/protocol-types` (generated) → `@atomium/client` (shared RPC client with Tauri and WebSocket transports) → `apps/desktop` (Tauri v2 + React panel; its `src-tauri` crate is a Cargo workspace member) and `apps/mobile` (an Expo skeleton).
+**TS side:** `@atomium/protocol-types` (generated) → `@atomium/client` (shared RPC client with Tauri and WebSocket transports) → `apps/desktop` (unified cross-platform Tauri v2 + React control-plane panel for macOS/Windows/Linux; its `src-tauri` crate is a Cargo workspace member, and its WebView is strictly restricted to trusted control-plane UI) and `apps/mobile` (an Expo skeleton). `native-helpers/` holds thin Swift sidecars for macOS-specific frameworks only.
 
 Runtime env overrides for the daemon: `ATOMIUM_SOCKET`, `ATOMIUM_DB`, `ATOMIUM_VAULT_DIR`, `ATOMIUM_RUNS_DIR`, `ATOMIUM_BROKER_DIR`, `ATOMIUM_USE_MACOS_KEYCHAIN`, `ATOMIUM_DEV_UNSANDBOXED`.
 
 ## Hard rules
 
-- The daemon alone decides isolation. Never add RPC parameters that disable the sandbox or accept arbitrary host paths. The only host path allowed in a request is `workspaces.import.source_dir`. Runs mount only Broker `workspace_id`s. When no isolation backend is available, return `-32003`. To get dev mode in tests, use `DaemonState::with_unsandboxed_dev_mode(true)` or `ATOMIUM_DEV_UNSANDBOXED=1`; dev mode emits a warning `LogLine` event on every run.
+- The daemon alone decides isolation. Never add RPC parameters that disable the sandbox or accept arbitrary host paths. The only host path allowed in a request is `workspaces.import.source_dir`. Runs mount only Broker `workspace_id`s. When no isolation backend is available or mandatory isolation probes fail, return `-32003`. To get dev mode in tests, use `DaemonState::with_unsandboxed_dev_mode(true)` or `ATOMIUM_DEV_UNSANDBOXED=1`; dev mode emits a warning `LogLine` event on every run.
 - Never put plaintext credentials in logs, events, snapshots, CLI args or test output. Use digests only.
-- Product red lines (product-spec §2): no automatic account switching within the same vendor, no account pools or shared/resold subscriptions, and no region, locale or identity spoofing. When quota runs out, stop and notify, or switch to a different vendor or model by user rule.
-- The user runs any command that needs `sudo` (for example, creating the Box user for the S1 prototype). Confirm before deleting accounts or directories.
+- Product red lines (product-spec §2): no automatic account switching within the same vendor, no account pools or shared/resold subscriptions, no region/locale/identity spoofing, and no generic `host.exec` portal. When quota runs out, stop and notify, or switch to a different vendor or model by user rule.
+- The user runs any command that needs `sudo` (for example, S1 prototype helpers). Confirm before deleting accounts or directories.
 - `legacy/` and `packages/agent-drivers/src/account-auth/` are archived. New code must not depend on them.
 
-Current status and the roadmap (S1 native GUI Box prototype, then M5 CLI Box + Gateway v2) are in `DEVELOPMENT-STATUS.md` and `docs/prototypes/`.
+Current status (v1.2 baseline; S1 native cross-UID GUI prototype archived as `no-go`) and the Phase 1–4 roadmap (Phase 1: L1 CLI workspace + dedicated chained gateway + PTY + per-session portal; Phase 2: L3 lightweight Linux VM containers; Phase 3: scoped host window plugins, mobile signing & optional L2 macOS VM; Phase 4: enterprise governance & Windows/Linux backends) are documented in `docs/architecture-design.md` and `DEVELOPMENT-STATUS.md`.

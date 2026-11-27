@@ -1,6 +1,6 @@
 # Atomium 控制协议 v2
 
-状态：**v1.2 已实现**（本仓库当前代码），**v2 已确定、按里程碑实现**。产品背景见 [product-spec.md](product-spec.md)。
+状态：**v1.2 已实现**（本仓库当前代码），**v2 规划草案随 Phase 1–4 验证演进**。产品决策见 [product-spec.md](product-spec.md)，系统分层与验收边界见 [architecture-design.md](architecture-design.md)。
 
 ## 1. 基本约定
 
@@ -15,18 +15,19 @@
 
 ## 2. 权限归属原则（所有方法都必须遵守）
 
-1. **隔离由守护进程决定**，调用方不能请求降级。没有可用的隔离后端时返回 `-32003`。只有守护进程启动方可以设置 `ATOMIUM_DEV_UNSANDBOXED=1` 进入开发模式，此时每次运行都会发出 `stream="atomium"` 的警告 `LogLine` 事件。
-2. **Box 只能访问 Broker 管理的路径**。请求中不允许出现任意宿主路径；唯一的例外是 `workspaces.import.source_dir`，由用户显式选择。
-3. **凭据不出 Vault**：任何响应、事件或日志中都不出现明文凭据，只给出 `content_digest`。
-4. **需要本人在场的操作**（M7 起）：请求中必须携带 `presence_proof`，否则返回 `-32013`。
+1. **隔离由守护进程决定**，调用方不能请求降级。没有可用的隔离后端或启动前关键隔离探针未通过时返回 `-32003`。只有守护进程启动方可以设置 `ATOMIUM_DEV_UNSANDBOXED=1` 进入开发模式，此时每次运行都会发出 `stream="atomium"` 的警告 `LogLine` 事件。
+2. **Box 只能访问 Broker 管理的路径或守护进程签发的资源句柄**。请求中不允许出现任意宿主路径；唯一的例外是控制面上的 `workspaces.import.source_dir`，由用户显式选择。
+3. **凭据不出 Vault**：任何响应、事件或日志中都不出现明文凭据（含上游代理认证密钥），只给出 `content_digest`。
+4. **控制面与门户面物理分离**（Phase 1 起）：控制面 `atomiumd.sock` 对隔离环境不可达；隔离环境仅能访问每会话专属门户通道（L1 为 `runs_dir/<session_id>/portal.sock`，L3/L2 为独立 `virtio-vsock` 端点）。门户通道由服务端按监听句柄静态绑定会话身份（忽略请求载荷自报的 `box_id`/`session_id`），且在路由层物理不含创建授权、修改路由策略或裁决审批等控制面方法。
+5. **需要本人在场的操作**（Phase 3 / 原 M7 起）：高危请求必须携带 `presence_proof`，否则返回 `-32013`。
 
-## 3. 调用方认证
+## 3. 调用方认证与通道边界
 
-| 阶段 | 机制 |
-| --- | --- |
-| v1.2（当前） | Socket 文件权限 `0600`，只有同一 uid 能连接 |
-| M5 | 在 `0600` 之外，用 `LOCAL_PEERTOKEN` 取对端 audit token，校验代码签名（Team ID 与 bundle ID 白名单）。未签名的调用方只能调用只读方法 |
-| M7 | 移动端经中继连接：设备配对时交换公钥；会话使用 Noise IK 端到端加密；设备密钥存放在 Secure Enclave / StrongBox |
+| 阶段 | 控制面 (`atomiumd.sock`) | 门户面 (`portal.sock` / `vsock`) |
+| --- | --- | --- |
+| v1.2（当前） | Socket 文件权限 `0600`（同一 UID 可连） | 尚未开放 |
+| Phase 1–2（原 M5） | `0600` + Seatbelt 强探针强制阻断 L1 内部连接；逐步叠加 `LOCAL_PEERTOKEN` 对端代码签名白名单校验 | 每会话独立 socket / `vsock` 实例，服务端静态绑定 `session_id` 与能力集；授权撤销后存量连接后续调用立即拒绝 |
+| Phase 3（原 M7） | 移动端经 Noise IK 端到端加密中继连接；设备私钥存放于 Secure Enclave / StrongBox；高危裁决校验 `PresenceProof` | 同上 |
 
 **本人在场证明**（`PresenceProof`，M7）：
 
@@ -91,12 +92,13 @@ PresenceProof {
 | `ExportResult` 新增可选字段 `post_verify_ok`；导出改为 `broker_dir/exports/<export_id>/journal.json` 记录的准备、提交、复核及回滚流程。每次尝试生成独立的 `exp-<UUIDv7>`，可用 journal 中的 `approval_id` 与回执关联，守护进程启动时自动恢复未完成导出。回滚失败的工作区进入 `export_inconsistent`，后续导出返回 `-32018` | 防止导出中途崩溃造成宿主工作区处于无审计、不可恢复的中间状态 |
 | 带 `workspace_id` 的运行在 `runs.start` 租约原子获取阶段同时获取 `workspace:<workspace_id>` Exclusive 租约；正常结束、取消、超时和僵尸租约回收路径都释放该租约 | 防止多个写入者并发修改同一 Broker 工作副本 |
 
-## 5. v2 类型（已确定，按里程碑实现）
+## 5. v2 规划类型草案（随 Phase 1–4 验证落地）
 
-以下用 Rust 风格伪代码描述，落地时写入 `atomium-protocol` 并导出 TS。
+以下用 Rust 风格伪代码描述规划结构；实际落地时写入 `atomium-protocol` 并通过 `pnpm run gen:protocol` 导出 TS 绑定，遵循 §1 与 §9 兼容演进规则。
 
 ```text
-enum BoxTier { Cli, Gui, MacVm, LinuxVm }
+// L1-GUI 已由 S1 证伪移除；正式隔离档位为 L1 CLI / L3 LinuxContainer / L2 MacVm
+enum BoxTier { Cli, LinuxContainer, MacVm }
 enum BoxState { Provisioning, Stopped, Starting, Running, Stopping, Error, Destroying }
 
 struct BoxRecord {
@@ -104,38 +106,59 @@ struct BoxRecord {
   display_name: String,
   tier: BoxTier,
   state: BoxState,
-  os_user: Option<BoxOsUser>,          // Cli / Gui
-  vm: Option<BoxVmInfo>,               // MacVm / LinuxVm
+  vm: Option<BoxVmInfo>,               // LinuxContainer / MacVm
   identity: BoxIdentity,
   resources: BoxResources,
   color: String,                       // 可信边框颜色，#RRGGBB
   egress_policy_id: Option<String>,
   created_at_ms: i64,
 }
-struct BoxOsUser { uid: u32, short_name: String, home: String, primary_gid: u32 }
-struct BoxVmInfo { image_digest: String, disk_bytes: u64, machine_identifier_digest: String }
+struct BoxVmInfo { image_digest: String, disk_bytes: u64, machine_identifier_digest: Option<String> }
 struct BoxIdentity { hostname_alias: Option<String>, timezone: Option<String>, lang: Option<String> }
 struct BoxResources { cpu_count: Option<u32>, memory_bytes: Option<u64>, disk_quota_bytes: Option<u64> }
 
-enum AppKind { Cli, Gui }
+// 沙箱专用链式路由与守护进程托管出网策略（独立于宿主机系统代理）
+enum ProxyProtocol { HttpConnect, Socks5 }
+struct ProxyHopSpec {
+  protocol: ProxyProtocol,
+  host: String,
+  port: u16,
+  auth_vault_secret_id: Option<String>, // 凭据封存于 Vault，配置与日志零明文
+}
+enum OutboundMode {
+  Direct,                               // 解析并校验非公网 IP 后固定 SocketAddr 连接，保留原始域名做 TLS SNI
+  Chain { hops: Vec<ProxyHopSpec> },    // 单跳或多跳代理链；失效时 502 Fail-Closed，严禁静默回退 Direct
+}
+struct OutboundRoute { route_id: String, display_name: String, mode: OutboundMode }
+
+enum EgressAction {
+  Allow { route_id: String },
+  Ask { route_id: String },
+  Deny,
+}
+struct EgressRule { pattern: String, ports: Vec<u16>, action: EgressAction }
+struct EgressPolicy { policy_id: String, default_action: EgressAction, rules: Vec<EgressRule> }
+
+enum AppKind { Cli, Desktop }
 struct AppProfile {                    // 来自签名的应用画像目录
-  app_id: String,                      // 如 "claude-desktop"、"codex-cli"
+  app_id: String,                      // 如 "claude-code"、"codex-cli"、"agy"
   kind: AppKind,
   display_name: String,
   catalog_version: String,
-  install: InstallSpec,                // 官方来源 URL、期望的签名 Team ID、摘要
-  launch: LaunchSpec,                  // 可执行文件或 .app 路径（相对 Box HOME）、默认参数
+  install: InstallSpec,                // 官方来源 URL、期望签名 Team ID、摘要
+  launch: LaunchSpec,                  // 可执行路径或容器入口、默认参数
   egress_hosts: Vec<String>,
-  credential_flows: Vec<CredentialFlow>, // api_key_inject | oauth_inject | oauth_projection
-  tcc_needs: Vec<String>,
+  // API Key 反代、个人 OAuth 反代与文件投影须独立实测，禁止混同标注
+  credential_flows: Vec<CredentialFlow>, // base_url_api_key | base_url_oauth | oauth_projection
+  portal_needs: Vec<PortalKind>,
   compat: Vec<TierCompat>,             // { tier, status: supported|partial|unsupported|untested, note }
 }
 struct Harness { harness_id: String, box_id: String, app_id: String, version: String, installed_digest: String }
 
-enum SessionKind { Terminal, Gui, Task }
+enum SessionKind { Terminal, Task, Desktop }
 enum SessionState { Starting, Running, Detached, Stopping, Stopped, Failed }
 struct SessionRecord {
-  session_id: String, box_id: String, harness_id: String, profile_id: String,
+  session_id: String, box_id: Option<String>, harness_id: Option<String>, profile_id: String,
   workspace_id: Option<String>, recipe_id: Option<String>, role: Option<SessionRole>,
   kind: SessionKind, state: SessionState, pty: Option<PtySize>,
   budget: Option<Budget>, created_at_ms: i64, updated_at_ms: i64,
@@ -144,56 +167,43 @@ enum SessionRole { Solo, Implementer, Reviewer }
 struct PtySize { cols: u16, rows: u16 }
 struct Budget { max_requests: Option<u32>, max_bytes: Option<u64>, max_duration_ms: Option<i64> }
 
-struct Recipe {
-  recipe_id: String, name: String,
-  entries: Vec<RecipeEntry>,           // { app_id, profile_id, box_template, role, args }
-  workspace_id: Option<String>,
-  review: Option<ReviewPolicy>,        // { reviewer_entry_index, require_cross_model: bool }
-}
-
 enum PortalKind { FsShare, FsReview, FsPick, ClipboardToBox, ClipboardToHost, UrlOpen,
-                  PortExpose, Notify, GitCredential, SshSign, McpBridge }
+                  PortExpose, Notify, GitCredential, SshSign, MacosXcodeBuild, McpBridge, WindowComputerUse }
 enum GrantMode { Allow, Ask, Deny }
 struct Grant {
-  grant_id: String, box_id: String, portal: PortalKind,
-  scope: serde_json::Value,            // 按 Portal 定义，例如 fs.share 的 { path_ref, read_only }
+  grant_id: String, box_id: Option<String>, session_id: Option<String>, portal: PortalKind,
+  scope: serde_json::Value,            // 按插件动作定义 JSON Schema 参数范围（禁止任意宿主路径）
   mode: GrantMode, expires_at_ms: Option<i64>, uses_left: Option<u32>,
   requires_presence: bool, created_at_ms: i64,
 }
 struct PortalRequest {
-  request_id: String, box_id: String, session_id: Option<String>,
+  request_id: String, session_id: String, // 由门户服务端监听句柄静态绑定，忽略客户端自报 ID
   portal: PortalKind, scope: serde_json::Value, reason: Option<String>, requested_at_ms: i64,
 }
 
 enum EgressDecisionKind { Allowed, Denied, Asked, AskTimeout }
-struct EgressRule { pattern: String, ports: Vec<u16>, decision: GrantMode }
-
 enum PrivacyStatus { Enforced, DefaultOnly, HostVisible, Unverified }
 struct PrivacyItem { item_id: String, status: PrivacyStatus, probe_id: Option<String>, evidence_at_ms: Option<i64>, note: String }
 
 struct DeviceRecord { device_id: String, display_name: String, platform: String, public_key_b64: String, paired_at_ms: i64 }
 ```
 
-**`CredentialSpec` 扩展**：新增 `Injected { vault_blob_id, provider, inject: InjectionMode }`，其中 `InjectionMode` 为 `api_key_header | oauth_bearer_swap`。`OauthSnapshot` 保留，作为"投影"降级模式。`OAuthStorageMode::HostKeychainSlot` 在注入落地后删除。
+**`CredentialSpec` 规划扩展**：新增宿主侧注入变体 `Injected { vault_blob_id, upstream_origin, inject: InjectionMode }`，其中 `upstream_origin` 在服务端静态锁死唯一目标源站（禁止客户端篡改 `Host` 或经 `3xx` 跨域重定向外带凭据），宿主对 OAuth 维护 Singleflight 单飞刷新锁。`OauthSnapshot`（`IsolatedFile`）保留用于不支持自定义 Base URL 的客户端；`OAuthStorageMode::HostKeychainSlot` 在迁移完成后移除。
 
-**`TaskEventPayload` 新增事件**：`BoxStateChanged`、`SessionStateChanged`、`PortalRequested`、`PortalDecided`、`EgressDecision { host, port, decision, bytes_up, bytes_down }`、`DlpRedacted { rule_id, count }`、`PrivacyProbeResult`。事件 envelope 增加可选的 `box_id`、`session_id`（v2 中 `run_id` 保留为兼容字段）。
+**`TaskEventPayload` 规划新增事件**：`SessionStateChanged`、`PortalRequested`、`PortalDecided`、`EgressDecision { host, port, route_id, decision, bytes_up, bytes_down }`、`DlpRedacted { rule_id, count }`、`PrivacyProbeResult`。事件 envelope 增加可选的 `box_id`、`session_id`（`run_id` 保留兼容）。
 
-## 6. v2 方法（按里程碑实现）
+## 6. v2 规划方法（按阶段落地）
 
-| 域 | 方法 | 里程碑 |
-| --- | --- | --- |
-| boxes | `boxes.create` / `list` / `get` / `start` / `stop` / `snapshot` / `restore` / `clone` / `destroy`（**需要本人在场**） | S1 原型后为 M5（L1 CLI）、M6（GUI） |
-| apps | `apps.catalog` / `apps.install` / `apps.uninstall` / `apps.update` | M5 |
-| harnesses | `harnesses.list` | M5 |
-| sessions | `sessions.start` / `list` / `get` / `attach` / `input` / `resize` / `detach` / `stop` | M5（取代 `runs.*`；`runs.*` 再保留一个小版本） |
-| recipes | `recipes.save` / `list` / `launch` | M5 |
-| grants | `grants.list` / `create` / `revoke` | M5 |
-| portals | `portals.pending` / `decide`（需要本人在场，取决于 Grant 设置） | M5 |
-| egress | `egress.rules.get` / `set`，`egress.log` | M5 |
-| privacy | `privacy.matrix` / `privacy.probe` | M5 |
-| devices | `devices.pair_begin` / `pair_complete` / `list` / `revoke` | M7 |
-| daemon | `daemon.capabilities`（后端实测能力、entitlement 状态） | M5 |
-| emergency | `daemon.panic`：撤销全部授权并停止全部会话 | M5 |
+| 域 | 方法 | 暴露通道 | 规划阶段（原里程碑对照） |
+| --- | --- | --- | --- |
+| routes / egress | `routes.upsert` / `list` / `delete`，`egress.policies.upsert` / `list`，`egress.log` | 仅控制面 | Phase 1（原 M5） |
+| sessions | `sessions.start` / `list` / `get` / `attach` / `input` / `resize` / `detach` / `stop` | 仅控制面 | Phase 1（渐进兼容 `runs.*`） |
+| portals（请求侧） | `portals.invoke` / `portals.grants_self` | **门户面专用** | Phase 1 起（首批 `url.open`，Phase 2–3 扩展） |
+| portals / grants（管理侧） | `grants.list` / `create` / `revoke`，`portals.pending` / `decide` | 仅控制面 | Phase 1–3（高危动作需 `PresenceProof`） |
+| privacy / daemon | `daemon.capabilities`，`privacy.matrix` / `privacy.probe`，`daemon.panic` | 仅控制面 | Phase 1（原 M5） |
+| boxes | `boxes.create` / `list` / `get` / `start` / `stop` / `snapshot` / `restore` / `clone` / `destroy` | 仅控制面 | Phase 2（L3 容器）、Phase 3（可选 L2 VM） |
+| apps / harnesses / recipes | `apps.catalog` / `install`，`harnesses.list`，`recipes.save` / `list` / `launch` | 仅控制面 | Phase 2 |
+| devices | `devices.pair_begin` / `pair_complete` / `list` / `revoke` | 仅控制面 | Phase 3（原 M7） |
 
 ## 7. 错误码
 
