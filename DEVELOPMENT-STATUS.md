@@ -1,6 +1,6 @@
 # Atomium 开发状态与验收基线
 
-更新于 2026-11-26。当前实现协议为 v1.2。本轮续审环境为 macOS 26.7.3（25G342）arm64。产品方向见 [docs/product-spec.md](docs/product-spec.md)，协议见 [docs/protocol-v2.md](docs/protocol-v2.md)。
+更新于 2026-11-27。当前实现协议为 v1.2（代码基线 `a4ae5f4`）。本轮续审环境为 macOS 26.7.3（25G342）arm64。产品决策见 [docs/product-spec.md](docs/product-spec.md)，系统分层与阶段路线见 [docs/architecture-design.md](docs/architecture-design.md)，协议见 [docs/protocol-v2.md](docs/protocol-v2.md)。
 
 ---
 
@@ -11,8 +11,8 @@
 | PR #1（Monorepo 基座） | 已合入 `main` | Rust Workspace + pnpm Monorepo；`ts-rs` 协议单一真相源；M0 Seatbelt 探针；Vault、租约、事件日志；Tauri v2 与 Expo 骨架；GitHub Actions `CI Gate` |
 | PR #2（运行引擎与订阅并行） | 已合入 `main` | 可注入的 `MasterKeyProvider`；僵尸租约自愈；孤儿进程组清理；fail-closed 网关支持撤销在途连接和目的主机白名单；实时 `events.subscribe` 推送；token 刷新原子写回 |
 | PR #3（Broker 与最小面板） | 已合入 `main` | `WorkspaceBroker`（导入时拒绝符号链接、特殊文件和路径穿越；确定性的 baseline / candidate / patch 摘要；复核基线后原子导出）；`workspace` / `candidate` / `approval` 全链路；最小 Desktop Panel |
-| **协议 v1.2**（含 v1.1 迁移） | 本地已提交 | 记录产品决策（product-spec）；确定协议 v2；`accounts.*` → `subscriptions.*`；删除地区和代理对齐字段；删除 RPC 中的无沙盒运行与任意宿主路径入口；时区和语言改为手动设置；新增两项安全回归测试；清理过时文档 |
-| **M4 / S1 原型**（原生窗口 GUI Box） | **已完成（判定：`no-go`）** | 交付 `native-helpers/macos-box-host`（`BoxCore`、`AtomiumBoxCtl`、`AtomiumBoxProbe`、`AtomiumBoxAgent`、`AtomiumBoxClip`、`AtomiumBoxOverlay`，接入 macOS CI）；在 macOS 26.6.2 (`25G83`) 实测 V1–V4 与 S2a–S2h/§4.9：跨 UID 原生窗口全部 `onscreen=0` 且画面透明无内容、`user/<uid>` Background 域被 `runningboardd` 拒绝启动 `.app`（Code 125）、V1 泄露宿主剪贴板并经 `responsible_pid` 继承终端 TCC、Electron 无法嵌套外层 `sandbox-exec`（`SIGTRAP` exit 5）。GUI 旗舰按预案回退到 L2 Mac VM；S2 实测结论已反哺 `product-spec.md` §6 与 M5 L1 CLI Box 加固清单 |
+| PR #4 / **协议 v1.2**（含 v1.1 迁移与安全加固） | 已合入 `main`（`a4ae5f4`） | 记录产品决策（product-spec）；确定协议 v1.2；`accounts.*` → `subscriptions.*`；删除地区和代理对齐字段；删除 RPC 中的无沙盒运行与任意宿主路径入口；时区和语言改为手动设置；补齐网关防走私、精确脱敏、崩溃可恢复导出与 Seatbelt realpath 修复 |
+| **M4 / S1 原型**（原生窗口 GUI Box） | **已完成（判定：`no-go`）** | 交付 `native-helpers/macos-box-host`（`BoxCore`、`AtomiumBoxCtl`、`AtomiumBoxProbe`、`AtomiumBoxAgent`、`AtomiumBoxClip`、`AtomiumBoxOverlay`，接入 macOS CI）；在 macOS 26.6.2 (`25G83`) 实测 V1–V4 与 S2a–S2h/§4.9：跨 UID 原生窗口全部 `onscreen=0` 且画面透明无内容、`user/<uid>` Background 域被 `runningboardd` 拒绝启动 `.app`（Code 125）、V1 泄露宿主剪贴板并经 `responsible_pid` 继承终端 TCC、Electron 无法嵌套外层 `sandbox-exec`（`SIGTRAP` exit 5）。据此完成架构收敛（见 `docs/architecture-design.md`）：Phase 1 聚焦免 `sudo` L1 CLI 工作区与专用链式网关，Phase 2 引入 L3 轻量 Linux VM 容器与宿主机插件，统一采用 Tauri 主面板 |
 
 ## 2. Astra 6.2 审核意见处理状态
 
@@ -53,14 +53,14 @@
 
 ## 3. 当前能力与已知差距
 
-| 层 | 已具备 | 已知差距（对应里程碑） |
+| 层 | 已具备（v1.2 基线） | 已知差距与对应阶段（详见 `docs/architecture-design.md`） |
 | --- | --- | --- |
-| 协议 | v1.2：订阅、运行、事件、工作区、候选、审批；删除凭据宿主路径读取；导出返回 `post_verify_ok` | 还没有 Box、Session、Grant、Portal 等 v2 对象（M5） |
-| 运行时 | macOS Seatbelt 强制隔离（守护进程决定）；Keychain 默认拒绝；网络限制到 per-run 网关；sysctl-read 全部放行，加 `kern.hostname`、`hw.model`、硬件 UUID/序列号等身份类黑名单；宿主私有目录读取拒绝；环境变量白名单；独立 HOME、TMPDIR、cache | 独立 Box 用户与正式 LaunchAgent/LaunchDaemon 尚未产品化，守护进程须独立运行才能切断终端 `responsible_pid` TCC 继承（M5）；GUI 档位已确定走 L2 Mac VM（M6） |
-| 网关 | keep-alive 逐请求鉴权与策略检查；fail-closed；主机白名单；非公网 IP 拦截；请求头上限与防走私 framing；CONNECT 建隧道前检查；撤销在途连接 | 只能转发到上游代理，不能直连；隧道建立后的 TLS 字节不透明；没有 SOCKS 和询问机制（M5） |
-| 凭据 | AES-256-GCM Vault；IsolatedFile 投影；confined 刷新写回；日志/事件精确脱敏 | 凭据仍会投影进运行目录；同一订阅不能并行；`HostKeychainSlot` 已弃用（M6 注入） |
-| 控制面认证 | `0600` socket | 没有校验对端签名；审批不需要本人在场（M5、M7） |
-| 客户端 | 瘦 CLI；`@atomium/client`；Tauri 面板；Expo 骨架 | macOS 旗舰 SwiftUI 面板、移动端审批中继（M6、M7） |
+| 协议 | v1.2：订阅、运行、事件、工作区、候选、审批；删除凭据宿主路径读取；导出返回 `post_verify_ok` | 尚未落地托管代理链、交互式 `sessions.*`、每会话门户 `portals.*` 与容器 `boxes.*`（Phase 1–2，原 M5） |
+| 运行时 | macOS 同 UID Seatbelt 强制隔离（守护进程决定）；Keychain 默认拒绝；网络限制到 per-run 网关；sysctl-read 黑名单拦截 `kern.hostname`、`hw.model` 等；宿主私密目录读取拒绝；环境变量白名单；独立 HOME、TMPDIR、cache | `RuntimeBackend` 尚只有 `name/probe`；守护进程未以独立用户态 `LaunchAgent` 运行时会继承终端 `responsible_pid` TCC；IOKit 序列号拦截、交互式 PTY 与连控制面必败强探针待合入（Phase 1）；跨 UID/内核隔离由轻量 Linux VM 容器（L3，Phase 2）与可选 Mac VM（L2，Phase 3）承接 |
+| 网关 | keep-alive 逐请求鉴权与策略检查；fail-closed；主机白名单；非公网 IP 字面量拦截；请求头上限与防走私 framing；CONNECT 建隧道前检查；撤销在途连接 | 仅支持转发到调用方传入的上游代理，无上游时 `502`；尚未实现防 DNS Rebinding 固定 IP 直连、守护进程托管多跳代理链（HTTP CONNECT / SOCKS5）及固定源站 Base URL 反代（Phase 1） |
+| 凭据与并发 | AES-256-GCM Vault；IsolatedFile 投影；confined 刷新写回；日志/事件精确脱敏 | 投影模式下凭据仍进入运行目录且同一 OAuth 订阅互斥；固定源站 Base URL 宿主侧代填（Phase 1）与 Singleflight 单飞刷新锁 + 每会话 APFS CoW 副本（Phase 2）待落地 |
+| 控制面与门户 | `0600` 控制面 socket | 尚未建立物理分离的每会话专属 `portal.sock` / `vsock`；尚未接入对端代码签名白名单与 `PresenceProof`（Phase 1–3） |
+| 客户端 | 瘦 CLI；`@atomium/client`；Tauri v2 + React 桌面面板（`apps/desktop`）；Expo 骨架（`apps/mobile`） | 桌面端已统一收敛为 `apps/desktop`（不再另建 SwiftUI 主面板），待接入链式代理配置、会话流与门户审批视图（Phase 1–3）；移动端签名审批中继在 Phase 3 落地 |
 
 ## 4. `agy` 订阅隔离实测结论
 
@@ -103,11 +103,16 @@ swift test --disable-sandbox --package-path native-helpers/macos-box-host
 | 5 Swift helper | 通过 | 1 / 0 | 20 / 0 |
 | 6 下游与文档 | 通过 | 1 / 0 | 20 / 0 |
 
-### 本轮需要本人执行的检查
+### 本轮需要本人执行的检查（2026-11-27 Owner 确认处置）
 
-1. **R4，个人 Keychain 访问。** 确认 agy 已登录本人的订阅。启动 `cargo run -p atomiumd`，再在另一个终端用未占用的配置 ID 执行 `cargo run -p atomium-cli -- subscription capture review_check --name "Keychain check"`。若 macOS 弹窗，核对请求进程为 CLI 后授权。用 `cargo run -p atomium-cli -- subscription list` 核对该 ID、`snapshot_version` 和 `content_digest`。测试过程无需展示钥匙串内容。更多说明见[订阅快速上手](docs/subscription-quickstart.md)。
-2. **W1–W3，真实 Box 账户与 manifest。** 在专用测试 Mac 上构建 `macos-box-host` 并选择未占用的 Box ID。由本人运行 `sudo atomium-boxctl provision <box_id>` 和 `sudo atomium-boxctl keychain-init <box_id>`，核对报告中的 `created`、`unlocked` 与账户的 UID/GID。用 `sudo stat -f '%Su %Sp' /var/db/atomium-prototype/manifest.json` 检查属主 root、权限 0600。运行 `atomium-boxctl destroy <box_id>` 预览计划；仅在逐项确认后本人执行带 `--apply` 的同一命令并按提示输入确认文本。用同一 ID 再次 provision，核对新记录的身份。共享资源仍存在时允许 manifest 保留对应记录。删除最后一个受管理资源后的空 manifest 应消失。上述命令中的 `atomium-boxctl` 可替换为 Swift 构建目录中的可执行文件。
+1. **R4，个人 Keychain 访问 — 并入 Phase 1 凭据验证一并处理。** 在 P1.2 实测 `agy` 个人 OAuth 时随同手验：确认 `agy` 已登录本人订阅，启动 `cargo run -p atomiumd`，在另一终端执行 `cargo run -p atomium-cli -- subscription capture review_check --name "Keychain check"`，若 macOS 弹窗则核对请求进程为 CLI 后授权，再用 `cargo run -p atomium-cli -- subscription list` 核对该 ID、`snapshot_version` 和 `content_digest`（无需展示钥匙串明文；详见[订阅快速上手](docs/subscription-quickstart.md)）。
+2. **W1–W3，真实 Box 账户与 manifest — 已关闭（随 S1 原型归档，不阻断 Phase 1）。** 对应 S1 跨用户原生窗口方案已在 macOS 26.6.2（`25G83`）实测判定 `no-go` 并归档（见 [docs/prototypes/s1-native-gui-box.md](docs/prototypes/s1-native-gui-box.md)），Phase 1–2 不再推进 `macos-box-host` 特权 Box 账户产品化流程；若未来在独立特权场景重启相关路径，再重新开启手工验收。
 
-## 6. 下一步
+## 6. 下一步（Phase 1–4 路线，详见 `docs/architecture-design.md`）
 
-S1 原型已完成并在 macOS 26.6.2 (`25G83`) 给出 **`no-go`** 判定：GUI 旗舰路线切换为 L2 Mac VM（M6）；下一步进入 **M5（L1 CLI Box + Gateway v2）**，将 S2 探针验证生效的独立 Box 用户、Seatbelt 身份与宿主目录拒绝规则（`kern.hostname`、`IOPlatformSerialNumber`/`IOPlatformUUID`、`/Users/<host>`）以及独立守护进程 `responsible_pid` 隔离落入正式运行时。
+S1 原型已在 macOS 26.6.2 (`25G83`) 给出 **`no-go`** 判定。经架构收敛，全平台桌面主面板统一采用 Tauri v2（`apps/desktop`），执行架构按 **L1 免 `sudo` CLI 工作区 → L3 轻量 Linux VM 容器 + 受控宿主机插件 → 可选 L2 Mac VM** 推进。当前立即执行 **Phase 1（研发 CLI 工作区 MVP）**：
+
+1. **P1.0 结构整理**：在本文档及规格同步基础上，完成 `crates/atomiumd` 按域模块拆分与 `RuntimeBackend` L1 生命周期接口下沉，保持 `pnpm run ci:local` 零退化。
+2. **P1.1 L1 会话、LaunchAgent 与强探针**：支持用户态 `LaunchAgent` 切断终端 `responsible_pid` TCC 继承，补齐 IOKit 硬件标识拦截，落地交互式 PTY 会话与每会话专属 `portal.sock`（服务端静态绑定身份，强探针验证 L1 内直连 `atomiumd.sock` 被拒）。
+3. **P1.2 专用链式网关 v2 与首轮 CLI 凭据验证**：实现防 DNS Rebinding 固定 IP 直连与 HTTP CONNECT / SOCKS5 多跳代理链（代理链失效时 `502` Fail-Closed 严禁回退直连），并按分立实测口径推进首轮目标矩阵：**Claude Code（API Key 固定源站 Base URL 反代注入）+ Codex CLI（个人 OAuth）+ `agy`（个人 OAuth，含 R4 Keychain 捕获手验）**。
+4. **P1.3 开发工作区端到端闭环**：打通导入真实仓库 → L1 受控编码 → 候选冻结 → diff 审阅 → 审批原子导出的完整日常开发闭环，并与 `apps/desktop` 面板联动验证。

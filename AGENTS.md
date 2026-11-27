@@ -1,6 +1,6 @@
 # Agent Instructions for Atomium
 
-先读 `docs/product-spec.md`（产品决策与红线）和 `docs/protocol-v2.md`（协议约定）。
+先读 `docs/product-spec.md`（产品决策与红线）、`docs/architecture-design.md`（系统分层与验收边界）和 `docs/protocol-v2.md`（协议约定）。
 
 ## 验证
 
