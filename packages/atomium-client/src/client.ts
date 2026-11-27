@@ -1,4 +1,11 @@
 import type {
+  DaemonCapabilities,
+  PrivacyMatrix,
+  PrivacyProbeRequest,
+  PrivacyProbeResult,
+  DaemonPanicRequest,
+  DaemonPanicResult,
+  DaemonPanicClearResult,
   ApprovalCreateRequest,
   ApprovalRequest,
   ApprovalResolveRequest,
@@ -116,6 +123,26 @@ export class AtomiumClient {
         void this.call("events.subscribe", { after_seq: this.lastSeq }).catch(() => {});
       }
     });
+  }
+
+  daemonCapabilities(): Promise<DaemonCapabilities> {
+    return this.call("daemon.capabilities");
+  }
+
+  privacyMatrix(): Promise<PrivacyMatrix> {
+    return this.call("privacy.matrix");
+  }
+
+  privacyProbe(request: PrivacyProbeRequest = { probe_ids: null }): Promise<PrivacyProbeResult> {
+    return this.call("privacy.probe", { ...request });
+  }
+
+  daemonPanic(request: DaemonPanicRequest = { reason: null }): Promise<DaemonPanicResult> {
+    return this.call("daemon.panic", { ...request });
+  }
+
+  daemonPanicClear(): Promise<DaemonPanicClearResult> {
+    return this.call("daemon.panic_clear");
   }
 
   get cursor(): number {
@@ -254,7 +281,10 @@ export class AtomiumClient {
       if (seq > this.lastSeq) {
         this.lastSeq = seq;
       }
-      this.eventListeners.forEach((fn) => fn(msg.params!));
+      const type = msg.params.payload?.type;
+      if (["status_changed", "log_line", "policy_denied", "approval_requested", "approval_resolved"].includes(type)) {
+        this.eventListeners.forEach((fn) => fn(msg.params!));
+      }
       return;
     }
     const id = typeof msg.id === "number" ? msg.id : Number(msg.id);

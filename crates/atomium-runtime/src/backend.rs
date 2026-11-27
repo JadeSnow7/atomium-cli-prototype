@@ -72,6 +72,13 @@ pub trait RuntimeBackend: Send + Sync {
 
     async fn probe(&self) -> Result<(CapabilitiesReport, Vec<ProbeEvidence>)>;
 
+    async fn probe_with_control_socket(
+        &self,
+        _path: &Path,
+    ) -> Result<(CapabilitiesReport, Vec<ProbeEvidence>)> {
+        self.probe().await
+    }
+
     fn prepare_run_env(
         &self,
         runs_dir: &Path,

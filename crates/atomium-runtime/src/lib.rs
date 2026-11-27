@@ -2,6 +2,7 @@ pub mod backend;
 pub mod dev_unsandboxed;
 pub mod linux_stub;
 pub mod macos_seatbelt;
+pub mod probes;
 pub mod process;
 
 pub use backend::{

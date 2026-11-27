@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,11 +26,26 @@ pub struct EgressProxyHandle {
     pub local_port: u16,
     pub proxy_url: String,
     shutdown_tx: watch::Sender<bool>,
+    completed_rx: watch::Receiver<bool>,
 }
 
 impl EgressProxyHandle {
-    pub fn revoke(&self) {
+    pub fn revoke(&self) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
         let _ = self.shutdown_tx.send(true);
+        let mut completed = self.completed_rx.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !*completed.borrow_and_update() {
+                    completed
+                        .changed()
+                        .await
+                        .context("proxy completion channel closed")?;
+                }
+                Ok(())
+            })
+            .await
+            .context("proxy revocation timed out")?
+        }
     }
 
     pub fn is_revoked(&self) -> bool {
@@ -75,6 +90,26 @@ pub async fn spawn_run_proxy_with_policy_and_config(
     config: EgressProxyConfig,
 ) -> Result<EgressProxyHandle> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
+    spawn_run_proxy_on_listener(
+        listener,
+        run_id,
+        ephemeral_token,
+        upstream_proxy_addr,
+        allowed_hosts,
+        config,
+    )
+    .await
+}
+
+/// Consume the preflight-reserved port so the loaded policy and real gateway agree.
+pub async fn spawn_run_proxy_on_listener(
+    listener: TcpListener,
+    run_id: &str,
+    ephemeral_token: &str,
+    upstream_proxy_addr: Option<String>,
+    allowed_hosts: Option<Vec<String>>,
+    config: EgressProxyConfig,
+) -> Result<EgressProxyHandle> {
     let local_port = listener.local_addr()?.port();
     let expected_auth = format!(
         "Basic {}",
@@ -82,6 +117,7 @@ pub async fn spawn_run_proxy_with_policy_and_config(
     );
     let proxy_url = format!("http://{run_id}:{ephemeral_token}@127.0.0.1:{local_port}");
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let (completed_tx, completed_rx) = watch::channel(false);
     let expected_auth = Arc::new(expected_auth);
     let upstream = Arc::new(upstream_proxy_addr);
     let normalized_allowlist: Arc<Option<Vec<String>>> = Arc::new(allowed_hosts.map(|list| {
@@ -102,6 +138,7 @@ pub async fn spawn_run_proxy_with_policy_and_config(
 
     let header_read_timeout = config.header_read_timeout;
     tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 changed = shutdown_rx.changed() => {
@@ -109,13 +146,14 @@ pub async fn spawn_run_proxy_with_policy_and_config(
                         break;
                     }
                 }
+                _ = connections.join_next(), if !connections.is_empty() => {}
                 accepted = listener.accept() => {
                     let Ok((client, _)) = accepted else { continue };
                     let auth = expected_auth.clone();
                     let upstream = upstream.clone();
                     let allowlist = normalized_allowlist.clone();
                     let client_shutdown_rx = shutdown_rx.clone();
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         let _ = handle_client(
                             client,
                             &auth,
@@ -129,12 +167,17 @@ pub async fn spawn_run_proxy_with_policy_and_config(
                 }
             }
         }
+        drop(listener);
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+        let _ = completed_tx.send(true);
     });
 
     Ok(EgressProxyHandle {
         local_port,
         proxy_url,
         shutdown_tx,
+        completed_rx,
     })
 }
 

@@ -14,6 +14,34 @@ use std::sync::Arc;
 use crate::state::DaemonState;
 use crate::transport::format_push_frame;
 
+pub(crate) const CONTROL_METHODS: &[&str] = &[
+    "daemon.panic",
+    "daemon.panic_clear",
+    "daemon.ping",
+    "profiles.list",
+    "profiles.upsert",
+    "subscriptions.capture",
+    "subscriptions.list",
+    "subscriptions.activate",
+    "runs.start",
+    "runs.list",
+    "runs.get",
+    "runs.cancel",
+    "events.subscribe",
+    "workspaces.import",
+    "workspaces.list",
+    "workspaces.get",
+    "candidates.freeze",
+    "candidates.list",
+    "candidates.get",
+    "approvals.request",
+    "approvals.list",
+    "approvals.resolve",
+    "daemon.capabilities",
+    "privacy.matrix",
+    "privacy.probe",
+];
+
 pub(crate) type RpcErr = (i32, String, Option<serde_json::Value>);
 
 pub(crate) fn rpc_ok(id: serde_json::Value, result: serde_json::Value) -> JsonRpcResponse {
@@ -63,6 +91,64 @@ pub async fn dispatch(
     let id = req.id.clone();
 
     match req.method.as_str() {
+        "daemon.panic" => {
+            let result = match serde_json::from_value::<atomium_protocol::DaemonPanicRequest>(
+                object_params(&req.params),
+            ) {
+                Ok(request) => crate::panic_control::panic(state, request.reason)
+                    .await
+                    .and_then(|r| {
+                        serde_json::to_value(r).map_err(|e| (-32000, e.to_string(), None))
+                    }),
+                Err(_) => Err((-32602, "invalid daemon.panic parameters".into(), None)),
+            };
+            (
+                match result {
+                    Ok(value) => rpc_ok(id, value),
+                    Err((code, message, data)) => rpc_err_with_data(id, code, message, data),
+                },
+                vec![],
+            )
+        }
+        "daemon.panic_clear" => {
+            let result = crate::panic_control::clear(state).await;
+            (
+                match result {
+                    Ok(value) => rpc_ok(id, serde_json::json!(value)),
+                    Err((code, message, data)) => rpc_err_with_data(id, code, message, data),
+                },
+                vec![],
+            )
+        }
+        "daemon.capabilities" | "privacy.matrix" | "privacy.probe" => {
+            let result = match req.method.as_str() {
+                "daemon.capabilities" => {
+                    crate::isolation::capabilities(state).await.and_then(|r| {
+                        serde_json::to_value(r).map_err(|e| (-32000, e.to_string(), None))
+                    })
+                }
+                "privacy.matrix" => crate::isolation::matrix(state).await.and_then(|r| {
+                    serde_json::to_value(r).map_err(|e| (-32000, e.to_string(), None))
+                }),
+                _ => match serde_json::from_value::<atomium_protocol::PrivacyProbeRequest>(
+                    object_params(&req.params),
+                ) {
+                    Ok(request) => crate::isolation::refresh(state, request.probe_ids)
+                        .await
+                        .and_then(|r| {
+                            serde_json::to_value(r).map_err(|e| (-32000, e.to_string(), None))
+                        }),
+                    Err(_) => Err((-32602, "invalid privacy.probe parameters".into(), None)),
+                },
+            };
+            (
+                match result {
+                    Ok(value) => rpc_ok(id, value),
+                    Err((code, message, data)) => rpc_err_with_data(id, code, message, data),
+                },
+                vec![],
+            )
+        }
         "daemon.ping" => (
             rpc_ok(
                 id,
@@ -150,7 +236,7 @@ pub async fn dispatch(
                     ),
                     vec![],
                 ),
-                Err((code, msg)) => (rpc_err(id, code, msg), vec![]),
+                Err((code, msg, data)) => (rpc_err_with_data(id, code, msg, data), vec![]),
             },
             Err(e) => (
                 rpc_err(id, -32602, format!("invalid runs.start params: {e}")),
@@ -351,5 +437,41 @@ pub async fn dispatch(
             rpc_err(id, -32601, format!("method not found: {other}")),
             vec![],
         ),
+    }
+}
+
+fn object_params(value: &serde_json::Value) -> serde_json::Value {
+    if value.is_null() {
+        serde_json::json!({})
+    } else {
+        value.clone()
+    }
+}
+
+#[cfg(test)]
+mod strict_optional_params_tests {
+    use super::*;
+    #[test]
+    fn null_is_empty_and_unknown_fields_are_rejected() {
+        for value in [serde_json::Value::Null, serde_json::json!({})] {
+            assert!(
+                serde_json::from_value::<atomium_protocol::DaemonPanicRequest>(object_params(
+                    &value
+                ))
+                .is_ok()
+            );
+            assert!(
+                serde_json::from_value::<atomium_protocol::PrivacyProbeRequest>(object_params(
+                    &value
+                ))
+                .is_ok()
+            );
+        }
+        let unknown = object_params(&serde_json::json!({"unknown":true}));
+        assert!(
+            serde_json::from_value::<atomium_protocol::DaemonPanicRequest>(unknown.clone())
+                .is_err()
+        );
+        assert!(serde_json::from_value::<atomium_protocol::PrivacyProbeRequest>(unknown).is_err());
     }
 }

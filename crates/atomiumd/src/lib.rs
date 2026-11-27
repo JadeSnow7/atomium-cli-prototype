@@ -1,3 +1,6 @@
+mod instance_lock;
+mod isolation;
+mod panic_control;
 mod redact;
 mod rpc;
 mod session_engine;

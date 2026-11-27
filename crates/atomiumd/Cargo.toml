@@ -12,6 +12,7 @@ atomium-protocol = { path = "../atomium-protocol" }
 atomium-runtime = { path = "../atomium-runtime" }
 base64.workspace = true
 hex.workspace = true
+libc.workspace = true
 rand.workspace = true
 regex.workspace = true
 serde.workspace = true

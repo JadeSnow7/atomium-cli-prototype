@@ -335,9 +335,16 @@ pub(crate) fn emit_bounded_log_line(
     redactor: &SecretRedactor,
     emitted_bytes: &mut usize,
     truncation_notified: &mut bool,
-) {
+) -> bool {
     if *truncation_notified {
-        return;
+        return false;
+    }
+    // Normal event writes can wait on SQLite longer than the panic budget.
+    if state
+        .panic_latched
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return true;
     }
     let redacted = redactor.redact(line);
     let prospective = emitted_bytes.saturating_add(redacted.len().saturating_add(1));
@@ -352,7 +359,7 @@ pub(crate) fn emit_bounded_log_line(
                 ),
             },
         );
-        return;
+        return false;
     }
     *emitted_bytes = prospective;
     let _ = state.emit_event(
@@ -362,6 +369,7 @@ pub(crate) fn emit_bounded_log_line(
             line: redacted,
         },
     );
+    false
 }
 
 #[cfg(test)]

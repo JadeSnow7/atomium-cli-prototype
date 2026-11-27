@@ -138,7 +138,7 @@ test('events.push advances cursor monotonically and unsubscribe stops deliveries
 
   transport.emitMessage({
     method: 'events.push',
-    params: { seq: 5, run_id: 'r1', timestamp_ms: 100, payload: { type: 'run_started' } },
+    params: { seq: 5, run_id: 'r1', timestamp_ms: 100, payload: { type: 'status_changed', status: 'running', reason: null } },
   });
   assert.equal(client.cursor, 5);
   assert.equal(received.length, 1);
@@ -146,11 +146,11 @@ test('events.push advances cursor monotonically and unsubscribe stops deliveries
   // Duplicate and lower seq must not move cursor backwards
   transport.emitMessage({
     method: 'events.push',
-    params: { seq: 5, run_id: 'r1', timestamp_ms: 101, payload: { type: 'run_started' } },
+    params: { seq: 5, run_id: 'r1', timestamp_ms: 101, payload: { type: 'status_changed', status: 'running', reason: null } },
   });
   transport.emitMessage({
     method: 'events.push',
-    params: { seq: 3, run_id: 'r1', timestamp_ms: 102, payload: { type: 'run_started' } },
+    params: { seq: 3, run_id: 'r1', timestamp_ms: 102, payload: { type: 'status_changed', status: 'running', reason: null } },
   });
   assert.equal(client.cursor, 5);
   assert.equal(received.length, 3);
@@ -159,7 +159,7 @@ test('events.push advances cursor monotonically and unsubscribe stops deliveries
 
   transport.emitMessage({
     method: 'events.push',
-    params: { seq: 10, run_id: 'r1', timestamp_ms: 103, payload: { type: 'run_started' } },
+    params: { seq: 10, run_id: 'r1', timestamp_ms: 103, payload: { type: 'status_changed', status: 'running', reason: null } },
   });
   assert.equal(client.cursor, 10);
   assert.equal(received.length, 3);
@@ -175,7 +175,7 @@ test('reconnect automatically re-subscribes with the latest cursor', async () =>
 
   transport.emitMessage({
     method: 'events.push',
-    params: { seq: 17, run_id: 'r1', timestamp_ms: 200, payload: { type: 'run_started' } },
+    params: { seq: 17, run_id: 'r1', timestamp_ms: 200, payload: { type: 'status_changed', status: 'running', reason: null } },
   });
   assert.equal(client.cursor, 17);
 
@@ -314,4 +314,22 @@ test('AtomiumRpcError recognizes export inconsistency by code or structured kind
   assert.equal(new AtomiumRpcError(-32000, 'recovery failed', { kind: 'export_inconsistent' }).isExportInconsistent(), true);
   assert.equal(new AtomiumRpcError(-32010, 'baseline conflict').isExportInconsistent(), false);
   assert.equal(new AtomiumRpcError(-32000, 'internal error', null).isExportInconsistent(), false);
+});
+
+
+test('mixed known and future events advance the cursor while future payloads are skipped', () => {
+  const transport = createMockTransport();
+  const client = new AtomiumClient(transport);
+  const events = [];
+  client.onEvent(event => events.push(event));
+  for (const [seq, payload] of [
+    [1, { type: 'log_line', stream: 'stdout', line: 'first' }],
+    [2, { type: 'future_event', value: true }],
+    [3, { type: 'status_changed', status: 'stopped', reason: null }],
+    [4, { type: 'another_future_event' }],
+  ]) {
+    transport.emitMessage({ method: 'events.push', params: { seq, run_id: 'run-test', timestamp_ms: 1, payload } });
+  }
+  assert.equal(client.cursor, 4);
+  assert.deepEqual(events.map(event => event.seq), [1, 3]);
 });

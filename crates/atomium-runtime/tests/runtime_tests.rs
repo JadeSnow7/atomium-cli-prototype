@@ -188,6 +188,9 @@ async fn macos_seatbelt_backend_probe_returns_consistent_report_and_evidences() 
             "host_secret_read_denied",
             "direct_egress_denied",
             "unauthorized_localhost_denied",
+            "control_socket_connect_denied",
+            "iokit_identity_denied",
+            "pasteboard_read_denied",
         ]
     );
 
@@ -204,13 +207,13 @@ async fn macos_seatbelt_backend_probe_returns_consistent_report_and_evidences() 
     } else if all_passed {
         assert_eq!(report.file_isolation, "enforced_verified");
         assert_eq!(report.egress_enforcement, "enforced_verified");
-        assert_eq!(report.keychain_isolation, "enforced_verified");
-        assert_eq!(report.location_blocked, "enforced_verified");
+        assert_eq!(report.keychain_isolation, "unverified");
+        assert_eq!(report.location_blocked, "unverified");
     } else {
         assert_eq!(report.file_isolation, "unverified");
         assert_eq!(report.egress_enforcement, "unverified");
-        assert_eq!(report.keychain_isolation, "enforced_verified");
-        assert_eq!(report.location_blocked, "enforced_verified");
+        assert_eq!(report.keychain_isolation, "unverified");
+        assert_eq!(report.location_blocked, "unverified");
     }
 }
 

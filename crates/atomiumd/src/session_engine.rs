@@ -126,9 +126,81 @@ enum CredentialProjection {
     },
 }
 
+async fn cleanup_panic_directory(
+    backend: Arc<dyn atomium_runtime::RuntimeBackend>,
+    path: PathBuf,
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::task::spawn_blocking(move || backend.cleanup_run_env(&path))
+        )
+        .await,
+        Ok(Ok(true))
+    )
+}
+
+struct StartRegistration {
+    state: Arc<DaemonState>,
+    run_id: String,
+    done: watch::Sender<bool>,
+}
+impl Drop for StartRegistration {
+    fn drop(&mut self) {
+        let state = self.state.clone();
+        let id = self.run_id.clone();
+        let done = self.done.clone();
+        tokio::spawn(async move {
+            state.preflight_runs.lock().await.remove(&id);
+            state.pending_runs.lock().await.remove(&id);
+            done.send_replace(true);
+        });
+    }
+}
+
 pub(crate) async fn handle_runs_start(
     state: &Arc<DaemonState>,
     req: RunStartRequest,
+) -> std::result::Result<RunRecord, crate::rpc::RpcErr> {
+    crate::isolation::ensure(state).await?;
+    let run_id = format!("run-{}", uuid::Uuid::now_v7());
+    let (cancel, _) = watch::channel(false);
+    let (done, _) = watch::channel(false);
+    let (terminal, _) = watch::channel(None);
+    let _registration = StartRegistration {
+        state: state.clone(),
+        run_id: run_id.clone(),
+        done: done.clone(),
+    };
+    let control = crate::state::PendingRunControl {
+        cancel: cancel.clone(),
+        done: done.clone(),
+        terminal: terminal.clone(),
+    };
+    let result = start_after_probes(state, req, &run_id, control).await;
+    state.preflight_runs.lock().await.remove(&run_id);
+    state.pending_runs.lock().await.remove(&run_id);
+    done.send_replace(true);
+    if result.is_err()
+        && (*cancel.borrow()
+            || state
+                .panic_latched
+                .load(std::sync::atomic::Ordering::SeqCst))
+    {
+        return Err(crate::isolation::panic_error());
+    }
+    result.map_err(|(code, message)| {
+        let data =
+            (code == -32003).then(|| serde_json::json!({"kind":"isolation_policy_unloadable"}));
+        (code, message, data)
+    })
+}
+
+async fn start_after_probes(
+    state: &Arc<DaemonState>,
+    req: RunStartRequest,
+    run_id: &str,
+    control: crate::state::PendingRunControl,
 ) -> std::result::Result<RunRecord, (i32, String)> {
     validate_run_request_security(&req)?;
 
@@ -182,7 +254,115 @@ pub(crate) async fn handle_runs_start(
         None => None,
     };
 
-    let run_id = format!("run-{}", uuid::Uuid::now_v7());
+    let run_id = run_id.to_owned();
+    let mut pending_cancel = control.cancel.subscribe();
+
+    // Reserve only the port before preflight. The gateway is activated after preparation.
+    let reserved_listener = tokio::net::TcpSocket::new_v4().map_err(|e| (-32000, e.to_string()))?;
+    reserved_listener
+        .bind("127.0.0.1:0".parse().expect("literal address"))
+        .map_err(|e| (-32000, e.to_string()))?;
+    if runtime_backend.is_isolated() {
+        let planned = atomium_runtime::PreparedRunEnvironment {
+            run_dir: state.runs_dir.join(&run_id),
+            workspace_dir: brokered_workspace_dir
+                .clone()
+                .unwrap_or_else(|| state.runs_dir.join(&run_id).join("workspace")),
+            run_home_dir: state.runs_dir.join(&run_id).join("home"),
+            run_tmp_dir: state.runs_dir.join(&run_id).join("tmp"),
+            run_cache_dir: state.runs_dir.join(&run_id).join("cache"),
+        };
+        let spec = RuntimeSpawnSpec {
+            env: planned,
+            program: req.program.clone(),
+            args: req.args.clone(),
+            extra_env: vec![],
+            allowed_proxy_port: Some(
+                reserved_listener
+                    .local_addr()
+                    .map_err(|e| (-32003, e.to_string()))?
+                    .port(),
+            ),
+            keychain_policy: KeychainPolicy::for_credential(&profile.credential),
+            timezone: profile.locale_policy.timezone.clone(),
+            lang: profile.locale_policy.lang.clone(),
+        };
+        if std::path::Path::new(&req.program).is_absolute() {
+            std::fs::canonicalize(&req.program)
+                .map_err(|_| (-32602, "program path cannot be canonicalized".into()))?;
+        }
+        let policy = atomium_runtime::probes::render_policy_for_spec(&spec)
+            .map_err(|_| (-32003, "isolation_policy_unloadable".into()))?;
+        #[cfg(test)]
+        let injected = state
+            .policy_render_injector
+            .lock()
+            .expect("policy injector poisoned")
+            .clone();
+        #[cfg(test)]
+        let policy = if injected.as_ref().is_some_and(|i| i.malformed) {
+            "invalid SBPL".to_owned()
+        } else {
+            policy
+        };
+        let mut fixture = {
+            let _gate = state.spawn_gate.lock().await;
+            if state
+                .panic_latched
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err((-32002, "panic_latched".into()));
+            }
+            state
+                .preflight_runs
+                .lock()
+                .await
+                .insert(run_id.clone(), control.clone());
+            #[cfg(test)]
+            let fixture = if injected.as_ref().is_some_and(|i| i.hold_fixture) {
+                atomium_runtime::probes::PolicyPreflight::spawn_test_fixture(&policy)
+            } else {
+                atomium_runtime::probes::PolicyPreflight::spawn(&policy)
+            };
+            #[cfg(not(test))]
+            let fixture = atomium_runtime::probes::PolicyPreflight::spawn(&policy);
+            fixture.map_err(|_| (-32003, "isolation_policy_unloadable".into()))?
+        };
+        #[cfg(test)]
+        if let Some(entered) = injected
+            .as_ref()
+            .and_then(|injected| injected.entered.as_ref())
+        {
+            entered.notify_one();
+        }
+        let elapsed = tokio::select! {
+            result = fixture.wait() => result.map_err(|_|(-32003,"isolation_policy_unloadable".into()))?,
+            _ = pending_cancel.changed() => {
+                fixture.cancel_and_reap().await.map_err(|e|(-32000,e.to_string()))?;
+                return Err((-32002,"panic_latched".into()));
+            }
+        };
+        tracing::debug!(
+            elapsed_ms = elapsed.as_millis(),
+            "rendered isolation policy preflight passed"
+        );
+    }
+    {
+        let _gate = state.spawn_gate.lock().await;
+        state.preflight_runs.lock().await.remove(&run_id);
+        if *pending_cancel.borrow()
+            || state
+                .panic_latched
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err((-32002, "panic_latched".into()));
+        }
+        state
+            .pending_runs
+            .lock()
+            .await
+            .insert(run_id.clone(), control.clone());
+    }
 
     // 1. Atomically acquire multi-resource leases (Profile OAuth Exclusive / credential Shared).
     let mut lease_reqs = Vec::new();
@@ -223,6 +403,10 @@ pub(crate) async fn handle_runs_start(
             .map_err(|e| (-32009, e.to_string()))?;
     }
 
+    if *pending_cancel.borrow() {
+        let _ = state.leases.release_all(&run_id);
+        return Err((-32002, "daemon panic latched".into()));
+    }
     // From here on, any early failure MUST release leases and clean up run_dir.
     let run_dir = state.runs_dir.join(&run_id);
 
@@ -239,6 +423,7 @@ pub(crate) async fn handle_runs_start(
         )?;
         let run_home = &run_env.run_home_dir;
 
+        if *pending_cancel.borrow() { anyhow::bail!("daemon panic latched"); }
         // 2. Project OAuth credentials into isolated $HOME (0600 decoded JSON) or HostKeychainSlot.
         let (projection, initial_ver, secret_redactor) = match &profile.credential {
             CredentialSpec::OauthSnapshot {
@@ -330,19 +515,25 @@ pub(crate) async fn handle_runs_start(
         }
     };
 
+    if *pending_cancel.borrow() {
+        let _ = runtime_backend.cleanup_run_env(&run_dir);
+        let _ = state.leases.release_all(&run_id);
+        return Err((-32002, "daemon panic latched".into()));
+    }
     // 3. Start per-run Fail-Closed Egress Proxy.
     let ephemeral_token = random_ephemeral_token();
     secret_redactor.add_secret_bytes(ephemeral_token.as_bytes());
     // The proxy URL and Basic authentication encode the same per-run credentials differently.
     secret_redactor.add_secret_bytes(format!("{run_id}:{ephemeral_token}").as_bytes());
-    let proxy_handle = match start_run_egress_proxy(&run_id, &ephemeral_token, &req).await {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = runtime_backend.cleanup_run_env(&run_dir);
-            let _ = state.leases.release_all(&run_id);
-            return Err((-32000, format!("failed to start egress proxy: {e}")));
-        }
-    };
+    let proxy_handle =
+        match start_run_egress_proxy(&run_id, &ephemeral_token, &req, reserved_listener).await {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = runtime_backend.cleanup_run_env(&run_dir);
+                let _ = state.leases.release_all(&run_id);
+                return Err((-32000, format!("failed to start egress proxy: {e}")));
+            }
+        };
 
     let proxy_port = proxy_handle.local_port;
     let proxy_url = proxy_handle.proxy_url.clone();
@@ -366,7 +557,7 @@ pub(crate) async fn handle_runs_start(
         updated_at_ms: created_at_ms,
     };
     if let Err(e) = state.runs.upsert(&record) {
-        proxy_handle.revoke();
+        drop(proxy_handle.revoke());
         let _ = runtime_backend.cleanup_run_env(&run_dir);
         let _ = state.leases.release_all(&run_id);
         return Err((-32000, e.to_string()));
@@ -422,7 +613,7 @@ pub(crate) async fn handle_runs_start(
     };
 
     let prepared_cmd = runtime_backend.prepare_command(&spawn_spec).map_err(|e| {
-        proxy_handle.revoke();
+        drop(proxy_handle.revoke());
         let _ = runtime_backend.cleanup_run_env(&run_dir);
         let _ = state.leases.release_all(&run_id);
         record.status = TaskStatus::Blocked;
@@ -442,32 +633,43 @@ pub(crate) async fn handle_runs_start(
     #[cfg(test)]
     if let Some((entered, resume)) = state.before_spawn_hook.lock().await.take() {
         entered.notify_one();
-        resume.notified().await;
+        tokio::select! { _=resume.notified()=>{}, _=pending_cancel.changed()=>{} }
     }
 
+    let spawn_guard = state.spawn_gate.lock().await;
+    if *pending_cancel.borrow()
+        || state
+            .panic_latched
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        drop(spawn_guard);
+        let gateway_closed = proxy_handle.revoke().await.is_ok();
+        record.cleanup_verified = cleanup_panic_directory(runtime_backend.clone(), run_dir.clone())
+            .await
+            && gateway_closed;
+        record.status = if record.cleanup_verified {
+            TaskStatus::Stopped
+        } else {
+            TaskStatus::CleanupUnverified
+        };
+        record.reason = Some("daemon_panic".into());
+        record.updated_at_ms = now_ms();
+        let terminal = crate::panic_control::finish_record(state, &record, false).await;
+        control.terminal.send_replace(Some(terminal));
+        return Err((-32002, "panic_latched".into()));
+    }
+    state.pending_runs.lock().await.remove(&run_id);
     let (cancel_tx, mut cancel_rx) = watch::channel::<Option<String>>(None);
     let egress_slot = Arc::new(Mutex::new(Some(proxy_handle)));
     let done_notify = Arc::new(Notify::new());
-
-    {
-        let mut active = state.active_runs.lock().await;
-        active.insert(
-            run_id.clone(),
-            ActiveRunControl {
-                cancel_tx,
-                egress_handle: egress_slot.clone(),
-                done_notify: done_notify.clone(),
-                workspace_dir: canon_ws,
-            },
-        );
-    }
+    let (active_terminal, _) = watch::channel(None);
 
     let mut spawned = match runtime_backend.spawn(prepared_cmd) {
         Ok(s) => s,
         Err(e) => {
-            state.active_runs.lock().await.remove(&run_id);
+            drop(spawn_guard);
             if let Some(proxy) = egress_slot.lock().await.take() {
-                proxy.revoke();
+                let _ = proxy.revoke().await;
             }
             done_notify.notify_waiters();
             let _ = runtime_backend.cleanup_run_env(&run_dir);
@@ -486,6 +688,22 @@ pub(crate) async fn handle_runs_start(
             return Err((-32000, format!("failed to spawn process: {e}")));
         }
     };
+
+    {
+        let mut active = state.active_runs.lock().await;
+        active.insert(
+            run_id.clone(),
+            ActiveRunControl {
+                cancel_tx,
+                egress_handle: egress_slot.clone(),
+                done_notify: done_notify.clone(),
+                terminal: active_terminal.clone(),
+                workspace_dir: canon_ws,
+            },
+        );
+    }
+
+    drop(spawn_guard);
 
     // 6. Persist child process group (for crash recovery) and transition to Running.
     let child_pgid = spawned.pgid;
@@ -535,6 +753,7 @@ pub(crate) async fn handle_runs_start(
                 let mut reader = BufReader::new(out);
                 let mut emitted_bytes = 0usize;
                 let mut truncation_notified = false;
+                let mut discarded_during_panic = false;
                 while let Ok(Some(line)) = read_bounded_child_line(&mut reader).await {
                     if truncation_notified {
                         continue;
@@ -547,7 +766,7 @@ pub(crate) async fn handle_runs_start(
                             .is_err())
                         || redactor.digest_only;
                     let line = line.into_audit_text(digest_only);
-                    emit_bounded_log_line(
+                    discarded_during_panic |= emit_bounded_log_line(
                         &st,
                         &rid,
                         "stdout",
@@ -557,6 +776,7 @@ pub(crate) async fn handle_runs_start(
                         &mut truncation_notified,
                     );
                 }
+                discarded_during_panic
             })
         });
 
@@ -570,6 +790,7 @@ pub(crate) async fn handle_runs_start(
                 let mut reader = BufReader::new(err_pipe);
                 let mut emitted_bytes = 0usize;
                 let mut truncation_notified = false;
+                let mut discarded_during_panic = false;
                 while let Ok(Some(line)) = read_bounded_child_line(&mut reader).await {
                     if truncation_notified {
                         continue;
@@ -582,7 +803,7 @@ pub(crate) async fn handle_runs_start(
                             .is_err())
                         || redactor.digest_only;
                     let line = line.into_audit_text(digest_only);
-                    emit_bounded_log_line(
+                    discarded_during_panic |= emit_bounded_log_line(
                         &st,
                         &rid,
                         "stderr",
@@ -592,6 +813,7 @@ pub(crate) async fn handle_runs_start(
                         &mut truncation_notified,
                     );
                 }
+                discarded_during_panic
             })
         });
 
@@ -619,6 +841,7 @@ pub(crate) async fn handle_runs_start(
 
         let mut cancelled_reason: Option<String> = None;
         let mut exit_code: Option<i32> = None;
+        let mut processes_verified = true;
 
         tokio::select! {
             status_res = spawned.child.wait() => {
@@ -635,14 +858,18 @@ pub(crate) async fn handle_runs_start(
                 cancelled_reason = Some(reason);
                 // Ensure egress is revoked BEFORE terminating child.
                 if let Some(handle) = egress_slot.lock().await.take() {
-                    handle.revoke();
+                    drop(handle.revoke());
                 }
-                sup_backend.terminate(&mut spawned).await;
+                if cancelled_reason.as_deref() == Some("daemon_panic") {
+                    processes_verified=atomium_runtime::process::terminate_for_panic(&mut spawned).await;
+                } else {
+                    sup_backend.terminate(&mut spawned).await;
+                }
             }
             _ = &mut timeout_fut => {
                 cancelled_reason = Some("timeout".into());
                 if let Some(handle) = egress_slot.lock().await.take() {
-                    handle.revoke();
+                    drop(handle.revoke());
                 }
                 let _ = sup_state.emit_event(
                     &sup_run_id,
@@ -659,16 +886,33 @@ pub(crate) async fn handle_runs_start(
 
         // Always revoke egress proxy before finishing.
         if let Some(handle) = egress_slot.lock().await.take() {
-            handle.revoke();
+            drop(handle.revoke());
         }
 
-        // Wait for log readers to drain so LogLine events precede terminal StatusChanged.
-        if let Some(t) = stdout_task {
-            let _ = tokio::time::timeout(Duration::from_secs(2), t).await;
+        if cancel_rx.borrow().as_deref() == Some("daemon_panic") {
+            cancelled_reason = Some("daemon_panic".into());
         }
-        if let Some(t) = stderr_task {
-            let _ = tokio::time::timeout(Duration::from_secs(2), t).await;
+        let panic_run = cancelled_reason.as_deref() == Some("daemon_panic");
+        let mut readers: Vec<_> = [stdout_task, stderr_task].into_iter().flatten().collect();
+        let drain_budget = if panic_run {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(4)
+        };
+        let drain = tokio::time::timeout(drain_budget, async {
+            let mut discarded_during_panic = false;
+            for reader in &mut readers {
+                discarded_during_panic |= reader.await.unwrap_or(true);
+            }
+            discarded_during_panic
+        })
+        .await;
+        if drain.is_err() {
+            for reader in &readers {
+                reader.abort();
+            }
         }
+        let log_truncated = drain.unwrap_or(true);
 
         // If the run exited normally (not cancelled/timed out), check for OAuth token refresh
         // and atomically write back to Vault + bump snapshot_version BEFORE deleting run_dir.
@@ -816,6 +1060,33 @@ pub(crate) async fn handle_runs_start(
         }
 
         // Remove isolated run directory and verify cleanup.
+        if panic_run {
+            let dir_cleaned = cleanup_panic_directory(sup_backend.clone(), run_dir.clone()).await;
+            let cleanup_verified = dir_cleaned && processes_verified;
+            if !cleanup_verified {
+                tracing::warn!(
+                    run_id = %sup_run_id,
+                    dir_cleaned,
+                    processes_verified,
+                    "panic cleanup verification failed"
+                );
+            }
+            sup_record.cleanup_verified = cleanup_verified;
+            sup_record.exit_code = exit_code;
+            sup_record.status = if cleanup_verified {
+                TaskStatus::Stopped
+            } else {
+                TaskStatus::CleanupUnverified
+            };
+            sup_record.reason = Some("daemon_panic".into());
+            sup_record.updated_at_ms = now_ms();
+            let terminal =
+                crate::panic_control::finish_record(&sup_state, &sup_record, log_truncated).await;
+            active_terminal.send_replace(Some(terminal));
+            sup_state.active_runs.lock().await.remove(&sup_run_id);
+            done_notify.notify_waiters();
+            return;
+        }
         let cleanup_verified = sup_backend.cleanup_run_env(&run_dir);
         let _ = sup_state.runs.clear_child_process(&sup_run_id);
 
@@ -849,6 +1120,7 @@ pub(crate) async fn handle_runs_start(
             },
         );
 
+        active_terminal.send_replace(Some(sup_record));
         sup_state.active_runs.lock().await.remove(&sup_run_id);
         done_notify.notify_waiters();
     });
@@ -876,7 +1148,7 @@ pub(crate) async fn handle_runs_cancel(
     if let Some((egress_slot, cancel_tx, done_notify)) = control {
         // 1. Immediately revoke egress proxy BEFORE terminating the child process.
         if let Some(handle) = egress_slot.lock().await.take() {
-            handle.revoke();
+            drop(handle.revoke());
         }
 
         // 2. Mark status as Revoking & emit StatusChanged event.
@@ -946,5 +1218,57 @@ pub(crate) async fn invalidate_run_candidates_and_approvals(state: &DaemonState,
                 },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn panicking_start_removes_both_registrations_and_signals_done() {
+        let root =
+            std::env::temp_dir().join(format!("atomium-registration-{}", uuid::Uuid::now_v7()));
+        let state = Arc::new(DaemonState::open(&root.join("state.sqlite")).unwrap());
+        let (cancel, _) = watch::channel(false);
+        let (done, mut receiver) = watch::channel(false);
+        let (terminal, _) = watch::channel(None);
+        let control = crate::state::PendingRunControl {
+            cancel,
+            done: done.clone(),
+            terminal,
+        };
+        state
+            .preflight_runs
+            .lock()
+            .await
+            .insert("fixture".into(), control.clone());
+        state
+            .pending_runs
+            .lock()
+            .await
+            .insert("fixture".into(), control);
+        let guard = StartRegistration {
+            state: state.clone(),
+            run_id: "fixture".into(),
+            done,
+        };
+        assert!(tokio::spawn(async move {
+            let _guard = guard;
+            panic!("injected start task panic");
+        })
+        .await
+        .is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*receiver.borrow_and_update() {
+                receiver.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.preflight_runs.lock().await.is_empty());
+        assert!(state.pending_runs.lock().await.is_empty());
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

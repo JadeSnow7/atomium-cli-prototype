@@ -117,10 +117,11 @@ flowchart TB
 
 1. **锁定系统版本与启动前强探针（Fail-Closed）**
    - Apple 将 `sandbox-exec` 与自定义 SBPL 视为已弃用的内部实现细节，行为可能随 macOS 大版本变化。
-   - 因此 L1 运行时必须在能力报告中记录确切 `os_version` 与策略版本号；守护进程在生产模式下启动会话前，必须确保核心隔离探针通过（包括：**宿主私密文件读取被拒、绕过网关直连公网被拒、访问未授权本机端口被拒、沙箱内连接控制面 `atomiumd.sock` 被拒**）。一旦策略装载失败或任一必要探针未通过，生产运行必须拒绝启动并返回 `-32003`。
+   - L1 运行时在能力报告中记录 `os_version`、`os_build` 和 `sbpl_template_digest`。守护进程按 OS build、模板摘要和后端版本缓存探针，缓存有效期为 24 小时。生产运行启动前须确认七项必选探针通过，并验证本次渲染的策略可以装载。任一必选探针或装载预检未通过时，守护进程在申请租约、创建运行目录和写入运行记录前返回 `-32003`。
+   - `direct_egress_denied` 在宿主与 Box 内用同一解释器和脚本尝试连接 RFC 5737 TEST-NET-1 地址 `192.0.2.1:80`。Box 返回 `EPERM` 或 `EACCES`，且宿主能够连接或仅遇到常规网络错误时，判定为通过。宿主也遭策略拒绝或无法归因时，探针失败。
 2. **`RuntimeBackend` 生命周期接口实心化**
-   - 当前 [`crates/atomium-runtime/src/backend.rs`](../crates/atomium-runtime/src/backend.rs) 仅定义了 `name()` 与 `probe()`，进程参数拼装仍散落在 `atomiumd` 中。
-   - 在 Phase 1 中，先围绕 L1 的真实需求将环境准备、受限进程/PTY 启动、信号停止与退出回收收敛进 `RuntimeBackend`，避免 `atomiumd` 直接耦合 `sandbox-exec` 命令行，为 Phase 2 接入 L3 Linux VM 容器提供干净的替换接缝。
+   - P1.0 后，[`RuntimeBackend`](../crates/atomium-runtime/src/backend.rs) 负责环境准备、运行命令构造、管道进程启动、进程组终止与运行目录清理。`atomiumd` 负责协调凭据、工作区租约、出网、状态持久化和事件。
+   - PR 1.1a 将本次策略的装载预检与正式启动分开。后端在私有临时夹具中验证策略，守护进程在预检后协调熔断锁存、待启动登记和正式进程启动。
 
 ### 3.3 Computer Use（桌面视觉与键鼠操控）双轨保留方案
 
@@ -202,7 +203,7 @@ enum OutboundMode {
 
 由于 Phase 1 的 L1 免 `sudo` 与宿主运行在同一系统 UID 下，`atomiumd.sock` 的文件权限 `0600` 与 `getpeereid()` 均无法单独区分“宿主机可信面板”与“L1 沙箱内的 Agent 进程”。因此，双 Socket 架构必须同时通过 Seatbelt 路径隔离与服务端句柄绑定来强制执行，并将以下 **5 条列为门户上线前的自动化必测条件**：
 
-1. **沙箱直连控制面被拒**：在 L1 Seatbelt 内实际发起对宿主 `atomiumd.sock` 的连接，必须被内核沙盒拒绝（`EPERM` / `EACCES`）。
+1. **沙箱直连控制面被拒**：守护进程发布控制 socket 后，在 L1 Seatbelt 内尝试连接其配置路径和规范化路径，并按需补测 `/var` 或 `/tmp` 别名。每条路径先通过宿主侧连接确认可达，沙箱侧须返回 `EPERM` 或 `EACCES`，结果以 `target = "control_socket"` 留证。启动请求等待该轮探针，探针期间只读控制面仍可用。离线 `atomium doctor --emit-evidence <dir>` 只连接自建的金丝雀 listener，证据标为 `target = "canary"`。
 2. **最小门户可见性**：L1 进程只能看到并连接守护进程放入其私有运行目录的专属门户入口 `runs_dir/<session_id>/portal.sock`（L3/L2 对应各自独立的 `virtio-vsock` 连接实例）。
 3. **服务端静态绑定会话身份**：守护进程在对应会话的专属 `portal.sock` listener 上收到连接时，直接将该连接绑定至服务端已知的 `session_id` 与授权集合，**绝不采信请求载荷中自报的 `box_id` 或 `session_id`**。
 4. **门户分发器物理裁剪控制面方法**：门户监听端挂载独立的只读/请求型方法表（仅响应 `portals.invoke` 等门户调用），在代码路由层物理不含 `grants.create`、`approvals.resolve`、`portals.decide`、`upstreams.*` 等任何提权或裁决方法。

@@ -1,7 +1,5 @@
 use anyhow::Result;
-use atomium_gateway::{
-    normalize_allowlist_pattern, spawn_run_proxy_with_policy, EgressProxyHandle,
-};
+use atomium_gateway::{normalize_allowlist_pattern, EgressProxyHandle};
 use atomium_protocol::RunStartRequest;
 
 pub(crate) fn validate_egress_request(
@@ -29,17 +27,20 @@ pub(crate) async fn start_run_egress_proxy(
     run_id: &str,
     ephemeral_token: &str,
     req: &RunStartRequest,
+    listener: tokio::net::TcpSocket,
 ) -> Result<EgressProxyHandle> {
     let allowlist = if req.allowed_egress_hosts.is_empty() {
         None
     } else {
         Some(req.allowed_egress_hosts.clone())
     };
-    spawn_run_proxy_with_policy(
+    atomium_gateway::egress::spawn_run_proxy_on_listener(
+        listener.listen(128)?,
         run_id,
         ephemeral_token,
         req.upstream_proxy_addr.clone(),
         allowlist,
+        atomium_gateway::EgressProxyConfig::default(),
     )
     .await
 }
