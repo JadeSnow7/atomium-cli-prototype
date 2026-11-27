@@ -219,15 +219,22 @@
 
 > 实施阶段按 PR 逐项回填。证据不得包含明文凭据，只能是摘要或本地 `out/` 中已脱敏的产物。
 
-- 交付提交：1.1a `<pending>`，1.1b `<pending>`，1.1c `<pending>`
+- 1.1a 本地实现提交 `b56e6ed59913c852743d78e8f9bc68ec2235ccad`。正式 spawn 失败的状态编码仍待 RA-1 偏差裁决。1.1b、1.1c 待交付。
 - E1–E4 实验记录（`40bd539`，2026-11-27，macOS 26.7.3 `25G342`，Darwin arm64）。原生前置命令 `sandbox-exec -p '(version 1)(allow default)' /usr/bin/true` 退出 0。以下脚本均在仓库根目录运行，策略来自当前 `macos_seatbelt.rs` 模板，实验增量随夹具留存。实验 listener、socket 节点和子进程已清理。
   - **E1 ①–⑦ 夹具通过**。执行 `python3 -B out/p1-1-exp/e1/run.py`、`python3 -B out/p1-1-exp/e1/supplement.py`。宿主对自身门户、外会话门户、模拟 `atomiumd.sock` 及其 `/var/../..` 别名均可连。模拟控制面按短临时名 bind、`0600`、rename 发布。Box 按原文 `path-literal` 连自身 `p/<12hex>.s` 并交换 NDJSON，连接其余目标（含两个 Box 内符号链接、两个 chdir 后的相对路径）均为 `EPERM=1`。`p/` 的 stat 成功，readdir 返回 `EPERM=1`，ls 同样报 Operation not permitted。Node 与 Python 启动及 stdout/stderr 正常，`com.apple.system.logger` 的 Mach lookup 返回 0 且端口有效。shim 的链接目录与目标都放行后可读、可执行，写 shim 被拒。只放行链接目录时也可执行，这与现有全局 `process-exec` 一致，读取仍被拒。实际默认 `$TMPDIR/atomiumd.sock` 不存在，别名证据来自 `/var/../..` 指向同一仓库内 listener，真实 `/var/folders` 控制面及 E-17 live 门禁留待 1.1a。证据 `out/p1-1-exp/e1/{results,supplement-results}.json`。
   - **E-16 预检通过**。执行 `python3 -B out/p1-1-exp/e1/preflight.py`，用未创建的本次运行目录渲染策略，在独立夹具工作目录执行 `sandbox-exec -p <sbpl> /usr/bin/true`，21 次退出均为 0。首个样本 **7.28 ms**，随后 20 次平均 **6.52 ms**。E1 门户策略另测 **7.52 ms / 6.37 ms**（首个样本 / 随后 20 次均值）。证据 `out/p1-1-exp/e1/preflight-results.json` 和 `out/p1-1-exp/e1/results.json`。
   - **E2 ①–③ 通过，④ 的隐私口径记录于此**。执行 `python3 -B out/p1-1-exp/e2/run.py`（内含 clang 编译及 IOKit/CoreFoundation 链接）。宿主正对照与第 0 步中，`ioreg -rd1 -c IOPlatformExpertDevice` 与 `IORegistryEntryCreateCFProperty` 均能读取两项属性，因此当前基线应说明该项 `HostVisible`。第 1 步加 `iokit-get-properties` 拒绝后，ioreg 仍枚举到设备且退出 0，两项值均缺失，C 直接查询两项均返回 NULL。Node 26.5.0、Python 3.15.0 启动正常，已安装的 Claude 2.1.332、Codex 0.172.0、agy 1.5.18 两步 `--version` 均退出 0，stdout/stderr 一致。仿 `node-machine-id` 的上游提取逻辑在运行时 PATH 下两步均找不到 ioreg，改用绝对路径时，第 0 步成功，第 1 步遇字段缺失产生 TypeError。已安装 CLI 版本探针无崩溃，未触发 O-5，无需试 user-client 变体。实际 `privacy.matrix` 字段、CLI 完整交互留待实现阶段验证。证据 `out/p1-1-exp/e2/results.json`，只记属性布尔值、状态和版本。
   - **E3 ⓪、②–⑤ 通过，① 部分失败，⑥ 失败并触发 O-6**。执行 `clang out/p1-1-exp/e3/probe.c -o out/p1-1-exp/e3/probe` 及 `python3 -B out/p1-1-exp/e3/run.py`。⓪ libc 的 master/slave 原子 `O_CLOEXEC` 均生效，`F_GETFD` 确认，无需回退。使用锁内 `ptsname`，并测得 `ptsname_r` 返回 0 同名。无 `process_group(0)` 时 `setsid` 和 `TIOCSCTTY` 成功，首领 PID、SID、PGID 一致。① sh 与 Python 均可回显和响应 Ctrl-C，前台作业退出，Python 收到 `KeyboardInterrupt`。sh 有基线选壳拒绝诊断，Python 3.15 pyrepl 受限后退回交互提示。现行 `target self` 下 shell 向后台子作业发 TERM 为 `EPERM=1`，替换为 `same-sandbox` 时返回 0，两个独立 sandbox 间的同类信号在对照中仍返回 `EPERM=1`。② 调整到 **119×41** 后收到 SIGWINCH 并读到新尺寸。③ 宿主以读写模式打开对照 tty，Box 打开同一外 tty 为 `EPERM=1`，自身 slave 与 `/dev/tty` 成功。④ `lsof -p` 核对独立 daemon 夹具在关 fd 后无残留，并发子会话未继承另一组 master/slave。⑤ 普通子进程 TERM 后消失，忽略 TERM 的子进程 KILL 后消失，另一次直接 KILL 两类均消失，均以 PID/start-time 核验。⑥ 双重 fork + setsid 的孙进程已重挂至 PID 1。用 Darwin SIGSTOP 冻结首领并以 `waitpid(WUNTRACED)` 确认后，`proc_listchildpids` 递归加 KILL 漏掉该身份，按独立记录补杀后消失。1.1c 待 Claude 裁决信号策略，O-6 待 Owner 裁决进程回收承诺。证据 `out/p1-1-exp/e3/results.json`。（r5 注：信号策略已按 E-35 裁决，O-6 已于 2026-11-27 获 Owner 批准。）
   - **E4 ①–③ 夹具通过**。执行 `python3 -B out/p1-1-exp/e4/run.py`。本机 `$TMPDIR` 含尾斜杠 **49 字节**。门户路径 / 同目录 `.sXXXXXX` 临时名预算（字节）为默认 `/var` **70 / 64**、规范化 `/private/var` **78 / 72**、LaunchAgent 8 字符用户及真实用户均 **73 / 67**、32 字符用户 **97 / 91**。C.1 的 72/96 应按实测预算修正为 73/97，结论仍低于 103。末尾保持规范门户文件名时，**103 字节**实 bind 成功，Seatbelt 内 Node、Python 从 `ATOMIUM_PORTAL_SOCKET` 连接并交换 NDJSON，**104 字节**由夹具在调用 bind 前拒绝。另一个较短 listener 上，规范路径、`/var/../..` 与 `/private/var/../../..` 形式在两种语言下均连接成功。实际 listener 位于仓库的 `out/` 内，真实 `/var/folders` bind 未做。证据 `out/p1-1-exp/e4/results.json`。
-- `TMPDIR=/tmp pnpm run ci:local` → `<pending>`
-- `cargo run -p atomium-cli -- doctor --emit-evidence ./out/p1-1-doctor` → `<pending>`
+- `pnpm run gen:protocol` 成功生成两套绑定。`TMPDIR=/tmp pnpm run ci:local` 在 macOS 26.7.3 `25G342` arm64 退出 0，格式检查、clippy `-D warnings`、协议同步、类型检查与构建均通过。工作区通过 252 项 Rust、54 项 TS/JS、21 项 Python、9 项 Shell 检查及 1 项跨层 E2E；协议同步另跑 47 项绑定导出用例，零漂移。日志与计数见 `out/p1-1a-validation/ci-local-verified.log`、`test-counts.json`。Linux 原生与 GitHub Actions 门禁本轮未运行。
+- 在 macOS 26.7.3 `25G342` arm64 上执行 `cargo run -p atomium-cli -- doctor --emit-evidence ./out/p1-1-doctor`，退出 0，七项必选探针全部通过。控制 socket 证据为 `target = "canary"`，宿主连接成功，Seatbelt 返回 `EPERM=1`。剪贴板只读，宿主 Mach 查询成功，Box 查询返回 1100，`pbpaste` 为空或失败。证据为 [`capabilities.json`](../../../out/p1-1-doctor/capabilities.json) 和 [`evidence.json`](../../../out/p1-1-doctor/evidence.json)。两份文件均通过本机序列号与 UUID 逐字匹配、五类凭据形态与合成金丝雀扫描，零命中。脱敏扫描摘要与运行日志见 `out/p1-1a-validation/doctor-scan.json`、`doctor.log`。
+- LaunchAgent 使用独立临时 `HOME` 运行 `print`、`install --write`、`status`、`uninstall`，`plutil -lint` 退出 0。检查到十个顶层字段、七个环境键、plist `0644`、目标目录 `0700` 和 cdhash 提示。`launchctl` 命令仅打印。摘要见 `out/p1-1a-validation/launchagent.json`。
+- E-16 原生预检组件测试使用最小合法策略、非法策略和主动取消，三条路径均移除私有夹具。合法策略实测 7 ms。正式 `runs.start` 的五份渲染策略实测 5–6 ms，中位数 5 ms。五个 Seatbelt 运行均完成，daemon 日志未发现合成凭据金丝雀。日志和摘要见 `out/p1-1a-validation/preflight-runtime.log`、`preflight-daemon.json`。
+- E-31 在真实 `atomiumd` 上用四种配置复验。`/var/folders` 与 `/tmp` 的配置路径分别与规范路径留证。以规范路径启动时，分别补测 `/var` 与 `/tmp` 反向别名。报告均为 `target = "control_socket"`，十条连接记录的宿主正对照全部成功，Seatbelt 全部返回 `EPERM=1`。摘要见 `out/p1-1a-validation/live.json`。
+- 守护进程启动后，全量缓存自动生成且七项均通过。只重跑 IOKit 时，只刷新该项的证据时间，其他项和全量缓存时间保持不变。未知 ID 返回 `-32602`。终端模式 TCC 为 `HostVisible`，矩阵共 11 项。摘要见 `out/p1-1a-validation/probe-cache.json`。
+- 真实 `atomiumd` 使用独立 DB 和开发模式测试 RA-4。`/var/folders` 与 `/tmp` 分别覆盖三种锁冲突。竞争实例非零退出，原实例仍能响应 `daemon.ping`，异库冲突未打开第二个 DB。旧实例退出时并发启动两实例，至多一实例成功，随后重启时两把锁的 `(dev, ino)` 保持不变。摘要见 `out/p1-1a-validation/double-lock.json`。
+- 使用八个忽略 `SIGTERM` 的开发模式运行并发调用两次 `daemon.panic`。正常库响应端到端为 2074.80 / 2077.43 ms，两次分别处理 8 / 0 个运行。持 SQLite 写锁时为 2970.71 / 3460.10 ms，两次均报告 `latch_persisted=false`，首调用列出 8 个 `CleanupUnverified`，`runs.get` 读回一致。解除写锁后确认每个运行恰好一条 `Stopped` 审计且租约全部释放。正常库重启保留锁存，`panic_clear` 可解除。脱敏摘要见 `out/p1-1a-validation/panic-busy-false.json`、`panic-busy-true.json`。
+- stdout/stderr 持续写入且后代继承两端写句柄时，熔断 RPC 实测端到端 2278.69 ms。持久化审计含一条日志截断及一条 `Stopped`，扫描合成凭据金丝雀零命中。摘要见 `out/p1-1a-validation/panic-pipes.json`。
 - E5-a LaunchAgent 与 TCC 对照（A3，Owner 执行，在 1.1a 之后）→ `<pending>`；E5-b `url.open` 拉起浏览器（A3，在 1.1b 之后）→ `<pending>`
 - CI Gate 运行链接：`<pending>`
 
@@ -235,7 +242,7 @@
 
 ### 5. 未验证部分与剩余限制
 
-- **当前状态**（r5，2026-11-27）：任务卡已到 r5。Codex 的开工前偏差已在 r4 全部裁决，Gemini r4 复核与 Codex r4 复核提出的待确认项已在 r5 裁决（E-30～E-36），O-6 已获 Owner 批准。
+- **r5 定稿时的状态**（2026-11-27）：Codex 的开工前偏差已在 r4 全部裁决，Gemini r4 复核与 Codex r4 复核提出的待确认项已在 r5 裁决（E-30～E-36），O-6 已获 Owner 批准。1.1a 实现后的证据见 §4。
   - **已完成**：E1–E4 已在 macOS 26.7.3（`25G342`，arm64）原生终端中用 `out/p1-1-exp/` 下的**一次性夹具**完成（证据见 §4）。E1、E2、E4 通过，E2 未触发 O-5；E3 ⓪②–⑤ 通过，① 的信号问题已按 E-35 裁决，⑥ 触发 O-6 并已获批。
   - **尚未验证**：正式实现代码（1.1a / 1.1b / 1.1c 都还没有提交）；在真实 `atomiumd` 上运行的 live 控制面探针（E-17，含真实 `/var/folders` 控制面 socket）；`TMPDIR=/tmp pnpm run ci:local` 全量门禁与 GitHub Actions CI Gate；`doctor --emit-evidence`；Owner A3 执行的 E5-a / E5-b。夹具结论**不能**替代正式代码在目标环境中的证据；r5 的新裁决（E-30～E-36）只是设计决定，同样没有经过正式代码的运行验证。
 - **O-6 既定剩余限制**（Owner 已于 2026-11-27 批准）：macOS L1 无法可靠捕获双重 fork 后调用 `setsid`、并已重挂到 PID 1 的孤儿孙进程（E3 ⑥）。对前台/后台进程组及 daemon 可追踪的后代，仍按 `(pid, 开始时间)` 独立核验 `processes_verified`；该项未通过或目录清理未通过，运行标为 `CleanupUnverified`。影响面（**推断，未实测**）：逃逸进程继承同一份 SBPL 约束；网关撤销后，它唯一放行的出网目标 `localhost:<proxy_port>` 不再有本运行的认证代理；但它可能继续读写授权的工作区副本，直至自行退出。彻底解决依赖 Phase 2 的 L3 VM。随 PR 1.1c 同步到文档（附录 G）。
@@ -740,6 +747,12 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
    - **F-p**。双平台跑绑定生成/零漂移与旧帧回归；新旧事件混合时跳过未知 `payload.type` 仍推进 TS 游标，CLI 原等待循环已跳过解码失败。TS 当前只是类型断言且自动订阅，attach 需单独 transport；桌面事件格式化的穷举 switch 要随新增已知变体更新。现有 SQLite 回放严格反序列化，O-1 的客户端前向容忍不能证明写入新事件后可降级回 v1.2 daemon。建议明确 F-p 的 `serde(default)` 适用于旧结构的新增可选字段，新 DTO 必填安全字段缺失仍拒绝（`crates/atomium-protocol/src/lib.rs:114–161,166–182,268–289,464–490`、`crates/atomium-core/src/lease.rs:417–457`、`crates/atomium-cli/src/main.rs:305–329`、`packages/atomium-client/src/client.ts:105–118,250–258`、`apps/desktop/src/panelController.ts:93–107`、本卡 r3 第 54、201–209、512 行）。
 
 ### 偏差申请（发现规格问题时填写，暂停受影响部分）
+
+**r5 实施偏差申请：RA-1 正式 spawn 失败的线上状态（待裁决）**
+
+- RA-1 要求本次策略预检通过后、正式 spawn 失败时沿用既有回滚并标为 `Failed`。基线 `e33f94f` 的 [`TaskStatus`](../../../crates/atomium-protocol/src/lib.rs#L80) 没有此变体，实施后的 [`spawn_failed` 分支](../../../crates/atomiumd/src/session_engine.rs#L637) 保留基线的 `Blocked`。F-p 限定协议增量为附录 A，A.1 未列 `TaskStatus` 增量。O-1 的前向容忍针对未知的 `payload.type`，已有 `status_changed` 中的新 `status` 值不在该约定内。
+- 影响：增加 `Failed` 会改变 `RunRecord.status` 和既有事件的值域。直接保留 `Blocked` 会与 RA-1 的字面验收条件不一致。暂停正式 spawn 失败的状态与事件编码调整。前置门禁、回滚资源和其他验收项可继续实现。
+- 方案：建议 Claude 按 A1 确认 RA-1 使用现有 `Blocked` 与 `spawn_failed` 原因，同时断言租约和目录已释放。若要求新增线上 `Failed`，需由 Owner 按 A2 裁决协议范围和客户端兼容约定。
 
 > 开工前复核意见（Codex，`db82f2d`）。**r4 状态：全部已裁决**。A1 项由 Claude 裁决，见下方「r4 裁决汇总」与附录 E 的 E-16～E-29；需要 A2 的 argv 凭据边界已由 Owner 批准为 O-8。原文保留，不做改写。
 
