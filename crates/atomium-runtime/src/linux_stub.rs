@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use atomium_protocol::{CapabilitiesReport, ProbeEvidence};
 
-use crate::backend::RuntimeBackend;
+use crate::backend::{PreparedCommand, RuntimeBackend, RuntimeSpawnSpec};
 
 pub struct LinuxContainerStubBackend;
 
@@ -10,6 +10,16 @@ pub struct LinuxContainerStubBackend;
 impl RuntimeBackend for LinuxContainerStubBackend {
     fn name(&self) -> &'static str {
         "linux-container-stub"
+    }
+
+    fn is_isolated(&self) -> bool {
+        false
+    }
+
+    fn prepare_command(&self, _spec: &RuntimeSpawnSpec) -> Result<PreparedCommand> {
+        Err(anyhow::anyhow!(
+            "linux container backend does not support spawning yet"
+        ))
     }
 
     async fn probe(&self) -> Result<(CapabilitiesReport, Vec<ProbeEvidence>)> {

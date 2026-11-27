@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 
-use crate::backend::RuntimeBackend;
+use crate::backend::{PreparedCommand, RuntimeBackend, RuntimeSpawnSpec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeychainPolicy {
@@ -328,6 +328,52 @@ pub struct MacOsSeatbeltBackend;
 impl RuntimeBackend for MacOsSeatbeltBackend {
     fn name(&self) -> &'static str {
         "macos-seatbelt"
+    }
+
+    fn is_isolated(&self) -> bool {
+        true
+    }
+
+    fn prepare_command(&self, spec: &RuntimeSpawnSpec) -> Result<PreparedCommand> {
+        let canon = spec.env.canonicalize();
+        let cfg = SeatbeltConfig {
+            workspace_dir: canon.workspace_dir,
+            run_home_dir: canon.run_home_dir,
+            run_tmp_dir: canon.run_tmp_dir,
+            run_cache_dir: canon.run_cache_dir,
+            allowed_proxy_port: spec.allowed_proxy_port,
+            keychain_policy: spec.keychain_policy,
+            timezone: spec.timezone.clone(),
+            lang: spec.lang.clone(),
+        };
+        let mut extra_read_paths = Vec::new();
+        let prog_path = PathBuf::from(&spec.program);
+        if prog_path.is_absolute() {
+            if let Ok(canon_prog) = std::fs::canonicalize(&prog_path) {
+                extra_read_paths.push(canon_prog);
+            } else {
+                extra_read_paths.push(prog_path);
+            }
+        }
+        let arg_refs: Vec<&str> = spec.args.iter().map(String::as_str).collect();
+        let env_refs: Vec<(&str, &str)> = spec
+            .extra_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let mut cmd = build_seatbelt_command_with_extra_read_paths(
+            &cfg,
+            &spec.program,
+            &arg_refs,
+            &env_refs,
+            &extra_read_paths,
+        )?;
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // Put child in its own process group so cancel terminates the entire process tree.
+        cmd.process_group(0);
+        Ok(PreparedCommand::new(cmd))
     }
 
     async fn probe(&self) -> Result<(CapabilitiesReport, Vec<ProbeEvidence>)> {

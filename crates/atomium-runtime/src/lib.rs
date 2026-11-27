@@ -1,14 +1,34 @@
 pub mod backend;
+pub mod dev_unsandboxed;
 pub mod linux_stub;
 pub mod macos_seatbelt;
+pub mod process;
 
-pub use backend::RuntimeBackend;
+pub use backend::{
+    PreparedCommand, PreparedRunEnvironment, RuntimeBackend, RuntimeSpawnSpec, SpawnedProcess,
+};
+pub use dev_unsandboxed::UnsandboxedDevBackend;
 pub use linux_stub::LinuxContainerStubBackend;
 pub use macos_seatbelt::{
     build_seatbelt_command, build_seatbelt_command_with_extra_read_paths, render_sbpl,
     render_sbpl_with_extra_read_paths, run_in_seatbelt, KeychainPolicy, MacOsSeatbeltBackend,
     SeatbeltConfig,
 };
+pub use process::{
+    kill_orphaned_process_group_sync, process_group_alive, terminate_child_process_group,
+};
+
+pub fn select_runtime_backend(
+    unsandboxed_dev_mode: bool,
+) -> std::result::Result<std::sync::Arc<dyn RuntimeBackend>, &'static str> {
+    if cfg!(target_os = "macos") && !unsandboxed_dev_mode {
+        Ok(std::sync::Arc::new(MacOsSeatbeltBackend))
+    } else if unsandboxed_dev_mode {
+        Ok(std::sync::Arc::new(UnsandboxedDevBackend))
+    } else {
+        Err("no isolation backend available on this OS; refusing to run unsandboxed")
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,7 +1,7 @@
 use atomium_protocol::{CredentialSpec, OAuthStorageMode};
 use atomium_runtime::{
-    render_sbpl, KeychainPolicy, LinuxContainerStubBackend, MacOsSeatbeltBackend, RuntimeBackend,
-    SeatbeltConfig,
+    render_sbpl, select_runtime_backend, KeychainPolicy, LinuxContainerStubBackend,
+    MacOsSeatbeltBackend, RuntimeBackend, RuntimeSpawnSpec, SeatbeltConfig, UnsandboxedDevBackend,
 };
 use std::path::PathBuf;
 
@@ -377,5 +377,131 @@ async fn review_seatbelt_realpath_and_system_symlink_metadata() {
             "program {program} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+}
+
+#[test]
+fn prepare_and_cleanup_run_env_validates_workspace_and_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let backend = UnsandboxedDevBackend;
+    let base = std::env::temp_dir().join(format!("atm-runtime-env-{}", uuid::Uuid::now_v7()));
+    let runs_dir = base.join("runs");
+    std::fs::create_dir_all(&runs_dir).unwrap();
+
+    // Default workspace when None
+    let env_default = backend
+        .prepare_run_env(&runs_dir, "run-default", None)
+        .unwrap();
+    assert!(env_default.run_dir.is_dir());
+    assert!(env_default.run_home_dir.is_dir());
+    assert!(env_default.run_tmp_dir.is_dir());
+    assert!(env_default.run_cache_dir.is_dir());
+    assert_eq!(
+        env_default.workspace_dir,
+        env_default.run_dir.join("workspace")
+    );
+    assert_eq!(
+        std::fs::metadata(&env_default.run_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert!(backend.cleanup_run_env(&env_default.run_dir));
+    assert!(!env_default.run_dir.exists());
+
+    // Valid brokered workspace
+    let brokered = base.join("brokered-ws");
+    std::fs::create_dir_all(&brokered).unwrap();
+    let env_brokered = backend
+        .prepare_run_env(&runs_dir, "run-brokered", Some(&brokered))
+        .unwrap();
+    assert_eq!(env_brokered.workspace_dir, brokered);
+    assert!(backend.cleanup_run_env(&env_brokered.run_dir));
+
+    // Missing brokered workspace fails
+    let missing = base.join("does-not-exist");
+    let err = backend
+        .prepare_run_env(&runs_dir, "run-missing", Some(&missing))
+        .unwrap_err();
+    assert!(err.to_string().contains("brokered working_dir is missing"));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn unsandboxed_dev_backend_full_lifecycle() {
+    use tokio::io::AsyncReadExt;
+
+    let backend = UnsandboxedDevBackend;
+    assert_eq!(backend.name(), "unsandboxed-dev");
+    assert!(!backend.is_isolated());
+    let (report, evidences) = backend.probe().await.unwrap();
+    assert_eq!(report.backend, "unsandboxed-dev");
+    assert_eq!(report.file_isolation, "unsupported");
+    assert!(evidences.is_empty());
+
+    let base = std::env::temp_dir().join(format!("atm-dev-life-{}", uuid::Uuid::now_v7()));
+    let env = backend.prepare_run_env(&base, "run-1", None).unwrap();
+    let spec = RuntimeSpawnSpec {
+        env: env.clone(),
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "printf 'hello-dev' && sleep 30".into()],
+        extra_env: vec![("ATOMIUM_TEST_VAR".into(), "ok".into())],
+        allowed_proxy_port: None,
+        keychain_policy: KeychainPolicy::Deny,
+        timezone: Some("UTC".into()),
+        lang: Some("C".into()),
+    };
+    let prepared = backend.prepare_command(&spec).unwrap();
+    let mut spawned = backend.spawn(prepared).unwrap();
+    assert!(spawned.pgid.is_some());
+
+    let mut stdout = spawned.child.stdout.take().unwrap();
+    let mut buf = [0u8; 9];
+    stdout.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"hello-dev");
+
+    backend.terminate(&mut spawned).await;
+    assert!(backend.cleanup_run_env(&env.run_dir));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn linux_stub_and_backend_selection() {
+    let stub = LinuxContainerStubBackend;
+    assert!(!stub.is_isolated());
+    let base = std::env::temp_dir().join(format!("atm-stub-{}", uuid::Uuid::now_v7()));
+    let env = stub.prepare_run_env(&base, "run-stub", None).unwrap();
+    let spec = RuntimeSpawnSpec {
+        env: env.clone(),
+        program: "/bin/echo".into(),
+        args: vec!["hi".into()],
+        extra_env: vec![],
+        allowed_proxy_port: None,
+        keychain_policy: KeychainPolicy::Deny,
+        timezone: None,
+        lang: None,
+    };
+    let err = stub.prepare_command(&spec).err().expect("stub should fail");
+    assert!(err.to_string().contains("does not support spawning"));
+    assert!(stub.cleanup_run_env(&env.run_dir));
+    let _ = std::fs::remove_dir_all(&base);
+
+    let dev = select_runtime_backend(true).unwrap();
+    assert_eq!(dev.name(), "unsandboxed-dev");
+    assert!(!dev.is_isolated());
+
+    #[cfg(target_os = "macos")]
+    {
+        let mac = select_runtime_backend(false).unwrap();
+        assert_eq!(mac.name(), "macos-seatbelt");
+        assert!(mac.is_isolated());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert!(select_runtime_backend(false).is_err());
     }
 }
