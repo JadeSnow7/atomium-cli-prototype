@@ -3,15 +3,54 @@ use atomium_protocol::{DaemonPanicResult, RunRecord, TaskStatus};
 use std::sync::{atomic::Ordering, Arc};
 use std::time::{Duration, Instant};
 
+const PANIC_FINALIZE_WAIT_BUDGET: Duration = Duration::from_millis(1500);
+const PANIC_FINALIZE_BUSY_TIMEOUT: Duration = Duration::from_millis(400);
+const PANIC_FINALIZE_BUSY_COOLDOWN: Duration = Duration::from_millis(200);
+
 pub(crate) async fn finish_record(
     state: &Arc<DaemonState>,
     record: &RunRecord,
     log_truncated: bool,
 ) -> RunRecord {
-    let store = state.runs.clone();
-    let value = record.clone();
-    match tokio::task::spawn_blocking(move || store.finalize_panic(&value, log_truncated)).await {
-        Ok(Ok((event, new))) => {
+    let outcome =
+        match tokio::time::timeout(PANIC_FINALIZE_WAIT_BUDGET, state.panic_finalize_gate.lock())
+            .await
+        {
+            Ok(mut busy_until) => {
+                if busy_until.is_some_and(|until| Instant::now() < until) {
+                    Err(
+                        "sqlite busy cooldown active during concurrent panic finalization"
+                            .to_string(),
+                    )
+                } else {
+                    let store = state.runs.clone();
+                    let value = record.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        store.finalize_panic_with_timeout(
+                            &value,
+                            log_truncated,
+                            PANIC_FINALIZE_BUSY_TIMEOUT,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(res)) => {
+                            *busy_until = None;
+                            Ok(res)
+                        }
+                        Ok(Err(err)) => {
+                            *busy_until = Some(Instant::now() + PANIC_FINALIZE_BUSY_COOLDOWN);
+                            Err(err.to_string())
+                        }
+                        Err(err) => Err(err.to_string()),
+                    }
+                }
+            }
+            Err(_) => Err("panic finalization gate wait budget exceeded".to_string()),
+        };
+
+    match outcome {
+        Ok((event, new)) => {
             state
                 .panic_cleanup
                 .lock()
@@ -22,7 +61,12 @@ pub(crate) async fn finish_record(
             }
             record.clone()
         }
-        _ => {
+        Err(reason) => {
+            tracing::warn!(
+                run_id = %record.run_id,
+                reason = %reason,
+                "panic finalization deferred to background retry"
+            );
             let mut pending = record.clone();
             pending.status = TaskStatus::CleanupUnverified;
             pending.cleanup_verified = false;
@@ -252,12 +296,21 @@ pub(crate) async fn clear(
 }
 
 fn retry_cleanup(state: &Arc<DaemonState>) {
+    if state
+        .panic_cleanup
+        .lock()
+        .expect("panic cleanup memory poisoned")
+        .is_empty()
+    {
+        return;
+    }
     if state.panic_cleanup_worker.swap(true, Ordering::SeqCst) {
         return;
     }
     let state = state.clone();
     tokio::spawn(async move {
         loop {
+            tokio::time::sleep(Duration::from_millis(150)).await;
             let records = {
                 let pending = state
                     .panic_cleanup
@@ -287,7 +340,14 @@ fn retry_cleanup(state: &Arc<DaemonState>) {
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            let pending = state
+                .panic_cleanup
+                .lock()
+                .expect("panic cleanup memory poisoned");
+            if pending.is_empty() {
+                state.panic_cleanup_worker.store(false, Ordering::SeqCst);
+                break;
+            }
         }
     });
 }
@@ -393,6 +453,16 @@ mod tests {
         let second = second.unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(first.latch_persisted && second.latch_persisted);
+        assert!(
+            first.cleanup_unverified.is_empty(),
+            "first panic cleanup_unverified: {:?}",
+            first.cleanup_unverified
+        );
+        assert!(
+            second.cleanup_unverified.is_empty(),
+            "second panic cleanup_unverified: {:?}",
+            second.cleanup_unverified
+        );
         let stopped = first
             .stopped_runs
             .into_iter()
@@ -402,7 +472,14 @@ mod tests {
         for run in &runs {
             assert!(stopped.contains(&run.run_id));
             let record = crate::rpc::sessions::handle_runs_get(&state, &run.run_id).unwrap();
-            assert_eq!(record.status, TaskStatus::Stopped);
+            assert_eq!(
+                record.status,
+                TaskStatus::Stopped,
+                "run {} cleanup_verified={} reason={:?}",
+                record.run_id,
+                record.cleanup_verified,
+                record.reason
+            );
             assert!(!state.runs_dir.join(&run.run_id).exists());
             assert!(
                 tokio::net::TcpStream::connect(("127.0.0.1", run.proxy_port.unwrap()))
@@ -425,6 +502,76 @@ mod tests {
             panic(&state, None).await.unwrap().stopped_runs,
             vec![run.run_id]
         );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn eight_runs_with_busy_database_stay_within_five_seconds_and_recover() {
+        let (root, state) = setup();
+        let mut runs = Vec::new();
+        for _ in 0..8 {
+            runs.push(start(&state, "trap '' TERM; exec sleep 60").await.unwrap());
+        }
+        let db =
+            atomium_core::sqlite_security::SecureSqliteConnection::open(root.join("state.sqlite"))
+                .unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = Instant::now();
+        let (first, second) = tokio::join!(panic(&state, None), panic(&state, None));
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "elapsed={:?}",
+            started.elapsed()
+        );
+        assert!(!first.latch_persisted);
+        let unverified = first
+            .cleanup_unverified
+            .into_iter()
+            .chain(second.cleanup_unverified)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unverified.len(), 8);
+        for run in &runs {
+            assert!(unverified.contains(&run.run_id));
+            assert_eq!(
+                crate::rpc::sessions::handle_runs_get(&state, &run.run_id)
+                    .unwrap()
+                    .status,
+                TaskStatus::CleanupUnverified
+            );
+        }
+        db.execute_batch("ROLLBACK").unwrap();
+        drop(db);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state
+            .panic_cleanup
+            .lock()
+            .expect("panic cleanup memory poisoned")
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(state.leases.list_active_leases().unwrap().is_empty());
+        let events = state.leases.query_events_after(0).unwrap();
+        for run in &runs {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.run_id == run.run_id
+                        && matches!(
+                            &event.payload,
+                            TaskEventPayload::StatusChanged {
+                                status: TaskStatus::Stopped,
+                                reason: Some(reason)
+                            } if reason == "daemon_panic"
+                        ))
+                    .count(),
+                1
+            );
+        }
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }

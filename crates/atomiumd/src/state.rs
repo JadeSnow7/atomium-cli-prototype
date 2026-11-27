@@ -75,6 +75,8 @@ pub struct DaemonState {
     // Long waits, hooks and child termination always happen outside these gates.
     pub(crate) spawn_gate: Mutex<()>,
     pub(crate) panic_gate: Mutex<()>,
+    // Leaf lock serializing concurrent SQLite panic finalization; never acquire other locks inside it.
+    pub(crate) panic_finalize_gate: Mutex<Option<std::time::Instant>>,
     pub(crate) preflight_runs: Mutex<HashMap<String, PendingRunControl>>,
     pub(crate) pending_runs: Mutex<HashMap<String, PendingRunControl>>,
     pub(crate) panic_cleanup:
@@ -201,6 +203,7 @@ impl DaemonState {
             panic_persisted: std::sync::atomic::AtomicBool::new(panic_latched),
             spawn_gate: Mutex::new(()),
             panic_gate: Mutex::new(()),
+            panic_finalize_gate: Mutex::new(None),
             preflight_runs: Mutex::new(HashMap::new()),
             pending_runs: Mutex::new(HashMap::new()),
             panic_cleanup: std::sync::Mutex::new(HashMap::new()),

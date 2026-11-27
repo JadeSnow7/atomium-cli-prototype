@@ -87,10 +87,10 @@ fn suffixed_path(path: &Path, suffix: &str) -> PathBuf {
 }
 
 pub fn harden_sqlite_files(db_path: &Path) -> Result<()> {
-    for path in [
-        db_path.to_path_buf(),
-        suffixed_path(db_path, "-wal"),
-        suffixed_path(db_path, "-shm"),
+    for (path, allow_vanish) in [
+        (db_path.to_path_buf(), false),
+        (suffixed_path(db_path, "-wal"), true),
+        (suffixed_path(db_path, "-shm"), true),
     ] {
         match fs::symlink_metadata(&path) {
             Ok(meta) => {
@@ -100,8 +100,12 @@ pub fn harden_sqlite_files(db_path: &Path) -> Result<()> {
                         path.display()
                     ));
                 }
-                if meta.file_type().is_file() {
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+                if meta.file_type().is_file() && (meta.permissions().mode() & 0o777) != 0o600 {
+                    match fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+                        Ok(()) => {}
+                        Err(err) if allow_vanish && err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err.into()),
+                    }
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -124,6 +128,50 @@ mod tests {
             let conn = SecureSqliteConnection::open(&db).unwrap();
             conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
                 .unwrap();
+        }
+        for path in [
+            db.clone(),
+            suffixed_path(&db, "-wal"),
+            suffixed_path(&db, "-shm"),
+        ] {
+            if path.exists() {
+                assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_wal_open_close_does_not_fail_harden_toctou() {
+        let dir = std::env::temp_dir().join(format!("atm-sqlite-conc-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("test.sqlite");
+        {
+            let conn = SecureSqliteConnection::open(&db).unwrap();
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS t(v INTEGER);")
+                .unwrap();
+        }
+        let handles: Vec<_> = (0..8)
+            .map(|tid| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    for iter in 0..25 {
+                        let conn = SecureSqliteConnection::open_with_busy_timeout(
+                            &db,
+                            std::time::Duration::from_secs(5),
+                        )
+                        .unwrap();
+                        conn.execute("INSERT INTO t(v) VALUES (?1)", [tid * 100 + iter])
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
         }
         for path in [
             db.clone(),

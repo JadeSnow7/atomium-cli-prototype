@@ -115,10 +115,21 @@ impl RunStore {
         record: &RunRecord,
         log_truncated: bool,
     ) -> Result<(atomium_protocol::TaskEvent, bool)> {
-        let mut conn = SecureSqliteConnection::open_with_busy_timeout(
-            &self.db_path,
+        self.finalize_panic_with_timeout(
+            record,
+            log_truncated,
             std::time::Duration::from_millis(400),
-        )?;
+        )
+    }
+
+    /// Bounded variant of `finalize_panic` with an explicit SQLite `busy_timeout`.
+    pub fn finalize_panic_with_timeout(
+        &self,
+        record: &RunRecord,
+        log_truncated: bool,
+        timeout: std::time::Duration,
+    ) -> Result<(atomium_protocol::TaskEvent, bool)> {
+        let mut conn = SecureSqliteConnection::open_with_busy_timeout(&self.db_path, timeout)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let payload = atomium_protocol::TaskEventPayload::StatusChanged {
             status: TaskStatus::Stopped,

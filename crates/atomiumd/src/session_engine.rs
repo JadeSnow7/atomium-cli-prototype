@@ -1061,9 +1061,16 @@ async fn start_after_probes(
 
         // Remove isolated run directory and verify cleanup.
         if panic_run {
-            let cleanup_verified = cleanup_panic_directory(sup_backend.clone(), run_dir.clone())
-                .await
-                && processes_verified;
+            let dir_cleaned = cleanup_panic_directory(sup_backend.clone(), run_dir.clone()).await;
+            let cleanup_verified = dir_cleaned && processes_verified;
+            if !cleanup_verified {
+                tracing::warn!(
+                    run_id = %sup_run_id,
+                    dir_cleaned,
+                    processes_verified,
+                    "panic cleanup verification failed"
+                );
+            }
             sup_record.cleanup_verified = cleanup_verified;
             sup_record.exit_code = exit_code;
             sup_record.status = if cleanup_verified {
