@@ -20,6 +20,8 @@ impl RuntimeBackend for UnsandboxedDevBackend {
 
     async fn probe(&self) -> Result<(CapabilitiesReport, Vec<ProbeEvidence>)> {
         let report = CapabilitiesReport {
+            os_build: None,
+            sbpl_template_digest: None,
             schema_version: "atomium-capabilities-v1".into(),
             os: std::env::consts::OS.into(),
             os_version: "dev-unsandboxed".into(),

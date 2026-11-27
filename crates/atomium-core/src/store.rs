@@ -19,6 +19,7 @@ pub struct IncompleteRun {
     pub child_proc_start: Option<i64>,
 }
 
+#[derive(Clone)]
 pub struct RunStore {
     db_path: PathBuf,
 }
@@ -34,6 +35,11 @@ impl RunStore {
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS daemon_panic_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                latched INTEGER NOT NULL,
+                reason TEXT
+            );
             CREATE TABLE IF NOT EXISTS task_runs (
                 run_id           TEXT PRIMARY KEY,
                 profile_id       TEXT NOT NULL,
@@ -70,6 +76,90 @@ impl RunStore {
             )?;
         }
         Ok(Self { db_path })
+    }
+
+    pub fn panic_latched(&self) -> Result<bool> {
+        use rusqlite::OptionalExtension;
+        let conn = SecureSqliteConnection::open(&self.db_path)?;
+        Ok(conn
+            .query_row(
+                "SELECT latched FROM daemon_panic_state WHERE singleton=1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    pub fn persist_panic(&self, latched: bool, reason: Option<&str>) -> Result<()> {
+        self.persist_panic_with_timeout(latched, reason, std::time::Duration::from_millis(400))
+    }
+
+    pub fn persist_panic_with_timeout(
+        &self,
+        latched: bool,
+        reason: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let mut conn = SecureSqliteConnection::open_with_busy_timeout(&self.db_path, timeout)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO daemon_panic_state(singleton,latched,reason) VALUES(1,?1,?2) ON CONFLICT(singleton) DO UPDATE SET latched=excluded.latched,reason=excluded.reason",params![latched,reason])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One bounded transaction releases leases, updates the record and appends
+    /// the single panic terminal event. A retry observes the existing event.
+    pub fn finalize_panic(
+        &self,
+        record: &RunRecord,
+        log_truncated: bool,
+    ) -> Result<(atomium_protocol::TaskEvent, bool)> {
+        let mut conn = SecureSqliteConnection::open_with_busy_timeout(
+            &self.db_path,
+            std::time::Duration::from_millis(400),
+        )?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let payload = atomium_protocol::TaskEventPayload::StatusChanged {
+            status: TaskStatus::Stopped,
+            reason: Some("daemon_panic".into()),
+        };
+        let payload_json = serde_json::to_string(&payload)?;
+        let prior: Option<(i64, i64)> = {
+            use rusqlite::OptionalExtension;
+            tx.query_row("SELECT seq,timestamp_ms FROM task_events WHERE run_id=?1 AND payload_json=?2 LIMIT 1",params![record.run_id,payload_json],|r|Ok((r.get(0)?,r.get(1)?))).optional()?
+        };
+        let status = serde_json::to_string(&record.status)?;
+        tx.execute("UPDATE task_runs SET status=?2,record_json=?3,updated_at_ms=?4,child_pgid=CASE WHEN ?2='stopped' THEN NULL ELSE child_pgid END,child_proc_start=CASE WHEN ?2='stopped' THEN NULL ELSE child_proc_start END WHERE run_id=?1",params![record.run_id,status.trim_matches('"'),serde_json::to_string(record)?,record.updated_at_ms])?;
+        tx.execute(
+            "DELETE FROM resource_leases WHERE run_id=?1",
+            params![record.run_id],
+        )?;
+        let (seq, timestamp_ms) = match prior {
+            Some(prior) => prior,
+            None => {
+                let at = now_ms();
+                if log_truncated {
+                    let note=serde_json::to_string(&atomium_protocol::TaskEventPayload::LogLine {stream:"atomium".into(),line:"daemon_panic: unread output truncated during bounded stdout/stderr shutdown".into()})?;
+                    tx.execute("INSERT INTO task_events(run_id,timestamp_ms,payload_json) VALUES(?1,?2,?3)",params![record.run_id,at,note])?;
+                }
+                tx.execute(
+                    "INSERT INTO task_events(run_id,timestamp_ms,payload_json) VALUES(?1,?2,?3)",
+                    params![record.run_id, at, payload_json],
+                )?;
+                (tx.last_insert_rowid(), at)
+            }
+        };
+        tx.commit()?;
+        Ok((
+            atomium_protocol::TaskEvent {
+                seq,
+                run_id: record.run_id.clone(),
+                timestamp_ms,
+                payload,
+            },
+            prior.is_none(),
+        ))
     }
 
     pub fn upsert(&self, record: &RunRecord) -> Result<()> {
@@ -184,7 +274,8 @@ impl RunStore {
                         | TaskStatus::Finalizing
                         | TaskStatus::Revoking
                         | TaskStatus::Stopping
-                )
+                ) || (item.record.status == TaskStatus::CleanupUnverified
+                    && item.record.reason.as_deref() == Some("daemon_panic"))
             })
             .collect())
     }
@@ -378,5 +469,65 @@ impl ApprovalStore {
             }
         }
         Ok(matching)
+    }
+}
+
+#[cfg(test)]
+mod panic_tests {
+    use super::*;
+
+    #[test]
+    fn panic_finalization_is_idempotent_and_preserves_unverified_process_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "atomium-panic-store-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let db = root.join("state.sqlite");
+        let leases = crate::LeaseManager::open(&db).unwrap();
+        let store = RunStore::open(&db).unwrap();
+        let mut record:RunRecord=serde_json::from_value(serde_json::json!({"run_id":"panic-recovery","profile_id":"synthetic","agent_kind":"test","program":"true","args":[],"status":"running","exit_code":null,"proxy_port":null,"cleanup_verified":false,"token_refreshed":false,"snapshot_version":null,"reason":null,"created_at_ms":1,"updated_at_ms":1})).unwrap();
+        store.upsert(&record).unwrap();
+        store
+            .set_child_process(&record.run_id, 12345, 67890)
+            .unwrap();
+        record.status = TaskStatus::CleanupUnverified;
+        record.reason = Some("daemon_panic".into());
+        let (first, new) = store.finalize_panic(&record, true).unwrap();
+        assert!(new);
+        let incomplete = store.list_incomplete_runs_with_child().unwrap();
+        assert_eq!(incomplete.len(), 1);
+        assert_eq!(incomplete[0].child_pgid, Some(12345));
+        assert_eq!(incomplete[0].child_proc_start, Some(67890));
+        let (repeated, new) = store.finalize_panic(&record, true).unwrap();
+        assert!(!new);
+        assert_eq!(repeated.seq, first.seq);
+        assert_eq!(leases.query_events_after(0).unwrap().len(), 2);
+        record.status = TaskStatus::Stopped;
+        record.cleanup_verified = true;
+        assert!(!store.finalize_panic(&record, false).unwrap().1);
+        let conn = SecureSqliteConnection::open(&db).unwrap();
+        let identity: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT child_pgid,child_proc_start FROM task_runs WHERE run_id=?1",
+                params![record.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(identity, (None, None));
+        store
+            .persist_panic(true, Some("reason_sha256:test"))
+            .unwrap();
+        assert!(store.panic_latched().unwrap());
+        store.persist_panic(false, None).unwrap();
+        assert!(!store.panic_latched().unwrap());
+        drop(conn);
+        drop(store);
+        drop(leases);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

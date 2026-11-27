@@ -41,7 +41,43 @@ pub(crate) struct ActiveRunControl {
     pub(crate) workspace_dir: PathBuf,
 }
 
+#[derive(Clone)]
+pub(crate) struct PendingRunControl {
+    pub(crate) cancel: watch::Sender<bool>,
+    pub(crate) done: watch::Sender<bool>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct ProbeOutcomeInjector {
+    pub(crate) failed_probe_ids: Vec<String>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct PolicyRenderInjector {
+    pub(crate) malformed: bool,
+    pub(crate) hold_fixture: bool,
+    pub(crate) entered: Option<Arc<Notify>>,
+}
+
 pub struct DaemonState {
+    pub(crate) isolation: crate::isolation::IsolationState,
+    #[cfg(test)]
+    pub(crate) probe_outcome_injector: std::sync::Mutex<Option<ProbeOutcomeInjector>>,
+    #[cfg(test)]
+    pub(crate) policy_render_injector: std::sync::Mutex<Option<PolicyRenderInjector>>,
+    pub(crate) panic_latched: std::sync::atomic::AtomicBool,
+    pub(crate) panic_persisted: std::sync::atomic::AtomicBool,
+    // C.5 cross-PR lock order: spawn_gate -> opener_gate -> spawn_fd_lock.
+    // Long waits, hooks and child termination always happen outside these gates.
+    pub(crate) spawn_gate: Mutex<()>,
+    pub(crate) panic_gate: Mutex<()>,
+    pub(crate) preflight_runs: Mutex<HashMap<String, PendingRunControl>>,
+    pub(crate) pending_runs: Mutex<HashMap<String, PendingRunControl>>,
+    pub(crate) panic_cleanup:
+        std::sync::Mutex<HashMap<String, (atomium_protocol::RunRecord, bool)>>,
+    pub(crate) panic_cleanup_worker: std::sync::atomic::AtomicBool,
     pub(crate) leases: LeaseManager,
     pub(crate) profiles: ProfileStore,
     pub(crate) runs: RunStore,
@@ -84,6 +120,7 @@ impl DaemonState {
         let leases = LeaseManager::open(db_path)?;
         let profiles = ProfileStore::open(db_path)?;
         let runs = RunStore::open(db_path)?;
+        let panic_latched = runs.panic_latched()?;
         let approvals = ApprovalStore::open(db_path)?;
         let broker_dir = std::env::var("ATOMIUM_BROKER_DIR")
             .map(PathBuf::from)
@@ -110,7 +147,23 @@ impl DaemonState {
             if orphan_dir.exists() {
                 let _ = fs::remove_dir_all(&orphan_dir);
             }
-            let _ = runs.clear_child_process(&item.record.run_id);
+            if panic_latched || item.record.reason.as_deref() == Some("daemon_panic") {
+                let processes_verified = item
+                    .child_pgid
+                    .is_none_or(|pgid| !atomium_runtime::process_group_alive(pgid));
+                let mut record = item.record;
+                record.cleanup_verified = !orphan_dir.exists() && processes_verified;
+                record.status = if record.cleanup_verified {
+                    atomium_protocol::TaskStatus::Stopped
+                } else {
+                    atomium_protocol::TaskStatus::CleanupUnverified
+                };
+                record.reason = Some("daemon_panic".into());
+                record.updated_at_ms = now_ms();
+                runs.finalize_panic(&record, false)?;
+            } else {
+                let _ = runs.clear_child_process(&item.record.run_id);
+            }
         }
 
         // 2. Reclaim stale leases from crashed daemon/processes and mark interrupted runs.
@@ -137,6 +190,19 @@ impl DaemonState {
         }
 
         Ok(Self {
+            isolation: crate::isolation::IsolationState::default(),
+            #[cfg(test)]
+            probe_outcome_injector: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            policy_render_injector: std::sync::Mutex::new(None),
+            panic_latched: std::sync::atomic::AtomicBool::new(panic_latched),
+            panic_persisted: std::sync::atomic::AtomicBool::new(panic_latched),
+            spawn_gate: Mutex::new(()),
+            panic_gate: Mutex::new(()),
+            preflight_runs: Mutex::new(HashMap::new()),
+            pending_runs: Mutex::new(HashMap::new()),
+            panic_cleanup: std::sync::Mutex::new(HashMap::new()),
+            panic_cleanup_worker: std::sync::atomic::AtomicBool::new(false),
             leases,
             profiles,
             runs,
@@ -172,6 +238,10 @@ impl DaemonState {
         if let Err(err) = self.approvals.insert(&req) {
             tracing::warn!(error = %err, approval_id = %req.approval_id, "failed to persist pending approval");
         }
+    }
+
+    pub(crate) fn broadcast_event(&self, event: TaskEvent) {
+        let _ = self.event_tx.send(event);
     }
 
     pub fn register_pending_approval_checked(&self, req: &ApprovalRequest) -> Result<()> {
@@ -344,7 +414,7 @@ pub async fn run_daemon() -> Result<()> {
 
     let sock_path = default_socket_path();
     let db_path = default_db_path();
-    let listener = bind_socket(&sock_path)?;
+    let _instance_locks = crate::instance_lock::InstanceLocks::acquire(&db_path, &sock_path)?;
 
     let state = {
         let base_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
@@ -386,6 +456,9 @@ pub async fn run_daemon() -> Result<()> {
         }
         Arc::new(state.with_unsandboxed_dev_mode(unsandboxed_dev_mode))
     };
+
+    let listener = bind_socket(&sock_path)?;
+    crate::isolation::begin_live(&state, sock_path.clone()).await;
 
     tracing::info!(
         socket = %sock_path.display(),

@@ -1,6 +1,6 @@
 # Atomium 控制协议 v2
 
-状态：**v1.2 已实现**（本仓库当前代码），**v2 规划草案随 Phase 1–4 验证演进**。产品决策见 [product-spec.md](product-spec.md)，系统分层与验收边界见 [architecture-design.md](architecture-design.md)。
+状态：**v1.3（PR 1.1a）已实现**，**v2 规划草案随 Phase 1–4 验证演进**。产品决策见 [product-spec.md](product-spec.md)，系统分层与验收边界见 [architecture-design.md](architecture-design.md)。
 
 ## 1. 基本约定
 
@@ -11,7 +11,7 @@
 - **命名**：方法名为 `<域>.<动词>`，字段一律 snake_case，时间单位为毫秒（`*_ms`），摘要格式为 `sha256:<hex>`。
 - **ID 前缀**：`run-`、`ses-`、`box-`、`grant-`、`appr-`、`cand-`、`ws-`、`rcp-`、`dev-`。时间有序的 ID 一律用 UUIDv7。
 - **可选字段**：用 `#[serde(default)]` 表示，TS 中为 `T | null`。新增字段必须是可选的；删除字段或修改语义算破坏性变更（见 §8）。
-- **服务端推送**：只有一种，即 `events.push` 通知，参数为 `TaskEvent`。客户端通过 `after_seq` 游标补拉断线期间的事件。
+- **服务端推送**：只有一种，即 `events.push` 通知，参数为 `TaskEvent`。客户端通过 `after_seq` 游标补拉断线期间的事件。收到信封合法、`payload.type` 未知的事件时，客户端应使用信封的 `seq` 推进游标并跳过该载荷，继续处理后续事件。
 
 ## 2. 权限归属原则（所有方法都必须遵守）
 
@@ -25,7 +25,8 @@
 
 | 阶段 | 控制面 (`atomiumd.sock`) | 门户面 (`portal.sock` / `vsock`) |
 | --- | --- | --- |
-| v1.2（当前） | Socket 文件权限 `0600`（同一 UID 可连） | 尚未开放 |
+| v1.2 | Socket 文件权限 `0600`（同一 UID 可连） | 尚未开放 |
+| v1.3（PR 1.1a） | `0600` + 启动前的 L1 控制面拒绝探针 | 尚未开放 |
 | Phase 1–2（原 M5） | `0600` + Seatbelt 强探针强制阻断 L1 内部连接；逐步叠加 `LOCAL_PEERTOKEN` 对端代码签名白名单校验 | 每会话独立 socket / `vsock` 实例，服务端静态绑定 `session_id` 与能力集；授权撤销后存量连接后续调用立即拒绝 |
 | Phase 3（原 M7） | 移动端经 Noise IK 端到端加密中继连接；设备私钥存放于 Secure Enclave / StrongBox；高危裁决校验 `PresenceProof` | 同上 |
 
@@ -41,11 +42,16 @@ PresenceProof {
 }
 ```
 
-## 4. 已实现方法（v1.2）
+## 4. 已实现方法
 
 | 方法 | 参数 → 结果 | 说明 |
 | --- | --- | --- |
 | `daemon.ping` | `{}` → `{ok, service, version, transport}` | |
+| `daemon.capabilities` | `{}` → `DaemonCapabilities` | 返回协议版本、后端、支持的方法、熔断锁存和探针缓存摘要 |
+| `privacy.matrix` | `{}` → `PrivacyMatrix` | 返回各隐私项及其证据状态 |
+| `privacy.probe` | `PrivacyProbeRequest` → `PrivacyProbeResult` | 重跑全部或指定的探针 |
+| `daemon.panic` | `DaemonPanicRequest` → `DaemonPanicResult` | 锁存熔断，撤销出网并终止当前运行 |
+| `daemon.panic_clear` | `{}` → `DaemonPanicClearResult` | 清除持久化和内存锁存 |
 | `profiles.list` | `{}` → `{profiles: IdentityProfile[]}` | |
 | `profiles.upsert` | `IdentityProfile` → `{saved, id}` | |
 | `subscriptions.capture` | `SubscriptionCaptureRequest` → `SubscriptionSummary` | 把凭据封存进 Vault，并创建或更新 Profile（版本号加一） |
@@ -91,6 +97,16 @@ PresenceProof {
 | `runs.start.allowed_egress_hosts` 只接受可解析的精确主机（可选端口）或通配符条目；畸形条目在 RPC 边界拒绝，直接构造代理时也会 fail closed。网关把十进制/八进制/十六进制等非规范 IPv4 数字形式按解析后的地址分类，拒绝用 `127.1`、整数或十六进制形式绕过非公网地址拦截 | 防止拼写错误的策略被静默放宽为无限制出网，并防止替代数字编码绕过回环、链路本地、CGNAT 或文档前缀拦截 |
 | `ExportResult` 新增可选字段 `post_verify_ok`；导出改为 `broker_dir/exports/<export_id>/journal.json` 记录的准备、提交、复核及回滚流程。每次尝试生成独立的 `exp-<UUIDv7>`，可用 journal 中的 `approval_id` 与回执关联，守护进程启动时自动恢复未完成导出。回滚失败的工作区进入 `export_inconsistent`，后续导出返回 `-32018` | 防止导出中途崩溃造成宿主工作区处于无审计、不可恢复的中间状态 |
 | 带 `workspace_id` 的运行在 `runs.start` 租约原子获取阶段同时获取 `workspace:<workspace_id>` Exclusive 租约；正常结束、取消、超时和僵尸租约回收路径都释放该租约 | 防止多个写入者并发修改同一 Broker 工作副本 |
+
+### 4.3 v1.2 → v1.3 增量变更日志
+
+#### PR 1.1a
+
+- 新增 `daemon.capabilities`、`privacy.matrix`、`privacy.probe`、`daemon.panic` 和 `daemon.panic_clear`。`daemon.capabilities` 返回 `protocol_version = "1.3"`，在 `methods` 中列出这五个方法，在 `deprecated` 中列出 `subscriptions.activate`。本阶段 `portals` 为空数组。`PortalKind` 预先定义 `"url.open"` 的线格式。
+- 新增 `DaemonCapabilities`、`LaunchMode`、`ProbeCacheInfo`、`PortalKind`、`PrivacyStatus`、`PrivacyItem`、`PrivacyMatrix`、`PrivacyProbeRequest`、`PrivacyProbeResult`、`DaemonPanicRequest`、`DaemonPanicResult` 和 `DaemonPanicClearResult`。既有 `CapabilitiesReport` 新增可选的 `os_build`、`sbpl_template_digest`，`ProbeEvidence` 新增可选的 `mandatory`、`evidence_at_ms`。历史帧省略这些字段时仍可解码。
+- `privacy.probe` 省略 `probe_ids` 时重跑全量，指定子集时只更新对应证据。未知 `probe_ids` 或请求中出现未知字段返回 `-32602`。`daemon.panic.reason` 可省略，上限为 256 字节，入库前脱敏。超限或请求中出现未知字段返回 `-32602`。
+- `runs.start` 在熔断锁存期间返回 `-32002`，`data.kind = "panic_latched"`。必选探针失败返回 `-32003`，`data.kind = "isolation_probe_failed"`，并附上 `failed_probe_ids`。本次渲染策略装载失败返回 `-32003`，`data.kind = "isolation_policy_unloadable"`。同时观察到锁存时，优先返回 `panic_latched`。
+- 事件仍通过 `events.push` 发送。本阶段沿用 `StatusChanged` 记录熔断，`reason = "daemon_panic"`。CLI、TypeScript 客户端和桌面端按 §1 容忍未来的未知事件类型。
 
 ## 5. v2 规划类型草案（随 Phase 1–4 验证落地）
 
@@ -200,7 +216,6 @@ struct DeviceRecord { device_id: String, display_name: String, platform: String,
 | sessions | `sessions.start` / `list` / `get` / `attach` / `input` / `resize` / `detach` / `stop` | 仅控制面 | Phase 1（渐进兼容 `runs.*`） |
 | portals（请求侧） | `portals.invoke` / `portals.grants_self` | **门户面专用** | Phase 1 起（首批 `url.open`，Phase 2–3 扩展） |
 | portals / grants（管理侧） | `grants.list` / `create` / `revoke`，`portals.pending` / `decide` | 仅控制面 | Phase 1–3（高危动作需 `PresenceProof`） |
-| privacy / daemon | `daemon.capabilities`，`privacy.matrix` / `privacy.probe`，`daemon.panic` | 仅控制面 | Phase 1（原 M5） |
 | boxes | `boxes.create` / `list` / `get` / `start` / `stop` / `snapshot` / `restore` / `clone` / `destroy` | 仅控制面 | Phase 2（L3 容器）、Phase 3（可选 L2 VM） |
 | apps / harnesses / recipes | `apps.catalog` / `install`，`harnesses.list`，`recipes.save` / `list` / `launch` | 仅控制面 | Phase 2 |
 | devices | `devices.pair_begin` / `pair_complete` / `list` / `revoke` | 仅控制面 | Phase 3（原 M7） |

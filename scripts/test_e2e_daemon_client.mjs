@@ -231,6 +231,29 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
     assert.equal(ping.service, "atomiumd");
     assert.equal(ping.transport, "unix-socket-0600");
 
+    const capabilities = await client.daemonCapabilities();
+    assert.equal(capabilities.protocol_version, "1.3");
+    assert.deepEqual(capabilities.portals, []);
+    assert.ok(capabilities.deprecated.includes("subscriptions.activate"));
+    for (const method of ["daemon.capabilities", "privacy.matrix", "privacy.probe"]) {
+      assert.ok(capabilities.methods.includes(method));
+    }
+    const privacy = await client.privacyMatrix();
+    assert.equal(privacy.items.length, 11);
+    assert.equal(privacy.items.find(item => item.item_id === "tcc").status, "HostVisible");
+    await assert.rejects(client.privacyProbe({ probe_ids: ["unknown"] }), error => error.code === -32602);
+    const probes = await client.privacyProbe({ probe_ids: null });
+    assert.equal(probes.all_mandatory_passed, process.platform === "darwin");
+    if (process.platform === "darwin") {
+      assert.equal(probes.evidence.length, 7);
+      assert.ok(probes.evidence.every(item => item.mandatory && item.passed));
+      assert.match(probes.evidence.find(item => item.probe_id === "control_socket_connect_denied").actual, /target=control_socket/);
+      const partial = await client.privacyProbe({ probe_ids: ["iokit_identity_denied"] });
+      assert.deepEqual(partial.evidence.map(item => item.probe_id), ["iokit_identity_denied"]);
+      const updated = await client.daemonCapabilities();
+      assert.equal(updated.probe_cache.probed_at_ms, probes.probed_at_ms);
+    }
+
     // 3. profiles.upsert and profiles.list via AtomiumClient
     const testProfile = {
       id: "e2e-profile-1",
@@ -454,6 +477,18 @@ test("cross-layer E2E: atomiumd + AtomiumClient + atomium-cli", async () => {
     assert.equal(await fs.readFile(path.join(hostRepo, "src", "app.txt"), "utf8"), "candidate-v2\n");
     assert.equal(await fs.readFile(path.join(hostRepo, "added.txt"), "utf8"), "new-file\n");
     assert.equal(await fs.readFile(path.join(hostRepo, ".env"), "utf8"), "SECRET=exclude-me\n");
+    await assert.rejects(client.daemonPanic({ reason: "x".repeat(257) }), error => error.code === -32602);
+    const panicRun = await client.call("runs.start", { profile_id: "e2e-oauth-acct", program: "/bin/sh", args: ["-c", "sleep 60"] });
+    const panicResult = await client.daemonPanic({ reason: "E2E bounded stop" });
+    assert.ok(panicResult.elapsed_ms < 5000);
+    assert.equal(panicResult.latched, true);
+    assert.equal(panicResult.latch_persisted, true);
+    assert.ok(panicResult.stopped_runs.includes(panicRun.run_id));
+    assert.deepEqual(panicResult.cleanup_unverified, []);
+    await assert.rejects(client.call("runs.start", { profile_id: "e2e-profile-1", program: "/usr/bin/true" }), error => error.code === -32002 && error.data?.kind === "panic_latched");
+    assert.equal((await client.daemonCapabilities()).panic_latched, true);
+    assert.equal((await client.daemonPanicClear()).cleared, true);
+    assert.equal((await client.daemonCapabilities()).panic_latched, false);
   } finally {
     if (client) {
       client.disconnect();

@@ -256,7 +256,7 @@ async fn proxy_url_format_and_auth_failures_and_empty_connection() {
         assert!(resp.contains("X-Atomium-Fail-Closed: true"), "got: {resp}");
     }
 
-    handle.revoke();
+    handle.revoke().await.unwrap();
 }
 
 #[tokio::test]
@@ -286,7 +286,7 @@ async fn proxy_fail_closed_on_unreachable_upstream() {
     assert!(resp.starts_with("HTTP/1.1 502 Bad Gateway"), "got: {resp}");
     assert!(resp.contains("X-Atomium-Fail-Closed: true"), "got: {resp}");
 
-    handle.revoke();
+    handle.revoke().await.unwrap();
 }
 
 #[tokio::test]
@@ -372,7 +372,7 @@ async fn proxy_forwards_exact_request_and_relays_response_including_concurrent_r
         j.await.unwrap();
     }
 
-    handle.revoke();
+    handle.revoke().await.unwrap();
     server_task.abort();
 }
 
@@ -386,7 +386,7 @@ async fn proxy_revoke_shuts_down_listener() {
     // Listener is initially accepting
     assert!(TcpStream::connect(("127.0.0.1", port)).await.is_ok());
 
-    handle.revoke();
+    handle.revoke().await.unwrap();
     // Allow spawned accept loop to observe shutdown signal and drop TcpListener
     let mut closed = false;
     for _ in 0..20 {
@@ -454,7 +454,7 @@ async fn proxy_revoke_immediately_terminates_inflight_tcp_connections() {
         .expect("upstream should receive in-flight request");
 
     // Revoke MUST immediately tear down the in-flight TCP connection.
-    handle.revoke();
+    handle.revoke().await.unwrap();
 
     let mut resp_buf = [0u8; 256];
     let client_read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut resp_buf))
@@ -562,7 +562,7 @@ async fn proxy_enforces_optional_destination_host_allowlist() {
     }
 
     assert_eq!(hit_count.load(Ordering::SeqCst), 2);
-    handle.revoke();
+    handle.revoke().await.unwrap();
     server_task.abort();
 }
 
@@ -646,7 +646,7 @@ async fn proxy_rejects_noncanonical_ipv4_loopback_literals() {
         "public noncanonical IPv4 must reach the fail-closed upstream decision, got: {resp}"
     );
 
-    handle.revoke();
+    handle.revoke().await.unwrap();
 }
 
 #[tokio::test]
@@ -674,7 +674,7 @@ async fn proxy_rejects_nonpublic_ip_literals_unless_exactly_allowlisted() {
             "{target}: {resp}"
         );
     }
-    handle.revoke();
+    handle.revoke().await.unwrap();
 
     // An exact operator-configured allowlist entry is an explicit exception for local test fixtures.
     let allowed = spawn_run_proxy_with_policy(
@@ -695,7 +695,7 @@ async fn proxy_rejects_nonpublic_ip_literals_unless_exactly_allowlisted() {
     s.write_all(req.as_bytes()).await.unwrap();
     let resp = read_response(&mut s).await;
     assert!(resp.starts_with("HTTP/1.1 502 Bad Gateway"), "got: {resp}");
-    allowed.revoke();
+    allowed.revoke().await.unwrap();
 }
 
 #[tokio::test]
@@ -731,7 +731,7 @@ async fn proxy_auth_requires_exact_header_value_and_oversized_headers_are_reject
         "got: {resp}"
     );
 
-    handle.revoke();
+    handle.revoke().await.unwrap();
 }
 
 #[tokio::test]
@@ -759,7 +759,7 @@ async fn proxy_malformed_allowlist_entries_fail_closed_instead_of_widening_egres
         "malformed policy must deny even otherwise-valid hosts, got: {resp}"
     );
 
-    handle.revoke();
+    handle.revoke().await.unwrap();
 }
 
 #[tokio::test]
@@ -800,7 +800,7 @@ async fn proxy_allowlist_normalizes_case_trailing_dot_ports_and_wildcards() {
     let resp = read_response(&mut s).await;
     assert!(resp.starts_with("HTTP/1.1 403 Forbidden"), "got: {resp}");
 
-    handle.revoke();
+    handle.revoke().await.unwrap();
 }
 
 #[tokio::test]
@@ -852,7 +852,7 @@ async fn proxy_keep_alive_rechecks_each_request_and_reconnects_for_new_allowed_h
         "local proxy credential leaked upstream: {seen:?}"
     );
 
-    handle.revoke();
+    handle.revoke().await.unwrap();
     upstream.task.abort();
 }
 
@@ -887,7 +887,7 @@ async fn proxy_keep_alive_reauthenticates_the_second_request() {
     assert!(resp.starts_with("HTTP/1.1 407"), "got: {resp}");
     assert_eq!(upstream.accepts.load(Ordering::SeqCst), 1);
 
-    handle.revoke();
+    handle.revoke().await.unwrap();
     upstream.task.abort();
 }
 
@@ -918,7 +918,7 @@ async fn proxy_accepts_headers_split_across_multiple_writes() {
         resp.starts_with("HTTP/1.1 502 Bad Gateway"),
         "split valid header should authenticate and reach fail-closed upstream handling, got: {resp}"
     );
-    handle.revoke();
+    handle.revoke().await.unwrap();
 }
 
 #[tokio::test]
@@ -968,7 +968,7 @@ async fn proxy_rejects_ambiguous_framing_malformed_requests_and_upgrade() {
     }
 
     assert_eq!(upstream.accepts.load(Ordering::SeqCst), 0);
-    handle.revoke();
+    handle.revoke().await.unwrap();
     upstream.task.abort();
 }
 
@@ -1009,7 +1009,7 @@ async fn proxy_forwards_three_chunked_requests_on_one_keep_alive_connection() {
         "same-host keep-alive requests must reuse one upstream connection"
     );
 
-    handle.revoke();
+    handle.revoke().await.unwrap();
     upstream.task.abort();
 }
 
@@ -1058,7 +1058,7 @@ async fn proxy_forwards_valid_trailers_both_directions_with_informational_respon
         .unwrap();
     }
     server.await.unwrap();
-    proxy.revoke();
+    proxy.revoke().await.unwrap();
 }
 
 #[tokio::test]
@@ -1112,7 +1112,7 @@ async fn proxy_connect_strips_local_proxy_authorization_before_upstream() {
     );
 
     drop(s);
-    handle.revoke();
+    handle.revoke().await.unwrap();
     server_task.abort();
 }
 
@@ -1160,7 +1160,7 @@ async fn proxy_revoke_interrupts_incomplete_request_body_forwarding() {
         .await
         .expect("upstream should receive the partial request");
 
-    handle.revoke();
+    handle.revoke().await.unwrap();
     let mut byte = [0u8; 1];
     let client_read = tokio::time::timeout(Duration::from_secs(2), s.read(&mut byte))
         .await
@@ -1236,7 +1236,7 @@ async fn review_invalid_request_framing_never_reaches_upstream() {
             .await
             .is_err()
     );
-    proxy.revoke();
+    proxy.revoke().await.unwrap();
 }
 
 #[tokio::test]
@@ -1272,7 +1272,7 @@ async fn review_bad_response_is_rejected_before_head_and_stream_errors_close() {
             assert!(!output.contains("200 OK"));
         }
         server.await.unwrap();
-        proxy.revoke();
+        proxy.revoke().await.unwrap();
     }
 }
 
@@ -1309,7 +1309,7 @@ async fn review_connect_failures_return_bad_gateway() {
         if let Some(server) = server {
             server.await.unwrap();
         }
-        proxy.revoke();
+        proxy.revoke().await.unwrap();
     }
 }
 
@@ -1345,5 +1345,5 @@ async fn review_exact_ipv6_allowlist_forwards_to_mock() {
         .unwrap();
     assert!(response.starts_with("HTTP/1.1 200"));
     server.await.unwrap();
-    proxy.revoke();
+    proxy.revoke().await.unwrap();
 }

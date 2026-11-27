@@ -1,4 +1,5 @@
 mod capture_source;
+mod launchagent;
 
 use anyhow::{anyhow, Result};
 use atomium_core::ProfileStore;
@@ -39,8 +40,20 @@ enum Commands {
     Probe,
     /// Check daemon socket connectivity
     Daemon {
+        #[command(subcommand)]
+        action: Option<DaemonCommands>,
+        #[arg(long, global = true)]
+        socket: Option<PathBuf>,
+    },
+    Capabilities {
         #[arg(long)]
         socket: Option<PathBuf>,
+    },
+    Privacy {
+        #[arg(long, global = true)]
+        socket: Option<PathBuf>,
+        #[command(subcommand)]
+        action: PrivacyCommands,
     },
     /// Inspect stored identity profiles directly from SQLite
     Profile {
@@ -82,6 +95,29 @@ enum Commands {
         #[command(subcommand)]
         action: ApprovalCommands,
     },
+}
+
+#[derive(Subcommand)]
+enum PrivacyCommands {
+    Matrix,
+    Probe {
+        #[arg(long = "probe-id")]
+        probe_ids: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommands {
+    Launchagent {
+        #[command(subcommand)]
+        action: launchagent::LaunchAgentAction,
+    },
+    Panic {
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    PanicClear,
+    Capabilities,
 }
 
 #[derive(Subcommand)]
@@ -302,6 +338,7 @@ async fn wait_for_run_terminal(sock_path: &Path, run_id: &str) -> Result<serde_j
         .await?;
     write_half.flush().await?;
 
+    let mut cursor = 0;
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
@@ -309,7 +346,7 @@ async fn wait_for_run_terminal(sock_path: &Path, run_id: &str) -> Result<serde_j
         let val: serde_json::Value = serde_json::from_str(&line)?;
         if val.get("method").and_then(|v| v.as_str()) == Some("events.push") {
             if let Some(params) = val.get("params") {
-                if let Ok(ev) = serde_json::from_value::<TaskEvent>(params.clone()) {
+                if let Some(ev) = consume_task_event(params, &mut cursor) {
                     if ev.run_id == run_id {
                         if let TaskEventPayload::StatusChanged { status, .. } = ev.payload {
                             if matches!(
@@ -417,10 +454,45 @@ async fn main() -> Result<()> {
             let (caps, _) = backend.probe().await?;
             println!("{}", serde_json::to_string_pretty(&caps)?);
         }
-        Commands::Daemon { socket } => {
+        Commands::Daemon { socket, action } => {
+            if let Some(DaemonCommands::Launchagent { action }) = action {
+                launchagent::run(action)?;
+                return Ok(());
+            }
+            let (method, params) = match action {
+                Some(DaemonCommands::Panic { reason }) => {
+                    ("daemon.panic", serde_json::json!({"reason":reason}))
+                }
+                Some(DaemonCommands::PanicClear) => ("daemon.panic_clear", serde_json::json!({})),
+                Some(DaemonCommands::Capabilities) => {
+                    ("daemon.capabilities", serde_json::json!({}))
+                }
+                None => ("daemon.ping", serde_json::json!({})),
+                _ => unreachable!(),
+            };
             let sock = resolve_socket_path(socket);
-            let resp = rpc_call(&sock, "daemon.ping", serde_json::json!({})).await?;
+            let resp = rpc_call(&sock, method, params).await?;
             println!("{}", serde_json::to_string(&resp)?);
+        }
+        Commands::Capabilities { socket } => {
+            let result = rpc_call_expect_ok(
+                &resolve_socket_path(socket),
+                "daemon.capabilities",
+                serde_json::json!({}),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Commands::Privacy { socket, action } => {
+            let (method, params) = match action {
+                PrivacyCommands::Matrix => ("privacy.matrix", serde_json::json!({})),
+                PrivacyCommands::Probe { probe_ids } => (
+                    "privacy.probe",
+                    serde_json::json!({"probe_ids": if probe_ids.is_empty() { None } else { Some(probe_ids) }}),
+                ),
+            };
+            let result = rpc_call_expect_ok(&resolve_socket_path(socket), method, params).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Commands::Profile { db } => {
             let db_path = db.unwrap_or_else(|| std::env::temp_dir().join("atomiumd.sqlite"));
@@ -718,4 +790,52 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+// Advance the envelope cursor even when a newer daemon adds a payload type.
+fn consume_task_event(params: &serde_json::Value, cursor: &mut i64) -> Option<TaskEvent> {
+    let seq = params.get("seq")?.as_i64()?;
+    *cursor = (*cursor).max(seq);
+    let event_type = params.pointer("/payload/type")?.as_str()?;
+    if !matches!(
+        event_type,
+        "status_changed"
+            | "log_line"
+            | "policy_denied"
+            | "approval_requested"
+            | "approval_resolved"
+    ) {
+        return None;
+    }
+    serde_json::from_value(params.clone()).ok()
+}
+
+#[cfg(test)]
+mod forward_event_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_future_events_advance_cursor() {
+        let mut cursor = 0;
+        let mut delivered = Vec::new();
+        for (seq, payload) in [
+            (
+                1,
+                serde_json::json!({"type":"log_line", "stream":"stdout", "line":"first"}),
+            ),
+            (2, serde_json::json!({"type":"future_event"})),
+            (
+                3,
+                serde_json::json!({"type":"status_changed", "status":"stopped", "reason":null}),
+            ),
+            (4, serde_json::json!({"type":"future_event"})),
+        ] {
+            let frame = serde_json::json!({"seq":seq,"run_id":"run-test","timestamp_ms":1,"payload":payload});
+            if let Some(event) = consume_task_event(&frame, &mut cursor) {
+                delivered.push(event.seq);
+            }
+        }
+        assert_eq!(cursor, 4);
+        assert_eq!(delivered, vec![1, 3]);
+    }
 }

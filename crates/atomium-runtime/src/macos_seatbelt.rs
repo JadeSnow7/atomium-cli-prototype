@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use atomium_protocol::{CapabilitiesReport, CredentialSpec, OAuthStorageMode, ProbeEvidence};
 use std::path::{Path, PathBuf};
-use tokio::net::TcpListener;
 use tokio::process::Command;
 
 use crate::backend::{PreparedCommand, RuntimeBackend, RuntimeSpawnSpec};
@@ -134,6 +133,7 @@ pub fn render_sbpl_with_extra_read_paths(
 (allow process-fork)
 (allow process-exec)
 (allow signal (target self))
+(deny iokit-get-properties (iokit-property "IOPlatformSerialNumber") (iokit-property "IOPlatformUUID"))
 (allow process-info-pidinfo (target self))
 (allow ipc-posix-sem*)
 (allow sysctl-read)
@@ -377,197 +377,13 @@ impl RuntimeBackend for MacOsSeatbeltBackend {
     }
 
     async fn probe(&self) -> Result<(CapabilitiesReport, Vec<ProbeEvidence>)> {
-        let base = std::env::temp_dir().join(format!("atomium-m0-{}", uuid::Uuid::now_v7()));
-        let ws = base.join("workspace");
-        let home = base.join("home");
-        let tmp = base.join("tmp");
-        let cache = base.join("cache");
-        let host_secret = base.join("host-synthetic-secret.txt");
+        crate::probes::strong_probe(None).await
+    }
 
-        std::fs::create_dir_all(&ws)?;
-        std::fs::create_dir_all(&home)?;
-        std::fs::create_dir_all(&tmp)?;
-        std::fs::create_dir_all(&cache)?;
-        std::fs::write(&host_secret, "SYNTHETIC_HOST_CANARY_DO_NOT_READ")?;
-
-        let cfg = SeatbeltConfig {
-            workspace_dir: std::fs::canonicalize(&ws)?,
-            run_home_dir: std::fs::canonicalize(&home)?,
-            run_tmp_dir: std::fs::canonicalize(&tmp)?,
-            run_cache_dir: std::fs::canonicalize(&cache)?,
-            allowed_proxy_port: None,
-            keychain_policy: KeychainPolicy::Deny,
-            timezone: Some("UTC".into()),
-            lang: Some("en_US.UTF-8".into()),
-        };
-
-        let mut evidences = Vec::new();
-        let mut nested_blocked = false;
-
-        // Probe 1: legal workspace read/write allowed
-        let p1 = run_in_seatbelt(
-            &cfg,
-            "/bin/sh",
-            &["-c", "printf 'ok-rw' > probe.txt && cat probe.txt"],
-            &[],
-        )
-        .await?;
-        let p1_err = String::from_utf8_lossy(&p1.stderr).to_string();
-        if p1_err.contains("sandbox_apply: Operation not permitted") {
-            nested_blocked = true;
-        }
-        let p1_out = String::from_utf8_lossy(&p1.stdout).to_string();
-        let p1_passed = p1.status.success() && p1_out == "ok-rw";
-        evidences.push(ProbeEvidence {
-            probe_id: "workspace_rw_allowed".into(),
-            passed: p1_passed,
-            expected: "exit 0 with stdout 'ok-rw'".into(),
-            actual: format!("exit {:?} stdout={:?}", p1.status.code(), p1_out),
-            exit_code: p1.status.code(),
-            detail: p1_err.trim().to_string(),
-        });
-
-        // Probe 2: host synthetic secret read denied
-        let host_secret_canon = std::fs::canonicalize(&host_secret)?;
-        let p2 = run_in_seatbelt(
-            &cfg,
-            "/bin/cat",
-            &[host_secret_canon.to_string_lossy().as_ref()],
-            &[],
-        )
-        .await?;
-        let p2_err = String::from_utf8_lossy(&p2.stderr).to_string();
-        let p2_out = String::from_utf8_lossy(&p2.stdout).to_string();
-        let p2_passed = p1_passed
-            && !nested_blocked
-            && !p2.status.success()
-            && !p2_out.contains("SYNTHETIC_HOST_CANARY");
-        evidences.push(ProbeEvidence {
-            probe_id: "host_secret_read_denied".into(),
-            passed: p2_passed,
-            expected: "non-zero exit, host canary unreadable".into(),
-            actual: format!(
-                "exit {:?} leaked={}",
-                p2.status.code(),
-                p2_out.contains("SYNTHETIC_HOST_CANARY")
-            ),
-            exit_code: p2.status.code(),
-            detail: p2_err.trim().to_string(),
-        });
-
-        let py_bin = if Path::new("/opt/homebrew/bin/python3").exists() {
-            "/opt/homebrew/bin/python3"
-        } else {
-            "/usr/bin/python3"
-        };
-
-        // Probe 3: direct external network denied with proxy env cleared
-        let p3 = run_in_seatbelt(
-            &cfg,
-            py_bin,
-            &[
-                "-c",
-                "import socket; s=socket.socket(); s.settimeout(1.5); s.connect(('1.1.1.1',80)); print('CONNECTED')",
-            ],
-            &[],
-        )
-        .await?;
-        let p3_err = String::from_utf8_lossy(&p3.stderr).to_string();
-        let p3_out = String::from_utf8_lossy(&p3.stdout).to_string();
-        let p3_passed =
-            p1_passed && !nested_blocked && !p3.status.success() && !p3_out.contains("CONNECTED");
-        evidences.push(ProbeEvidence {
-            probe_id: "direct_egress_denied".into(),
-            passed: p3_passed,
-            expected: "non-zero exit (EPERM/denied), direct TCP blocked".into(),
-            actual: format!(
-                "exit {:?} connected={}",
-                p3.status.code(),
-                p3_out.contains("CONNECTED")
-            ),
-            exit_code: p3.status.code(),
-            detail: p3_err.trim().to_string(),
-        });
-
-        // Probe 4: unauthorized localhost port denied
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let unauth_port = listener.local_addr()?.port();
-        let py_script = format!(
-            "import socket; s=socket.socket(); s.settimeout(1.5); s.connect(('127.0.0.1',{unauth_port})); print('LOCAL_CONNECTED')"
-        );
-        let p4 = run_in_seatbelt(&cfg, py_bin, &["-c", &py_script], &[]).await?;
-        drop(listener);
-        let p4_err = String::from_utf8_lossy(&p4.stderr).to_string();
-        let p4_out = String::from_utf8_lossy(&p4.stdout).to_string();
-        let p4_passed = p1_passed
-            && !nested_blocked
-            && !p4.status.success()
-            && !p4_out.contains("LOCAL_CONNECTED");
-        evidences.push(ProbeEvidence {
-            probe_id: "unauthorized_localhost_denied".into(),
-            passed: p4_passed,
-            expected: format!("non-zero exit, connection to 127.0.0.1:{unauth_port} denied"),
-            actual: format!(
-                "exit {:?} connected={}",
-                p4.status.code(),
-                p4_out.contains("LOCAL_CONNECTED")
-            ),
-            exit_code: p4.status.code(),
-            detail: p4_err.trim().to_string(),
-        });
-
-        let _ = std::fs::remove_dir_all(&base);
-
-        let all_passed = !nested_blocked && evidences.iter().all(|e| e.passed);
-        let os_version = Command::new("/usr/bin/sw_vers")
-            .arg("-productVersion")
-            .output()
-            .await
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|| "unknown".into());
-
-        let mut notes = vec![
-            "SwiftPM build recipes must pass --disable-sandbox and redirect CLANG_MODULE_CACHE_PATH.".into(),
-            "agy 1.5.16 verified on macOS arm64: supports IsolatedFile fallback ($HOME/.gemini/antigravity-cli/antigravity-oauth-token) when Keychain/SecurityServer are blocked by Seatbelt, after decoding zalando/go-keyring 'go-keyring-base64:' wrapper into raw JSON (IsolatedFile default; HostKeychainSlot retained as fallback).".into(),
-        ];
-        if nested_blocked {
-            notes.push("Nested sandbox-exec blocked by outer sandbox; run doctor in standard macOS Terminal for live enforcement evidence.".into());
-        }
-
-        let report = CapabilitiesReport {
-            schema_version: "atomium-capabilities-v1".into(),
-            os: std::env::consts::OS.into(),
-            os_version,
-            backend: self.name().into(),
-            file_isolation: if all_passed {
-                "enforced_verified"
-            } else {
-                "unverified"
-            }
-            .into(),
-            egress_enforcement: if all_passed {
-                "enforced_verified"
-            } else {
-                "unverified"
-            }
-            .into(),
-            keychain_isolation: if nested_blocked {
-                "unverified"
-            } else {
-                "enforced_verified"
-            }
-            .into(),
-            location_blocked: if nested_blocked {
-                "unverified"
-            } else {
-                "enforced_verified"
-            }
-            .into(),
-            timezone_policy: "default_configured".into(),
-            notes,
-        };
-
-        Ok((report, evidences))
+    async fn probe_with_control_socket(
+        &self,
+        path: &Path,
+    ) -> Result<(CapabilitiesReport, Vec<ProbeEvidence>)> {
+        crate::probes::strong_probe(Some(path)).await
     }
 }

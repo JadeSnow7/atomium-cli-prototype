@@ -195,9 +195,11 @@ dependencies = [
  "atomiumd",
  "base64 0.22.1",
  "clap",
+ "libc",
  "security-framework",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -257,6 +259,8 @@ dependencies = [
  "async-trait",
  "atomium-protocol",
  "libc",
+ "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "uuid",
 ]
@@ -272,6 +276,7 @@ dependencies = [
  "atomium-runtime",
  "base64 0.22.1",
  "hex",
+ "libc",
  "rand",
  "regex",
  "serde",

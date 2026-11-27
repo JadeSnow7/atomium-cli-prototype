@@ -243,7 +243,16 @@ fn doctor_emits_capabilities_and_evidence_on_macos() {
     let ev_raw = std::fs::read(out_dir.join("evidence.json")).expect("read evidence.json");
     let evidences: Vec<ProbeEvidence> =
         serde_json::from_slice(&ev_raw).expect("parse Vec<ProbeEvidence>");
-    assert_eq!(evidences.len(), 4);
+    assert_eq!(evidences.len(), 7);
+    assert!(evidences
+        .iter()
+        .all(|e| e.mandatory == Some(true) && e.evidence_at_ms.is_some()));
+    assert!(evidences
+        .iter()
+        .find(|e| e.probe_id == "control_socket_connect_denied")
+        .unwrap()
+        .actual
+        .contains("target=canary"));
 }
 
 #[cfg(target_os = "macos")]

@@ -266,6 +266,10 @@ pub struct JsonRpcError {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct CapabilitiesReport {
+    #[serde(default)]
+    pub os_build: Option<String>,
+    #[serde(default)]
+    pub sbpl_template_digest: Option<String>,
     pub schema_version: String,
     pub os: String,
     pub os_version: String,
@@ -281,6 +285,11 @@ pub struct CapabilitiesReport {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ProbeEvidence {
+    #[serde(default)]
+    pub mandatory: Option<bool>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub evidence_at_ms: Option<i64>,
     pub probe_id: String,
     pub passed: bool,
     pub expected: String,
@@ -463,6 +472,18 @@ mod tests {
 
     #[test]
     fn export_bindings() {
+        LaunchMode::export_all().unwrap();
+        PortalKind::export_all().unwrap();
+        ProbeCacheInfo::export_all().unwrap();
+        DaemonCapabilities::export_all().unwrap();
+        PrivacyStatus::export_all().unwrap();
+        PrivacyItem::export_all().unwrap();
+        PrivacyMatrix::export_all().unwrap();
+        PrivacyProbeRequest::export_all().unwrap();
+        PrivacyProbeResult::export_all().unwrap();
+        DaemonPanicRequest::export_all().unwrap();
+        DaemonPanicResult::export_all().unwrap();
+        DaemonPanicClearResult::export_all().unwrap();
         IdentityProfile::export_all().unwrap();
         TaskEvent::export_all().unwrap();
         RunRecord::export_all().unwrap();
@@ -489,4 +510,117 @@ mod tests {
         ApprovalResolveRequest::export_all().unwrap();
         ExportResult::export_all().unwrap();
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchMode {
+    LaunchAgent,
+    Terminal,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum PortalKind {
+    #[serde(rename = "url.open")]
+    UrlOpen,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProbeCacheInfo {
+    pub os_build: String,
+    pub sbpl_template_digest: String,
+    #[ts(type = "number")]
+    pub probed_at_ms: i64,
+    pub all_mandatory_passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DaemonCapabilities {
+    pub protocol_version: String,
+    pub daemon_version: String,
+    pub launch_mode: LaunchMode,
+    pub backend: CapabilitiesReport,
+    pub methods: Vec<String>,
+    pub deprecated: Vec<String>,
+    pub portals: Vec<PortalKind>,
+    pub panic_latched: bool,
+    pub probe_cache: Option<ProbeCacheInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum PrivacyStatus {
+    Enforced,
+    DefaultOnly,
+    HostVisible,
+    Unverified,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PrivacyItem {
+    pub item_id: String,
+    pub status: PrivacyStatus,
+    pub probe_id: Option<String>,
+    #[ts(type = "number | null")]
+    pub evidence_at_ms: Option<i64>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PrivacyMatrix {
+    pub items: Vec<PrivacyItem>,
+    pub os_build: String,
+    pub launch_mode: LaunchMode,
+    #[ts(type = "number")]
+    pub evaluated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct PrivacyProbeRequest {
+    pub probe_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PrivacyProbeResult {
+    pub report: CapabilitiesReport,
+    pub evidence: Vec<ProbeEvidence>,
+    pub all_mandatory_passed: bool,
+    #[ts(type = "number")]
+    pub probed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonPanicRequest {
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DaemonPanicResult {
+    pub latched: bool,
+    pub latch_persisted: bool,
+    pub stopped_runs: Vec<String>,
+    pub revoked_grants: u32,
+    pub closed_portal_connections: u32,
+    pub cleanup_unverified: Vec<String>,
+    #[ts(type = "number")]
+    pub elapsed_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DaemonPanicClearResult {
+    pub cleared: bool,
 }

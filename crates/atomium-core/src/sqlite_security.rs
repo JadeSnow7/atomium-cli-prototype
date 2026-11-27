@@ -19,6 +19,13 @@ pub struct SecureSqliteConnection {
 
 impl SecureSqliteConnection {
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_busy_timeout(db_path, std::time::Duration::from_secs(5))
+    }
+
+    pub fn open_with_busy_timeout(
+        db_path: impl AsRef<Path>,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
         match fs::symlink_metadata(&db_path) {
             Ok(meta) if meta.file_type().is_symlink() => {
@@ -43,8 +50,11 @@ impl SecureSqliteConnection {
             Err(err) => return Err(err.into()),
         }
         let conn = Connection::open(&db_path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.busy_timeout(timeout)?;
+        let journal: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !journal.eq_ignore_ascii_case("wal") {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+        }
         harden_sqlite_files(&db_path)?;
         Ok(Self { conn, db_path })
     }

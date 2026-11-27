@@ -103,6 +103,8 @@ export function formatEventDetail(ev: TaskEvent): string {
       return `APPROVAL REQUESTED ${p.request.approval_id} (${p.request.action_kind}) digest=${shortDigest(p.request.candidate_digest)}`;
     case "approval_resolved":
       return `APPROVAL ${p.approved ? "APPROVED" : "REJECTED"} ${p.approval_id}`;
+    default:
+      return "";
   }
 }
 

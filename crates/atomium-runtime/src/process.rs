@@ -61,3 +61,39 @@ pub async fn terminate_child_process_group(child: &mut tokio::process::Child, pg
         let _ = child.wait().await;
     }
 }
+
+/// Panic uses one TERM grace period and one shared kill/reap confirmation deadline.
+pub async fn terminate_for_panic(proc: &mut crate::SpawnedProcess) -> bool {
+    let Some(pgid) = proc.pgid else {
+        return proc.child.kill().await.is_ok();
+    };
+    unsafe {
+        libc::kill(-(pgid as libc::pid_t), libc::SIGTERM);
+    }
+    let grace = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let _ = proc.child.try_wait();
+        if !process_group_alive(pgid) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= grace {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    unsafe {
+        libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+    }
+    let _ = proc.child.start_kill();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let _ = proc.child.try_wait();
+        if !process_group_alive(pgid) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}

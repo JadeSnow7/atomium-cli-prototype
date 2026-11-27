@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+libc.workspace = true
+uuid.workspace = true
 anyhow.workspace = true
 atomium-core = { path = "../atomium-core" }
 atomium-protocol = { path = "../atomium-protocol" }

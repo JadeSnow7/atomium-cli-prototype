@@ -46,6 +46,6 @@ mod tests {
             "got: {resp2}"
         );
 
-        handle.revoke();
+        drop(handle.revoke());
     }
 }

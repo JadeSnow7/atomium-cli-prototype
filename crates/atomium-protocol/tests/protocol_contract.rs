@@ -317,6 +317,8 @@ fn json_rpc_request_response_and_error_wire_format() {
 #[test]
 fn capabilities_report_and_probe_evidence_roundtrip() {
     let report = CapabilitiesReport {
+        os_build: None,
+        sbpl_template_digest: None,
         schema_version: "atomium-capabilities-v1".into(),
         os: "macos".into(),
         os_version: "15.3".into(),
@@ -333,6 +335,8 @@ fn capabilities_report_and_probe_evidence_roundtrip() {
     assert_eq!(v_rep["notes"].as_array().unwrap().len(), 2);
 
     let ev_some = ProbeEvidence {
+        mandatory: None,
+        evidence_at_ms: None,
         probe_id: "workspace_rw_allowed".into(),
         passed: true,
         expected: "exit 0".into(),
@@ -344,6 +348,8 @@ fn capabilities_report_and_probe_evidence_roundtrip() {
     assert_eq!(v_ev_some["exit_code"], 0);
 
     let ev_none = ProbeEvidence {
+        mandatory: None,
+        evidence_at_ms: None,
         probe_id: "signal_killed".into(),
         passed: false,
         expected: "non-zero".into(),
@@ -564,4 +570,22 @@ fn approval_create_rejects_host_paths_including_legacy_null() {
         .unwrap()
         .get("target_dir")
         .is_none());
+}
+
+#[test]
+fn control_plane_requests_reject_unknown_fields_and_old_evidence_defaults() {
+    use atomium_protocol::{DaemonPanicRequest, PrivacyProbeRequest};
+    assert!(serde_json::from_value::<DaemonPanicRequest>(
+        serde_json::json!({"reason":null,"disable_sandbox":true})
+    )
+    .is_err());
+    assert!(serde_json::from_value::<PrivacyProbeRequest>(
+        serde_json::json!({"probe_ids":null,"host_path":"/"})
+    )
+    .is_err());
+    let evidence: ProbeEvidence = serde_json::from_value(serde_json::json!({
+        "probe_id":"old", "passed":false,"expected":"denied","actual":"unknown","exit_code":null,"detail":"old frame"
+    })).unwrap();
+    assert_eq!(evidence.mandatory, None);
+    assert_eq!(evidence.evidence_at_ms, None);
 }
