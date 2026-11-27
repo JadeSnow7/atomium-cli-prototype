@@ -1,9 +1,9 @@
 # 任务 P1.1：L1 用户态 LaunchAgent、边界强探针、交互式 PTY 与每会话 `portal.sock`
 
-> 状态：**R2 可执行定稿 r4（Owner 已拍板 O-1～O-4 与 O-8；Codex 偏差已由 Claude 全部裁决）**
-> 修订记录：r1 草案（`2e67aa1`）→ r2（Claude 技术负责人修订）：细化三个 PR 的边界与协议骨架，补齐 `url.open` 首期白名单方案、R2 拒绝验收、E1–E5 的通过/失败判据与工程约束，并把 A1 取舍与 Owner 决策分开列出 → r3（2026-11-27，Owner 拍板 O-1～O-4 并合入 Gemini 独立核查 4 项加固）：改用原子 `O_CLOEXEC` PTY 创建防跨会话 fd 泄露；缩短 portal socket 为 `<runs_dir>/p/<12位hex>.s` 兼容 32 字符用户名；收紧 `redirect_uri`/`scope` 固定与 `query_preview` 非公开键名脱敏；明确 `p/` 仅 `file-read-metadata` 与 `open` shim 拒绝非 URL 参数 → r4（2026-11-27，Claude 按 A1 裁决 Codex 在 `db82f2d` 提出的全部开工前偏差，并记录 Owner A2 批准的 O-8）：RA-1 预检前移与 live/离线探针分离（E-16、E-17）；熔断串行化、5 秒端到端口径、幂等比较规则与 DB+socket 双锁（E-18～E-20）；E5 去 Seatbelt/TCC 混杂（E-21）；门户授权线性化与 RB-5 / 协议 §8 统一（E-22、E-23）；URL 原始预检、高熵脱敏、无覆盖发布与 `BROWSER`/`default-run`（E-24～E-26）；`url.open` argv 凭据守卫（O-8、RB-6b）；严格扁平 DTO、PTY 与 `setsid` 解耦、RC-1/RC-4/F-p 口径（E-27～E-29）；文档同步清单（附录 G）。
+> 状态：**R2 可执行定稿 r5（Owner 已拍板 O-1～O-4、O-6 与 O-8；E1–E4 原生夹具实验已完成；PR 1.1a 开工条件已全部满足）**
+> 修订记录：r1 草案（`2e67aa1`）→ r2（Claude 技术负责人修订）：细化三个 PR 的边界与协议骨架，补齐 `url.open` 首期白名单方案、R2 拒绝验收、E1–E5 的通过/失败判据与工程约束，并把 A1 取舍与 Owner 决策分开列出 → r3（2026-11-27，Owner 拍板 O-1～O-4 并合入 Gemini 独立核查 4 项加固）：改用原子 `O_CLOEXEC` PTY 创建防跨会话 fd 泄露；缩短 portal socket 为 `<runs_dir>/p/<12位hex>.s` 兼容 32 字符用户名；收紧 `redirect_uri`/`scope` 固定与 `query_preview` 非公开键名脱敏；明确 `p/` 仅 `file-read-metadata` 与 `open` shim 拒绝非 URL 参数 → r4（2026-11-27，Claude 按 A1 裁决 Codex 在 `db82f2d` 提出的全部开工前偏差，并记录 Owner A2 批准的 O-8）：RA-1 预检前移与 live/离线探针分离（E-16、E-17）；熔断串行化、5 秒端到端口径、幂等比较规则与 DB+socket 双锁（E-18～E-20）；E5 去 Seatbelt/TCC 混杂（E-21）；门户授权线性化与 RB-5 / 协议 §8 统一（E-22、E-23）；URL 原始预检、高熵脱敏、无覆盖发布与 `BROWSER`/`default-run`（E-24～E-26）；`url.open` argv 凭据守卫（O-8、RB-6b）；严格扁平 DTO、PTY 与 `setsid` 解耦、RC-1/RC-4/F-p 口径（E-27～E-29）；文档同步清单（附录 G）→ r5（2026-11-27，Claude 按 A1 吸纳 Gemini r4 复核与 Codex r4 复核及 E1–E4 实测（`40bd539`、`1ab8620`）的待确认项，并记录 Owner A2 批准的 O-6）：O-6 落为既定剩余限制（RC-1、§5、附录 G）；RA-5/C.2 精确白名单优先、1.1a 熔断快拒与预检竞态、锁文件不 unlink、日志排空计入 5 秒、live 探针配置路径与规范路径分测（E-30、E-31）；B.2 撤销墓碑只针对 `Allow`、`opener_gate` 与 panic 锁存的唯一线性化点、O-8 覆盖 8–15 字节并在守卫前 `refresh`、shim 在双锁后重建（E-32～E-34）；LaunchAgent 路径预算按 E4 修正为 73/97 字节；SBPL 信号规则改为 `(target same-sandbox)`，并固定跨 PR 锁序 `spawn_gate → opener_gate → spawn_fd_lock`（E-35、E-36）。
 
-**风险档位**：R2　　**授权等级**：A1（增量协议与局部设计，见附录 E）＋ A2（O-1～O-3、O-8 已获 Owner 批准；O-5～O-7 仅在触发时决定）＋ **含 A3 前置/实测项**（O-4：LaunchAgent 加载与 TCC 对照实测，Owner 已确认亲自执行）
+**风险档位**：R2　　**授权等级**：A1（增量协议与局部设计，见附录 E）＋ A2（O-1～O-3、O-6、O-8 已获 Owner 批准；O-5 经 E2 未触发；O-7 仅在 E5 触发时决定）＋ **含 A3 前置/实测项**（O-4：LaunchAgent 加载与 TCC 对照实测，Owner 已确认亲自执行）
 **执行负责人**：ChatGPT（实现负责人）　　**评审者**：Claude（设计一致性）＋ Gemini（R2 关键假设独立核查）　　**集成人**：Claude
 
 ---
@@ -56,7 +56,8 @@
 #### 2.2 R2 拒绝验收：PR 1.1a（强探针、熔断与 LaunchAgent）
 
 - [ ] **RA-1 必选探针 Fail-Closed** [CI][mac]：通过测试钩子（仅在 `#[cfg(test)]` 或测试专用构造器中可用，不得暴露为 RPC 参数）让任意一项必选探针失败，或者让 SBPL 渲染出无法装载的策略。此时非开发模式下的 `runs.start` 和 `sessions.start`（后者从 1.1c 起）必须返回 `-32003`。探针失败时 `data = {kind: "isolation_probe_failed", failed_probe_ids: [...]}`，策略无法装载时 `data = {kind: "isolation_policy_unloadable"}`。两种情况都要满足四点：不创建 `runs_dir/<run_id>`、不残留租约、不写 `RunRecord`、不启动正式子进程。Linux 上没有后端时，仍然返回 `-32003`。
-  - **预检顺序（E-16）**：在获取任何正式运行租约、创建 `runs_dir/<run_id>` 或写 `RunRecord` **之前**，依次完成两件事：① 校验必选探针缓存（按 C.4 的规则，必要时同步重跑）；② 对**本次**渲染出的 SBPL 做可装载性预检。② 的做法：`run_id` 先只在内存中分配，用它算出目标路径（路径此时不必存在），渲染策略，再在一次性夹具中执行 `sandbox-exec -p <policy> /usr/bin/true`。夹具位于 daemon 私有的临时目录，不在 `runs_dir/<run_id>` 中，用完即删。只有退出码为 0，才视为可装载。
+  - **预检顺序（E-16；r5 按 E-30 补充熔断快拒）**：在获取任何正式运行租约、创建 `runs_dir/<run_id>` 或写 `RunRecord` **之前**，依次完成三件事：⓪ 读取内存熔断锁存，已锁存就立即返回 `-32002`（`panic_latched`），不校验探针缓存、不重跑探针，也不 spawn 预检夹具；① 校验必选探针缓存（按 C.4 的规则，必要时同步重跑）；② 对**本次**渲染出的 SBPL 做可装载性预检。② 的做法：`run_id` 先只在内存中分配，用它算出目标路径（路径此时不必存在），渲染策略，再在一次性夹具中执行 `sandbox-exec -p <policy> /usr/bin/true`。夹具位于 daemon 私有的临时目录，不在 `runs_dir/<run_id>` 中，用完即删。只有退出码为 0，才视为可装载。夹具自带超时（沿用探针超时），超时即 `SIGKILL` 并回收。
+  - **熔断二次复核与优先级（E-30）**：预检通过后，在 `spawn_gate` 内登记待启动运行时再次复核锁存（E-18），已锁存则返回 `-32002`，此时仍未产生任何正式副作用。**锁存优先于探针失败**：启动路径上任何一处观察到锁存都返回 `-32002`；预检失败、准备返回 `-32003` 之前也要再读一次锁存，已锁存就改为返回 `-32002`，避免熔断被 `-32003` 掩盖。
   - 两类失败分别使用**独立的测试注入点**：`ProbeOutcomeInjector` 让指定探针失败，`PolicyRenderInjector` 让渲染出的策略无法装载（例如注入非法 SBPL 语句）。各自断言 `data.kind` 和零副作用。两个注入点都只能在 `#[cfg(test)]` 或测试专用构造器中使用。
   - 预检通过后、正式 spawn 时仍然失败的情况（例如竞态），走既有的回滚路径。这不属于 RA-1 的零副作用承诺，但必须释放租约、删除目录，并把运行标为 `Failed`。
 - [ ] **RA-2 七项必选探针** [mac]（`doctor --emit-evidence` 留存证据）：
@@ -66,7 +67,7 @@
   4. `unauthorized_localhost_denied`
   5. `control_socket_connect_denied`：在 Seatbelt 内对**真实控制面 socket 的规范化路径**和一个探针自建的金丝雀监听 socket 发起 `connect`，都必须失败，errno 为 `EPERM` 或 `EACCES`，证据中记录 errno。证据分两种，**互不替代**（E-17）：
      - **离线 `atomium-cli doctor`**：只用 doctor 自己的金丝雀 listener，验证探针机制端到端可用。证据标 `target = "canary"`，不能当作真实控制面 socket 已被阻断的证据。
-     - **活守护进程 live 探针**：`atomiumd` 绑定并发布真实控制 socket 之后、开始处理任何 `runs.start` / `sessions.start` 之前执行。对真实 socket 的规范化路径和 `/var` 前缀形式各连接一次，留证时标 `target = "control_socket"`，并写入探针缓存。live 探针运行期间到达的启动请求要等待本轮探针结束（等待上限等于探针超时）；探针通过才继续，失败则按 RA-1 返回 `-32003`。只读方法（`daemon.capabilities`、`ping` 等）不受影响。
+     - **活守护进程 live 探针**：`atomiumd` 绑定并发布真实控制 socket 之后、开始处理任何 `runs.start` / `sessions.start` 之前执行。对真实 socket 按**配置路径**（`ATOMIUM_SOCKET` 原文，或默认的 `$TMPDIR/atomiumd.sock`）和**规范化路径**各连接一次；两者不同时分别留证，覆盖 `/tmp` → `/private/tmp` 与 `/var` → `/private/var` 两类别名；两者相同但位于 `/private/var` 或 `/private/tmp` 之下时，补测对应的 `/var` 或 `/tmp` 别名形式（E-31）。留证时标 `target = "control_socket"` 并记录每条路径的形式，并写入探针缓存。live 探针运行期间到达的启动请求要等待本轮探针结束（等待上限等于探针超时）；探针通过才继续，失败则按 RA-1 返回 `-32003`。只读方法（`daemon.capabilities`、`ping` 等）不受影响。
      - 先在宿主侧确认目标 listener 确实可连。`ENOENT`、`ECONNREFUSED` 或解释器启动失败都**不能**算作 Seatbelt 拒绝。
   6. `iokit_identity_denied`：判据见 E2。
   7. `pasteboard_read_denied`：Box 内 `pbpaste` 失败或输出为空，并且 pasteboard Mach 服务查询被拒。自动探针**不写入宿主剪贴板**；写入金丝雀做对照属于可选的 A3 手工步骤。
@@ -78,13 +79,18 @@
   - 锁存期间，`runs.start`、`sessions.start`、`grants.create` 返回 `-32002`（`data.kind = "panic_latched"`）。
   - daemon 重启后锁存仍然有效。
   - **串行化（E-18）**：用屏障构造以下三种交错，各跑一次：panic 先于待启动登记、panic 落在 `before_spawn_hook` 窗口内、panic 晚于 spawn 许可。断言结果分别是：启动被拒（`-32002`）、待启动运行被撤销且从未 spawn、已 spawn 的运行被正常终止。三种情况下都不存在「锁存之后仍 spawn」的执行序列。
+  - **预检夹具竞态（E-30，r5）**：另用屏障构造两种交错：① panic 先于启动请求到达，断言返回 `-32002`，且没有 spawn 任何探针或预检夹具；② panic 落在 E-16 预检夹具 spawn 之后、夹具退出之前，断言启动返回 `-32002`（不是 `-32003`，也不是成功），满足 RA-1 的四点零副作用，夹具临时目录已删除，夹具进程已退出。
   - **幂等（E-19）**：并发发起 2 次 `daemon.panic`，之后再顺序调用 1 次。断言最终 `latched = true`，每个运行恰好一条 `Stopped` 事件，租约全部释放，所有调用返回的 `stopped_runs` 的并集等于全部运行。**不比较** `elapsed_ms` 和单次调用的计数。
   - **降级口径**：注入 SQLite 忙（`busy_timeout` 被耗尽）或清理失败时，受影响的运行出现在 `cleanup_unverified` 中，状态为 `CleanupUnverified`，响应仍在 5 秒内返回。
+  - **日志收尾计入预算（E-30，r5）**：再构造一个持续写满 stdout/stderr 管道、且有孙进程继承管道写端的运行，断言 `daemon.panic` 仍在 5 秒内返回，两路读取任务在 E-19 ⑤′ 的限额内排空或被中止，不会退回到现有每路 2 秒的串行等待。
 - [ ] **RA-4 单实例** [CI]：第二个 `atomiumd` 必须以非零码退出，**并且**不执行 `DaemonState::open` 和崩溃恢复，**不能**把第一个实例的控制 socket 原子 rename 覆盖掉（第一个实例依然可以 ping 通，DB 中也没有第二个实例的恢复痕迹）。以下三种情形分别测试（E-20）：
   1. 同一个 DB 目录、同一个 socket。
   2. 同一个 DB 目录、不同 socket。
-  3. **不同 DB 目录、指向同一个控制面 socket**：模拟终端默认 DB 与 LaunchAgent DB 同时存在。同一 socket 再分别用规范化路径和 `/var` 别名各测一次。
+  3. **不同 DB 目录、指向同一个控制面 socket**：模拟终端默认 DB 与 LaunchAgent DB 同时存在。同一 socket 再分别用规范化路径和 `/var` 别名各测一次（别名覆盖按 E-31，含 `/tmp` → `/private/tmp`）。
+  - **锁文件保持同一 inode（E-30，r5）**：实例退出时**不** unlink 两把锁文件。测试断言第一个实例退出前后，两把锁文件的 `(dev, ino)` 不变；随后启动的新实例对同一 inode 加锁成功；在「旧实例正在退出、新实例同时启动」的交错下，不会出现两个实例分别持有新旧两个 inode 上的锁。同 UID 恶意进程主动删除锁文件不在本条防护范围内（同 UID 边界见 §5）。
 - [ ] **RA-5 plist 生成器拒绝** [CI]：遇到以下任一输入，拒绝生成 plist：要求写入 `ATOMIUM_DEV_UNSANDBOXED`、使用相对路径、socket 路径超过 103 字节、环境变量键命中凭据样式（`*TOKEN*`、`*KEY*`、`*SECRET*`、`*PASSWORD*`、代理认证）、`ProgramArguments` 中含 shell 包装（`sh -c` 等）。
+  - **判定优先级（E-30，r5）**：`EnvironmentVariables` 的键先按 C.2 的**精确允许列表**判定。键名与 7 个合法键之一逐字节相等（区分大小写）时放行，其中包括名字含 `KEY` 的 `ATOMIUM_USE_MACOS_KEYCHAIN`；其余所有键**一律拒绝**。凭据样式匹配只用来给出更具体的拒绝原因，不能放行任何键，也不能拒绝白名单中的键。
+  - 测试覆盖：7 个白名单键都能生成 plist；非白名单的凭据样式键逐一做显式拒绝断言，至少包括 `*TOKEN*`、`*KEY*`（例如 `OPENAI_API_KEY`）、`*SECRET*`、`*PASSWORD*`，以及代理认证类键（例如 `HTTPS_PROXY`、`ALL_PROXY`、`PROXY_AUTHORIZATION`）；白名单键的大小写变体和前后缀变体（例如 `atomium_use_macos_keychain`、`ATOMIUM_USE_MACOS_KEYCHAIN_X`）也被拒绝。
 - [ ] **RA-6 隐私矩阵诚实性** [CI]：`launch_mode != launch_agent` 时，TCC 项必须是 `HostVisible`。处于 `launch_agent` 模式、但当前 `os_build` 缺少 E5 证据登记时，TCC 项为 `Unverified`。任一探针缓存失效或探针失败时，对应项不得报为 `Enforced`。`privacy.probe` 只重跑部分 `probe_ids` 时，只能刷新这些探针自己的证据，**不能**把整份缓存标为新鲜。任一项失败、过期或配置变化，都会让 `all_mandatory_passed = false`，关联的隐私项也随之失效。E5 证据绑定 `(os_build, atomiumd 的 cdhash)`，两者任一变化，TCC 项都回到 `Unverified`（E-21）。
 
 #### 2.3 R2 拒绝验收：PR 1.1b（双通道隔离五项必测 ＋ `url.open`）
@@ -94,9 +100,10 @@
 - [ ] **RB-3 服务端静态绑定身份** [CI]：在 A 的门户连接上，请求载荷里夹带 `session_id`、`box_id`，或任何未知字段，都返回 `-32602`（`deny_unknown_fields`，见附录 E-6）。A 的会话上记一条 `PolicyDenied{category: "portal_spoofed_identity"}`。B 的 Grant 和 `uses_left` 保持不变，B 下没有出现任何事件。
 - [ ] **RB-4 门户分发器物理裁剪** [CI]：经门户调用 `daemon.*`、`privacy.*`、`profiles.*`、`subscriptions.*`、`runs.*`、`sessions.*`、`workspaces.*`、`candidates.*`、`approvals.*`、`grants.*`、`portals.pending`、`portals.decide`、`events.subscribe`、`upstreams.*`，全部返回 `-32601`。在现有 `portal_dispatcher_physically_excludes_control_plane_methods` 测试上扩展即可。
 - [ ] **RB-5 存量连接即时撤销** [CI]（语义见 E-23，`docs/protocol-v2.md` §8 在 PR 1.1b 中同步修订）：
-  - **`grants.revoke`**：该 `grant_id` 立即失效。在同一会话共享的门户长连接上，下一次本应命中这个 Grant 的 `portals.invoke` 返回 `-32015`（`data.kind = "grant_revoked"`），mock opener 调用次数为 0。**连接保持可用**：同一连接上的后续调用，仍按其他有效 Grant 或 Ask 正常处理。测试要同时覆盖「另有一条有效 Allow 命中 → 打开」和「无其他命中 → `-32015`」两种情况。
+  - **`grants.revoke`**：该 `grant_id` 立即失效。在同一会话共享的门户长连接上，下一次本应命中这个 Grant 的 `portals.invoke` 返回 `-32015`（`data.kind = "grant_revoked"`），mock opener 调用次数为 0。**连接保持可用**：同一连接上的后续调用，仍按其他有效 Grant 或 Ask 正常处理。测试要同时覆盖「另有一条有效 Allow 命中 → 打开」和「无其他命中 → `-32015`」两种情况。`-32015` 只针对被撤销的 **`Allow`** Grant（E-32，r5）：再测撤销一条 `Deny` Grant 和一条 `Ask` Grant，断言之后的请求按其余有效规则处理，没有其他命中时进入 Ask，**不**返回 `-32015`。
   - **`sessions.stop` / `runs.cancel` / `daemon.panic`**：1 秒内必须完成三件事：关闭存量门户连接（客户端读到 EOF）、listener 退出、socket 文件被 unlink。该会话所有待批请求以 `PortalDecided{decision: denied, decided_by: control_plane | panic}` 结束，opener 调用次数为 0。空闲连接、阻塞在 Ask 中的连接，以及停止之后才发起的新连接，都要测到。
   - **竞态**：用屏障让 `revoke`、`stop`、`panic` 分别与自动放行或 Ask 一次允许争抢 opener 启动闸门（E-22），两种先后顺序都要测。断言闸门的先后次序决定结果：撤销方先拿到闸门时，opener 调用次数为 0；opener 先拿到闸门时，计为已打开。
+  - **`daemon.panic` 的唯一判定（E-33，r5）**：panic 的内存锁存在取 `opener_gate` 之前就已设置，所以 panic 与 opener 的胜负**不看**谁先取得闸门，而看 B.1 第 6 步规定的线性化点，即 opener 持闸门、提交事务之后、spawn 之前对锁存的最后一次读取。除上面的两种先后之外，再用屏障构造两种交错：opener 已持闸门并提交事务，panic 在这次最后读取**之前**设置锁存，断言 opener 调用次数为 0，且请求以 `decided_by: panic` 结束；panic 在这次读取**之后**才设置锁存，断言计为已打开（`opened: true`）。四种交错的预期都唯一确定。
 - [ ] **RB-6 URL 硬性守卫** [CI]：下表中的每个输入都返回 `-32602`。同时满足：mock opener 调用次数为 0，事件中只出现 `PolicyDenied{category: "portal_invalid_url", detail: <原因码>}`，**不含原始 URL**。
 
   | 类别 | 用例（至少） |
@@ -108,7 +115,7 @@
   | 字符与长度 | NUL、`\t`、`\r\n`、空格、`\`、任意原始非 ASCII 字节、原始输入超过 4096 字节 |
   | 原始 authority / path 预检（E-24，在调用 `url` 2.5.9 之前执行） | authority 中出现 `@`，包括空 userinfo `https://@h.example/` 和 `https://:@h.example/`；原始路径中**整段**是点段，或整段是编码后的点段：`/a/../b`、`/a/./b`、`/a/%2e%2e/b`、`/a/.%2E/b`、`/a/%2E/b`（大小写不敏感）。解析器会先把这些折叠掉，所以必须按原始片段拒绝 |
 
-- [ ] **RB-6b 已知凭据不进入宿主 argv** [CI]（O-8，见 B.1 第 3 步）：分别把以下内容放进 query 值、路径段和 fragment：当前会话投影的凭据、daemon 已知的上游代理认证材料，以及它们百分号编码一次后的形式。测试用的「凭据」只能是运行时生成、仅存在于内存的合成金丝雀，经测试用 Vault 注入，**绝不能使用真实凭据**。要求如下：
+- [ ] **RB-6b 已知凭据不进入宿主 argv** [CI]（O-8，见 B.1 第 3 步）：分别把以下内容放进 query 值、路径段和 fragment：当前会话投影的凭据、daemon 已知的上游代理认证材料，以及它们百分号编码一次后的形式。测试用的「凭据」只能是运行时生成、仅存在于内存的合成金丝雀，经测试用 Vault 注入，**绝不能使用真实凭据**。金丝雀长度至少取 8、15、16 和 ≥ 24 字节四档，其中 8 和 15 字节用于证明守卫不受 `SecretRedactor::add_secret_bytes` 16 字节阈值的影响（E-34，r5）。另测「投影文件在会话中被改写为新金丝雀（模拟 token 回写或 PTY 会话中静默刷新）、随后立即 `portals.invoke`」，断言新金丝雀同样被拒。要求如下：
   - 调用返回 `-32014`（`data.kind = "credential_in_url"`）。
   - mock opener 调用次数为 0。
   - `portals.pending` 中不出现这个请求。
@@ -154,10 +161,12 @@
   5. 清理运行目录，核验 `cleanup_verified`。
   6. 释放租约。
 
-  顺序用测试钩子记录的时间戳来断言。如果 E3 证明 `setsid` 孙进程无法被可靠回收，转入 O-6。
-  - **进程核验独立于目录核验（E-28）**：第 4 步的「进程已消失」单独核验，结果记为 `processes_verified`，**不能**用第 5 步的目录 `cleanup_verified` 代替，也不能用一次 `kill(-pgid, 0)` 代替。daemon 要在会话生命周期内记录追踪到的每个后代进程的身份 `(pid, 进程开始时间)`：Darwin 用 `proc_pidinfo(PROC_PIDTBSDINFO)` 的 `pbi_start_tvsec/usec`，Linux 用 `/proc/<pid>/stat` 的 `starttime`。核验时，如果同一 PID 的开始时间已经不同，按「原进程已消失」处理（防止 PID 复用造成误判）。两项核验中任一项未通过，运行都标为 `CleanupUnverified`。测试钩子分别暴露两项结果，供断言。
+  顺序用测试钩子记录的时间戳来断言。
+  - **`setsid` 孤儿孙进程（O-6，Owner 已于 2026-11-27 批准；E3 ⑥ 实证）**：macOS L1 **无法可靠捕获**双重 fork 后调用 `setsid`、并已重挂到 PID 1 的孤儿孙进程。E3 ⑥ 中，冻结首领后用 `proc_listchildpids` 递归追踪，仍会漏掉这类身份。这是 P1.1 的**既定剩余限制**，由 Phase 2 L3 VM 彻底解决。RC-1 对这类进程**不做「已回收」断言**：测试只记录它在收尾后是否仍然存活，并写入 §4 作为剩余限制的证据；夹具按自己独立记录的身份自行清理它，这一步不计入 daemon 的回收能力。普通后台子进程、忽略 `SIGTERM` 的子进程，以及前台/后台进程组中 daemon **可追踪**到的后代，仍然必须按下面的独立核验全部回收。
+  - **进程核验独立于目录核验（E-28）**：第 4 步的「进程已消失」单独核验，结果记为 `processes_verified`，**不能**用第 5 步的目录 `cleanup_verified` 代替，也不能用一次 `kill(-pgid, 0)` 代替。daemon 要在会话生命周期内记录追踪到的每个后代进程的身份 `(pid, 进程开始时间)`：Darwin 用 `proc_pidinfo(PROC_PIDTBSDINFO)` 的 `pbi_start_tvsec/usec`，Linux 用 `/proc/<pid>/stat` 的 `starttime`。核验时，如果同一 PID 的开始时间已经不同，按「原进程已消失」处理（防止 PID 复用造成误判）。两项核验中任一项未通过，运行都标为 `CleanupUnverified`。测试钩子分别暴露两项结果，供断言。`processes_verified = true` 的含义限定为「daemon 追踪到的全部身份都已消失」，**不**表示没有逃逸的 `setsid` 孤儿进程；`privacy.matrix`、CLI 和文档都不得把它表述为「会话进程已全部回收」。
   - 现有进程组 helper 中 300 ms 的 TERM 等待，在 PTY 和熔断路径上统一改为 2 秒宽限，之后发 `SIGKILL`，并在核验结果返回后再进入第 5 步。
 - [ ] **RC-2 只开放本会话的 tty** [mac]：会话内打开任意其他 `/dev/ttys*`（包括测试宿主终端的 tty）必须得到 `EPERM`，打开 `/dev/tty` 与本会话 slave 则成功。
+  - **信号边界（E-35，r5）**：SBPL 信号规则为 `(allow signal (target same-sandbox))`。会话内 shell 对自己的后台子作业 `kill -TERM` 必须成功（返回 0）；会话 A 内的进程对会话 B 的进程、对 `atomiumd` 和对宿主终端进程发信号，都必须得到 `EPERM`。
 - [ ] **RC-3 attach 独占与输入约束** [CI]：
   - 第二个 attach 返回 `-32009`，除非带 `takeover: true`；takeover 时，原连接收到 `sessions.detached` 后被关闭。
   - 来自非 attach 连接的 `sessions.input` 或 `sessions.resize` 返回 `-32002`。
@@ -215,7 +224,7 @@
   - **E1 ①–⑦ 夹具通过**。执行 `python3 -B out/p1-1-exp/e1/run.py`、`python3 -B out/p1-1-exp/e1/supplement.py`。宿主对自身门户、外会话门户、模拟 `atomiumd.sock` 及其 `/var/../..` 别名均可连。模拟控制面按短临时名 bind、`0600`、rename 发布。Box 按原文 `path-literal` 连自身 `p/<12hex>.s` 并交换 NDJSON，连接其余目标（含两个 Box 内符号链接、两个 chdir 后的相对路径）均为 `EPERM=1`。`p/` 的 stat 成功，readdir 返回 `EPERM=1`，ls 同样报 Operation not permitted。Node 与 Python 启动及 stdout/stderr 正常，`com.apple.system.logger` 的 Mach lookup 返回 0 且端口有效。shim 的链接目录与目标都放行后可读、可执行，写 shim 被拒。只放行链接目录时也可执行，这与现有全局 `process-exec` 一致，读取仍被拒。实际默认 `$TMPDIR/atomiumd.sock` 不存在，别名证据来自 `/var/../..` 指向同一仓库内 listener，真实 `/var/folders` 控制面及 E-17 live 门禁留待 1.1a。证据 `out/p1-1-exp/e1/{results,supplement-results}.json`。
   - **E-16 预检通过**。执行 `python3 -B out/p1-1-exp/e1/preflight.py`，用未创建的本次运行目录渲染策略，在独立夹具工作目录执行 `sandbox-exec -p <sbpl> /usr/bin/true`，21 次退出均为 0。首个样本 **7.28 ms**，随后 20 次平均 **6.52 ms**。E1 门户策略另测 **7.52 ms / 6.37 ms**（首个样本 / 随后 20 次均值）。证据 `out/p1-1-exp/e1/preflight-results.json` 和 `out/p1-1-exp/e1/results.json`。
   - **E2 ①–③ 通过，④ 的隐私口径记录于此**。执行 `python3 -B out/p1-1-exp/e2/run.py`（内含 clang 编译及 IOKit/CoreFoundation 链接）。宿主正对照与第 0 步中，`ioreg -rd1 -c IOPlatformExpertDevice` 与 `IORegistryEntryCreateCFProperty` 均能读取两项属性，因此当前基线应说明该项 `HostVisible`。第 1 步加 `iokit-get-properties` 拒绝后，ioreg 仍枚举到设备且退出 0，两项值均缺失，C 直接查询两项均返回 NULL。Node 26.5.0、Python 3.15.0 启动正常，已安装的 Claude 2.1.332、Codex 0.172.0、agy 1.5.18 两步 `--version` 均退出 0，stdout/stderr 一致。仿 `node-machine-id` 的上游提取逻辑在运行时 PATH 下两步均找不到 ioreg，改用绝对路径时，第 0 步成功，第 1 步遇字段缺失产生 TypeError。已安装 CLI 版本探针无崩溃，未触发 O-5，无需试 user-client 变体。实际 `privacy.matrix` 字段、CLI 完整交互留待实现阶段验证。证据 `out/p1-1-exp/e2/results.json`，只记属性布尔值、状态和版本。
-  - **E3 ⓪、②–⑤ 通过，① 部分失败，⑥ 失败并触发 O-6**。执行 `clang out/p1-1-exp/e3/probe.c -o out/p1-1-exp/e3/probe` 及 `python3 -B out/p1-1-exp/e3/run.py`。⓪ libc 的 master/slave 原子 `O_CLOEXEC` 均生效，`F_GETFD` 确认，无需回退。使用锁内 `ptsname`，并测得 `ptsname_r` 返回 0 同名。无 `process_group(0)` 时 `setsid` 和 `TIOCSCTTY` 成功，首领 PID、SID、PGID 一致。① sh 与 Python 均可回显和响应 Ctrl-C，前台作业退出，Python 收到 `KeyboardInterrupt`。sh 有基线选壳拒绝诊断，Python 3.15 pyrepl 受限后退回交互提示。现行 `target self` 下 shell 向后台子作业发 TERM 为 `EPERM=1`，替换为 `same-sandbox` 时返回 0，两个独立 sandbox 间的同类信号在对照中仍返回 `EPERM=1`。② 调整到 **119×41** 后收到 SIGWINCH 并读到新尺寸。③ 宿主以读写模式打开对照 tty，Box 打开同一外 tty 为 `EPERM=1`，自身 slave 与 `/dev/tty` 成功。④ `lsof -p` 核对独立 daemon 夹具在关 fd 后无残留，并发子会话未继承另一组 master/slave。⑤ 普通子进程 TERM 后消失，忽略 TERM 的子进程 KILL 后消失，另一次直接 KILL 两类均消失，均以 PID/start-time 核验。⑥ 双重 fork + setsid 的孙进程已重挂至 PID 1。用 Darwin SIGSTOP 冻结首领并以 `waitpid(WUNTRACED)` 确认后，`proc_listchildpids` 递归加 KILL 漏掉该身份，按独立记录补杀后消失。1.1c 待 Claude 裁决信号策略，O-6 待 Owner 裁决进程回收承诺。证据 `out/p1-1-exp/e3/results.json`。
+  - **E3 ⓪、②–⑤ 通过，① 部分失败，⑥ 失败并触发 O-6**。执行 `clang out/p1-1-exp/e3/probe.c -o out/p1-1-exp/e3/probe` 及 `python3 -B out/p1-1-exp/e3/run.py`。⓪ libc 的 master/slave 原子 `O_CLOEXEC` 均生效，`F_GETFD` 确认，无需回退。使用锁内 `ptsname`，并测得 `ptsname_r` 返回 0 同名。无 `process_group(0)` 时 `setsid` 和 `TIOCSCTTY` 成功，首领 PID、SID、PGID 一致。① sh 与 Python 均可回显和响应 Ctrl-C，前台作业退出，Python 收到 `KeyboardInterrupt`。sh 有基线选壳拒绝诊断，Python 3.15 pyrepl 受限后退回交互提示。现行 `target self` 下 shell 向后台子作业发 TERM 为 `EPERM=1`，替换为 `same-sandbox` 时返回 0，两个独立 sandbox 间的同类信号在对照中仍返回 `EPERM=1`。② 调整到 **119×41** 后收到 SIGWINCH 并读到新尺寸。③ 宿主以读写模式打开对照 tty，Box 打开同一外 tty 为 `EPERM=1`，自身 slave 与 `/dev/tty` 成功。④ `lsof -p` 核对独立 daemon 夹具在关 fd 后无残留，并发子会话未继承另一组 master/slave。⑤ 普通子进程 TERM 后消失，忽略 TERM 的子进程 KILL 后消失，另一次直接 KILL 两类均消失，均以 PID/start-time 核验。⑥ 双重 fork + setsid 的孙进程已重挂至 PID 1。用 Darwin SIGSTOP 冻结首领并以 `waitpid(WUNTRACED)` 确认后，`proc_listchildpids` 递归加 KILL 漏掉该身份，按独立记录补杀后消失。1.1c 待 Claude 裁决信号策略，O-6 待 Owner 裁决进程回收承诺。证据 `out/p1-1-exp/e3/results.json`。（r5 注：信号策略已按 E-35 裁决，O-6 已于 2026-11-27 获 Owner 批准。）
   - **E4 ①–③ 夹具通过**。执行 `python3 -B out/p1-1-exp/e4/run.py`。本机 `$TMPDIR` 含尾斜杠 **49 字节**。门户路径 / 同目录 `.sXXXXXX` 临时名预算（字节）为默认 `/var` **70 / 64**、规范化 `/private/var` **78 / 72**、LaunchAgent 8 字符用户及真实用户均 **73 / 67**、32 字符用户 **97 / 91**。C.1 的 72/96 应按实测预算修正为 73/97，结论仍低于 103。末尾保持规范门户文件名时，**103 字节**实 bind 成功，Seatbelt 内 Node、Python 从 `ATOMIUM_PORTAL_SOCKET` 连接并交换 NDJSON，**104 字节**由夹具在调用 bind 前拒绝。另一个较短 listener 上，规范路径、`/var/../..` 与 `/private/var/../../..` 形式在两种语言下均连接成功。实际 listener 位于仓库的 `out/` 内，真实 `/var/folders` bind 未做。证据 `out/p1-1-exp/e4/results.json`。
 - `TMPDIR=/tmp pnpm run ci:local` → `<pending>`
 - `cargo run -p atomium-cli -- doctor --emit-evidence ./out/p1-1-doctor` → `<pending>`
@@ -226,7 +235,10 @@
 
 ### 5. 未验证部分与剩余限制
 
-- **当前状态**：任务卡已到 r4，Codex 的开工前偏差已全部裁决。还没有开始实现、做最小实验或在目标环境实测。r4 的裁决只是设计决定，**没有经过任何运行验证**。
+- **当前状态**（r5，2026-11-27）：任务卡已到 r5。Codex 的开工前偏差已在 r4 全部裁决，Gemini r4 复核与 Codex r4 复核提出的待确认项已在 r5 裁决（E-30～E-36），O-6 已获 Owner 批准。
+  - **已完成**：E1–E4 已在 macOS 26.7.3（`25G342`，arm64）原生终端中用 `out/p1-1-exp/` 下的**一次性夹具**完成（证据见 §4）。E1、E2、E4 通过，E2 未触发 O-5；E3 ⓪②–⑤ 通过，① 的信号问题已按 E-35 裁决，⑥ 触发 O-6 并已获批。
+  - **尚未验证**：正式实现代码（1.1a / 1.1b / 1.1c 都还没有提交）；在真实 `atomiumd` 上运行的 live 控制面探针（E-17，含真实 `/var/folders` 控制面 socket）；`TMPDIR=/tmp pnpm run ci:local` 全量门禁与 GitHub Actions CI Gate；`doctor --emit-evidence`；Owner A3 执行的 E5-a / E5-b。夹具结论**不能**替代正式代码在目标环境中的证据；r5 的新裁决（E-30～E-36）只是设计决定，同样没有经过正式代码的运行验证。
+- **O-6 既定剩余限制**（Owner 已于 2026-11-27 批准）：macOS L1 无法可靠捕获双重 fork 后调用 `setsid`、并已重挂到 PID 1 的孤儿孙进程（E3 ⑥）。对前台/后台进程组及 daemon 可追踪的后代，仍按 `(pid, 开始时间)` 独立核验 `processes_verified`；该项未通过或目录清理未通过，运行标为 `CleanupUnverified`。影响面（**推断，未实测**）：逃逸进程继承同一份 SBPL 约束；网关撤销后，它唯一放行的出网目标 `localhost:<proxy_port>` 不再有本运行的认证代理；但它可能继续读写授权的工作区副本，直至自行退出。彻底解决依赖 Phase 2 的 L3 VM。随 PR 1.1c 同步到文档（附录 G）。
 - **O-8 之后的剩余风险**：守卫只能识别 daemon **已知**的凭据片段，也就是 Vault 投影材料和 `SecretRedactor` 中精确登记的值。Box 内自行生成或从别处获得的秘密无法识别。此外，规范 URL（已排除已知凭据）在 `/usr/bin/open` 存活期间（≤ 10 秒）仍然出现在它的 argv 中，同 UID 进程可以看到。
 - **按设计保留的边界**（如实标注，不纳入 P1.1）：
   - L1 与宿主同 UID，宿主用户名在本机可见。需要跨 UID 时使用 L3。
@@ -235,7 +247,10 @@
   - PTY 实时字节流只作为显示通道，发给发起 attach 的可信控制端。它**不落盘、不做脱敏**，因为无法可靠地脱敏 TUI 字节流。在 `IsolatedFile` 模式下，Box 内持有投影凭据，CLI 自行打印凭据时会显示在用户自己的终端上。之后如果要录制会话，必须经过脱敏器，并另开任务。
   - `url.open` 只管第一跳。浏览器打开页面之后的跳转和登录交互由宿主浏览器负责，不在 Atomium 的控制范围内。
   - 在 L1 中，本机回环 OAuth 回调无法完成（见附录 B.6），留给 P1.2 实测，或另开 `port.expose` 任务。
-- **依赖实验结果才能确定的限制**：IOKit 拦截（E2 → O-5）、`setsid` 孙进程逃逸（E3 → O-6）、LaunchAgent 模式下 daemon 失去对 TCC 受保护目录的访问（E5 → O-7）。
+- **依赖实验结果才能确定的限制**：
+  - IOKit 拦截：E2 夹具通过，O-5 **未触发**。实际 `privacy.matrix` 字段待 1.1a 实现后验证。
+  - `setsid` 孙进程逃逸：E3 ⑥ 已证实，O-6 **已批准**，见上方「O-6 既定剩余限制」。
+  - LaunchAgent 模式下 daemon 失去对 TCC 受保护目录的访问：仍待 E5（Owner A3）→ O-7。
 
 ---
 
@@ -411,6 +426,8 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
 3. **已知凭据红线守卫**（O-8，Owner A2 已批准）。这一步属于硬性守卫，在第 2 步之后、在任何匹配、Ask 入队或唤起 `/usr/bin/open -u` 之前执行：
    - **检查对象**：原始输入、规范 URL，以及规范 URL 经一次百分号解码后的形式。
    - **比对来源**：daemon 已知的凭据片段，包括本会话 `SecretRedactor` 中精确登记的值（来自当前会话投影的 Vault 凭据材料，含回写后的新 token），以及 daemon 全局已知的上游代理认证材料。只比对长度 ≥ 8 字节的片段，避免短值误报。
+   - **8–15 字节覆盖**（E-34，r5）：现有 `SecretRedactor::add_secret_bytes` 只登记 ≥ 16 字节的值和片段（`crates/atomiumd/src/redact.rs:87–101`），8–15 字节的已知凭据（例如短的上游代理口令）会被漏掉。因此守卫**不得**只依赖 `SecretRedactor` 已登记的片段，要从同一批来源单独维护一个 ≥ 8 字节的已知片段集合（同样包含 JSON 叶子值和 base64 携带形态）。这个集合只存在于内存中，不序列化，不进入 `Debug` 输出。全局日志脱敏的 16 字节阈值**不变**。
+   - **守卫前刷新**（E-34，r5）：每次执行这一步之前，先对本会话的 `RunLogRedactor` 调用 `refresh`，读取受限 `IsolatedFile` 投影的最新内容，并据此更新已知片段集合，再进行比对。这样，静默会话或 PTY 会话中 CLI 自行刷新、回写到投影文件的新 token，也在比对范围内。`refresh` 失败，或会话已被置为 `digest_only`（投影值未通过长度校验，无法证明集合完整）时，按 fail-closed 拒绝：返回 `-32014`（`policy_denied`），不打开，审计只记原因码。
    - **命中时**：立即拒绝，返回 `-32014`（`data.kind = "credential_in_url"`）。不进入 Ask 队列，内存中也不保留这个 URL。只记 `PolicyDenied{category: "portal_credential_in_url"}`，不含 URL。
    - **不触发拒绝的情况**：只命中 `SecretRedactor` 的**模式规则**，但不是已知片段（例如 OAuth `state`、`code_challenge` 这类高熵值），不触发这条守卫，只在审计中脱敏。
    - **效果**：从源头保证已知明文凭据不会进入宿主进程的命令行参数（product-spec §2、章程 §3 第 2 条）。剩余风险见 §5。
@@ -422,12 +439,17 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
    - `open` 本身是独立进程，不与 Vault 共享地址空间，满足架构 §5.2 第 4 条“进程外最小权限”。
 6. **授权线性化**（E-22，替代 r3 中「单个 SQLite 事务」的写法）：采用「短 SQLite 写事务 + 显式串行化的 opener 启动闸门」。
    - **opener 启动闸门**：daemon 全局只有一个 `opener_gate` 互斥锁。持有闸门时依次做三件事：
-     1. 在一个**短写事务**中校验：会话仍处于 `Running`；熔断未锁存；自动放行路径下 Grant 仍然有效，并扣减 `uses_left`；或者 Ask 路径下，该请求的一次性许可仍为「已批准、未消费」，然后把它标为已消费。
+     1. 在一个**短写事务**中校验：会话仍处于 `Running`；熔断未锁存（这里的检查只用于提前退出，panic 的胜负以下面的「最后读取」为准）；自动放行路径下 Grant 仍然有效，并扣减 `uses_left`；或者 Ask 路径下，该请求的一次性许可仍为「已批准、未消费」，然后把它标为已消费。
      2. 提交事务。
-     3. 启动 opener 进程（只是 spawn）。
+     3. 对内存熔断锁存做**最后一次** `SeqCst` 读取；未锁存才启动 opener 进程（只是 spawn）。
 
      做完这三件事就释放闸门。**opener 最多 10 秒的执行和退出等待都在闸门和事务之外进行。**
-   - **撤销方也走闸门**：`grants.revoke`、`sessions.stop`、`runs.cancel` 和 `daemon.panic` 都要先取得同一个闸门，再写入失效状态（熔断的内存锁存在取闸门之前就已生效）。因此，两方谁先取得闸门，谁就赢。撤销方先赢时，opener 不会启动；opener 先赢时，计为「已打开」。浏览器已经打开的页面无法撤回，这一点如实记录。
+   - **撤销方也走闸门**：`grants.revoke`、`sessions.stop`、`runs.cancel` 和 `daemon.panic` 都要先取得同一个闸门，再写入失效状态。对 `grants.revoke`、`sessions.stop` 和 `runs.cancel` 来说，谁先取得闸门，谁就赢：撤销方先赢时，opener 不会启动；opener 先赢时，计为「已打开」。浏览器已经打开的页面无法撤回，这一点如实记录。
+   - **`daemon.panic` 的唯一线性化点**（E-33，r5，取代 r4 中「熔断的内存锁存在取闸门之前就已生效，因此谁先取得闸门谁赢」的写法）：`daemon.panic` 在 `spawn_gate` 内设置内存锁存（`SeqCst` 原子写），快照后释放 `spawn_gate`，再去取 `opener_gate`（锁序见 C.5）。因此锁存可能在 opener 持有闸门期间生效。规定：**opener 持有闸门、事务提交之后、spawn 之前对锁存的最后一次读取，是 panic 与 opener 之间唯一的线性化点**。
+     - 这次读取看到已锁存：不 spawn，opener 调用次数为 0，请求以 `PortalDecided{decision: denied, decided_by: panic, opened: false}` 结束。已提交的 `uses_left` 扣减或一次性许可消费不回滚，因为熔断随后会撤销该会话的全部 Grant，不存在复用。
+     - 这次读取看到未锁存：spawn，计为「已打开」（`opened: true`），即使 panic 在 spawn 之后、闸门释放之前设置了锁存。panic 随后取得闸门时，这个请求已经结束，不再处理。
+     - panic 在 opener 取得闸门**之前**就已设置锁存时，第 1 步的提前检查或最后读取必然看到锁存，结果同样是不 spawn。
+     - `grants.revoke`、`sessions.stop`、`runs.cancel` 没有闸门之外的提前状态，仍以取得闸门的先后为准。
    - **120 秒 Ask 等待不持有事务，也不持有闸门。**
    - 已接入的门户连接和待批请求都由会话持有，停止时可以取消（RB-5）。
 
@@ -441,9 +463,9 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
 - **多条 Grant 的优先级**（E-22）：同一个请求可能命中本会话的多条 Grant，按以下顺序处理：
   1. 有效的 `Deny`：拒绝，返回 `-32014`（`policy_denied`）。
   2. 有效且 `uses_left > 0` 的 `Allow`：自动放行。如果有多条，取 `expires_at_ms` 最早的一条，相同时取 `grant_id` 字典序最小的一条。
-  3. 被**显式 `revoke`** 的 Grant：返回 `-32015`（`grant_revoked`），不进入 Ask，避免撤销后立刻被同一目标反复请求（E-23）。
+  3. 被**显式 `revoke`** 的 **`Allow` Grant**（r5 限定，E-32）：返回 `-32015`（`grant_revoked`），不进入 Ask，避免撤销后立刻被同一目标反复请求（E-23）。被显式撤销的 `Deny` 或 `Ask` Grant **不留撤销墓碑**，直接退出匹配：请求按其余有效规则处理，没有其他命中时进入 Ask。否则撤销一条 `Deny` 反而会让该目标被永久以 `-32015` 拒绝，违背撤销的本意。
   4. 其他情况进入 Ask：命中的是 `Ask` Grant、`Allow` 已自然耗尽或到期、带 `raw_path_encoded` 标记，或者没有命中任何 Grant。
-- **自然耗尽或到期**（B.3、RB-7）与**显式撤销**的处理不同：前者降级为 Ask，后者返回 `-32015`。
+- **自然耗尽或到期**（B.3、RB-7）与**显式撤销 `Allow`** 的处理不同：前者降级为 Ask，后者返回 `-32015`。
 
 #### B.3 按 `agent_kind` 和会话签发的默认 Grant 模板
 
@@ -511,7 +533,7 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
   - `atomium-portal` 是 `atomium-cli` crate 中的第二个 `[[bin]]`。它只包含门户客户端代码，不包含任何控制面客户端代码。
   - 在 `crates/atomium-cli/Cargo.toml` 的 `[package]` 中显式设置 `default-run = "atomium-cli"`，保证 `cargo run -p atomium-cli -- …`（包括 `doctor` 和 `daemon --socket`）的默认入口不变。CI 回归这两条命令。
   - daemon 启动时，在 `current_exe()` 的同级目录中定位 `atomium-portal`，并对路径做规范化。找不到时，`daemon.capabilities.portals` 为空并附说明，会话中不注入 shim，也不注入 `BROWSER`。
-  - shim 目录是 daemon 私有的 `<runs_dir>/shim/`（`0700`，属主为 daemon 的 UID）。Box 与 daemon 同 UID，所以「Box 不可写」靠 SBPL 保证：只放行读取和执行，不放行写入。目录中有 `open`、`xdg-open`、`atomium-portal-open` 三个符号链接，都指向 `atomium-portal` 的规范化绝对路径。daemon 每次启动时重建这个目录，重建前先 `lstat` 核验，拒绝预置的异常节点。
+  - shim 目录是 daemon 私有的 `<runs_dir>/shim/`（`0700`，属主为 daemon 的 UID）。Box 与 daemon 同 UID，所以「Box 不可写」靠 SBPL 保证：只放行读取和执行，不放行写入。目录中有 `open`、`xdg-open`、`atomium-portal-open` 三个符号链接，都指向 `atomium-portal` 的规范化绝对路径。daemon 每次启动时重建这个目录，重建前先 `lstat` 核验，拒绝预置的异常节点。**重建必须在取得 E-20 的两把单实例锁之后执行**（E-34，r5；见 C.4 启动顺序），防止第二个实例在锁冲突退出之前，就改写第一个实例正在使用的 shim。
   - `atomium-portal` 按 `argv[0]` 的 basename 分派：`open`、`xdg-open`、`atomium-portal-open` 进入 shim 模式，`atomium-portal` 进入子命令模式。
   - shim 目录放到 `PATH` 最前。
 - `open` / `xdg-open` shim 仅接受单个 `https://` URL（或 `-u` / `--` 引导的单个 URL），显式拒绝 `-a`、`-b`、`-e`、`-t`、`-R` 等非 URL 选项及本地文件路径，防止诱导宿主机按应用或路径语义解析。
@@ -525,7 +547,7 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
 #### C.1 macOS `SUN_LEN`（`sun_path` 共 104 字节，含末尾 NUL，可用 103 字节）
 
 - **已计算的事实**：在本机，按原文的布局 `runs_dir/<run_id>/portal.sock` 得到的规范化路径是 `/private/var/folders/…/T/runs/run-<36 位 UUID>/portal.sock`，共 **114 字节**；不规范化的 `/var/…` 形式也有 106 字节。**两者都超出上限**，所以原文的布局不可行。
-- **A1 决定的布局**：`<runs_dir>/p/<12 位随机十六进制>.s`。在本机默认路径下规范化长度约为 77 字节；LaunchAgent 路径下，8 字符用户名约为 72 字节，即使 macOS 32 字符长用户名（`/Users/<32>/Library/Application Support/Atomium/runs/p/<12hex>.s`）也仅 **96 字节 ≤ 103 字节**；绑定时的临时路径 `.sXXXXXX` 更短。
+- **A1 决定的布局**：`<runs_dir>/p/<12 位随机十六进制>.s`。E4 实测（r5 修正，原估算 72/96 少算 1 字节）：本机默认 `/var` 形式 **70 字节**，规范化 `/private/var` 形式 **78 字节**；LaunchAgent 路径下，8 字符用户名为 **73 字节**，macOS 32 字符长用户名（`/Users/<32>/Library/Application Support/Atomium/runs/p/<12hex>.s`）为 **97 字节**，均 **≤ 103 字节**；同目录临时名 `.sXXXXXX` 的路径各短 6 字节（64 / 72 / 67 / 91 字节）。
   - `p/` 目录权限为 `0700`，属主是 daemon 的 UID。
   - Box 只有对**自己那一个 socket 的精确路径**发起 unix-socket 出站连接的权限，对 `p/` 目录本身没有 `file-read-data`（`readdir`）权限，看不到其他会话的 socket（如遍历需要，仅验证是否只需 `file-read-metadata`，见 E1）。
   - SBPL 中使用规范化路径，即 `/private/var/...`。
@@ -539,14 +561,14 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
 | 文件位置 | `~/Library/LaunchAgents/io.atomium.daemon.plist`，权限 `0644`，属主为当前用户（launchd 拒绝组或其他用户可写的 plist） |
 | `Label` | `io.atomium.daemon` |
 | `ProgramArguments` | 只有一项：`atomiumd` 的规范化绝对路径。不经 shell，不带任何参数，也不带凭据。目标位于 git worktree 的 `target/` 目录下时，CLI 给出警告：ad-hoc 签名的 cdhash 每次构建都会变化，TCC 记录会随之失效 |
-| `EnvironmentVariables` | **只允许**以下键：`ATOMIUM_SOCKET`、`ATOMIUM_DB`、`ATOMIUM_VAULT_DIR`、`ATOMIUM_RUNS_DIR`、`ATOMIUM_BROKER_DIR`、`ATOMIUM_USE_MACOS_KEYCHAIN`、`RUST_LOG`。**禁止** `ATOMIUM_DEV_UNSANDBOXED` 以及任何凭据类键（RA-5） |
-| 路径 | 全部写绝对路径。`ATOMIUM_SOCKET` 写成生成时用 `confstr(_CS_DARWIN_USER_TEMP_DIR)` 得到的 `<用户 T 目录>/atomiumd.sock`，这样与 CLI 默认的 `$TMPDIR/atomiumd.sock` 发现路径保持一致；launchd 不保证为 Agent 设置 `TMPDIR`（**推断，E5 核实**），不写死就可能退回到共享的 `/tmp`。DB、Vault、runs、broker 放在 `~/Library/Application Support/Atomium/`（`0700`），DB 文件名用 `atomium.sqlite`，以匹配 SBPL 中现有的显式拒绝正则 `Application Support/Atomium/(atomium\.sqlite\|vault)`。按本机 8 字符用户名计算，`runs/p/<12hex>.s` 的 portal 路径约 72 字节；即使 32 字符用户名也仅 96 字节 ≤ 103 字节 |
+| `EnvironmentVariables` | **只允许**以下键：`ATOMIUM_SOCKET`、`ATOMIUM_DB`、`ATOMIUM_VAULT_DIR`、`ATOMIUM_RUNS_DIR`、`ATOMIUM_BROKER_DIR`、`ATOMIUM_USE_MACOS_KEYCHAIN`、`RUST_LOG`（共 7 个）。**禁止** `ATOMIUM_DEV_UNSANDBOXED` 以及任何凭据类键（RA-5）。**判定顺序**（E-30，r5）：先按这 7 个键做逐字节精确匹配（区分大小写），命中就放行，因此 `ATOMIUM_USE_MACOS_KEYCHAIN` 不会被 `*KEY*` 凭据样式误拒；不在白名单中的键一律拒绝，凭据样式只用于给出更具体的拒绝原因 |
+| 路径 | 全部写绝对路径。`ATOMIUM_SOCKET` 写成生成时用 `confstr(_CS_DARWIN_USER_TEMP_DIR)` 得到的 `<用户 T 目录>/atomiumd.sock`，这样与 CLI 默认的 `$TMPDIR/atomiumd.sock` 发现路径保持一致；launchd 不保证为 Agent 设置 `TMPDIR`（**推断，E5 核实**），不写死就可能退回到共享的 `/tmp`。DB、Vault、runs、broker 放在 `~/Library/Application Support/Atomium/`（`0700`），DB 文件名用 `atomium.sqlite`，以匹配 SBPL 中现有的显式拒绝正则 `Application Support/Atomium/(atomium\.sqlite\|vault)`。按 E4 实测（r5 修正），`runs/p/<12hex>.s` 的 portal 路径在 8 字符用户名下为 **73 字节**，32 字符用户名下为 **97 字节**，均 ≤ 103 字节 |
 | `RunAtLoad` / `KeepAlive` | `true` / `{SuccessfulExit: false}`，`ThrottleInterval = 10`。`daemon.panic` **不会退出进程**，锁存状态持久化，因此不会因 launchd 重启而失效 |
 | `LimitLoadToSessionType` | `Aqua`。`/usr/bin/open` 通过 LaunchServices 打开浏览器，需要位于 GUI 会话中 |
 | `Umask` | `63`（即 `0o077`） |
 | `StandardOutPath` / `StandardErrorPath` | `~/Library/Logs/Atomium/atomiumd.log`。内容只有经脱敏的 tracing 日志 |
 | 禁止的键 | `Sockets`（不使用 launchd 的 socket 激活，保留 `bind_socket` 原子创建 `0600` socket 的语义）、`MachServices`、`inetdCompatibility`、`UserName`、`GroupName`、`ProcessType = Interactive` |
-| 单实例（E-20） | daemon 启动时依次取得**两把**锁，都用 `flock(LOCK_EX \| LOCK_NB)`，并且都要在 `DaemonState::open` 和崩溃恢复**之前**、在 `bind_socket` 之前完成：① **DB 目录锁**：`<规范化 DB 目录>/atomiumd.lock`；② **控制面 socket 锁**：`<socket 父目录的规范化路径>/.<socket 文件名>.lock`，例如 `$TMPDIR/.atomiumd.sock.lock`。② 的路径由规范化后的 `atomiumd.sock` 路径推导，因此 `/var` 与 `/private/var` 两种写法会落到同一把锁上。锁文件的打开参数为 `O_CREAT \| O_NOFOLLOW \| O_CLOEXEC`，模式 `0600`；打开后用 `fstat` 核验它是普通文件、属主是当前 euid。任一把锁取不到，或核验失败，都以非零码退出，不触碰 DB 和 socket。两把锁在进程的整个生命周期内一直持有。这样可以同时消除两种覆盖：同一 DB 目录上的两个实例，以及「终端默认 DB 与 LaunchAgent DB 路径不同、却指向同一个控制面 socket」的两个实例 |
+| 单实例（E-20） | daemon 启动时依次取得**两把**锁，都用 `flock(LOCK_EX \| LOCK_NB)`，并且都要在 `DaemonState::open` 和崩溃恢复**之前**、在 `bind_socket` 之前完成：① **DB 目录锁**：`<规范化 DB 目录>/atomiumd.lock`；② **控制面 socket 锁**：`<socket 父目录的规范化路径>/.<socket 文件名>.lock`，例如 `$TMPDIR/.atomiumd.sock.lock`。② 的路径由规范化后的 `atomiumd.sock` 路径推导，因此 `/var` 与 `/private/var` 两种写法会落到同一把锁上。锁文件的打开参数为 `O_CREAT \| O_NOFOLLOW \| O_CLOEXEC`，模式 `0600`；打开后用 `fstat` 核验它是普通文件、属主是当前 euid。任一把锁取不到，或核验失败，都以非零码退出，不触碰 DB 和 socket。两把锁在进程的整个生命周期内一直持有。**退出时不 unlink 锁文件**（E-30，r5）：锁文件长期保持同一 inode，锁随进程退出由内核释放；如果退出时 unlink，正在启动的新实例可能锁住旧 inode，而第三个实例新建一个 inode，两者同时「持锁」。这样可以同时消除两种覆盖：同一 DB 目录上的两个实例，以及「终端默认 DB 与 LaunchAgent DB 路径不同、却指向同一个控制面 socket」的两个实例 |
 | CLI 命令 | `atomium daemon launchagent print`（只输出 plist）、`install --write`（只写文件，并打印需要 Owner 执行的 `launchctl bootstrap gui/$(id -u) <plist>`）、`status`（只读）、`uninstall`（打印 `bootout` 命令和需要删除的文件路径）。**CLI 和 CI 都不执行 `launchctl`**；首次在真实宿主上加载属于 A3 |
 
 #### C.3 PTY 流与审计分离
@@ -560,11 +582,12 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
   5. 同一时间只允许一个 attach，`takeover` 会显式踢掉原来的 attach。
 - **PTY 分配**（E-28）：
   - **首选**：`posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC)` + `grantpt` + `unlockpt` + 可重入取名 + `open(slave, O_RDWR | O_NOCTTY | O_CLOEXEC)`。目的是避免多线程 Tokio 守护进程在并发 `fork/exec` 时，把 PTY fd 泄露给其他隔离会话。
-  - **Darwin 待实测**：本机 `man posix_openpt(3)` 的 flags 只列出 `O_RDWR` 和 `O_NOCTTY`（Codex 核对），所以 Darwin 是否接受 `O_CLOEXEC` 要在 E3 中实测，并用 `fcntl(F_GETFD)` 确认返回的 fd 已经带有 `FD_CLOEXEC`。如果 Darwin 拒绝这个 flag，或者接受了却没有生效，就**回退**到「spawn 互斥锁」方案：
+  - **Darwin 已实测（E3 ⓪，r5）**：本机 `man posix_openpt(3)` 的 flags 只列出 `O_RDWR` 和 `O_NOCTTY`（Codex 核对），但 E3 ⓪ 在 macOS 26.7.3（`25G342`）上实测：`posix_openpt(O_CLOEXEC)` 和 `open(slave, O_CLOEXEC)` 都被接受，`fcntl(F_GETFD)` 确认 master 和 slave 都带有 `FD_CLOEXEC`，`ptsname_r` 可用（返回 0，结果与锁内 `ptsname` 同名）。因此 1.1c **在 Darwin 上采用原子 `O_CLOEXEC` 首选路径和 `ptsname_r`，不回退**。实现仍需在运行时对返回的 fd 断言 `FD_CLOEXEC`，断言失败时 PTY 分配 fail-closed（不静默继续）。下面的回退方案**只作为跨平台或降级兜底**保留（例如未来某个平台或系统版本不接受这个 flag）：
     - daemon 全局设一个 `spawn_fd_lock` 读写锁。分配 PTY 时，在写锁内调用不带 `O_CLOEXEC` 的 `posix_openpt` 和 `open`，并**立即**执行 `fcntl(FD_CLOEXEC)`。
     - daemon 中所有子进程的 spawn 都在读锁内进行，包括 Box、探针、策略预检夹具和 opener。
-  - **取名**：优先用 `ptsname_r`。如果 `libc` crate 在 Darwin 上没有暴露它，就改用 `ioctl(TIOCPTYGNAME)`，或在互斥锁保护下调用 `ptsname`。**禁止**在没有同步的情况下调用裸 `ptsname`，因为它不承诺线程安全。E3 记录实际采用了哪一种。
+  - **取名**：使用 `ptsname_r`（E3 ⓪ 已确认 Darwin 可用）。如果 `libc` crate 版本在 Darwin 上没有暴露它，就改用 `ioctl(TIOCPTYGNAME)`，或在互斥锁保护下调用 `ptsname`。**禁止**在没有同步的情况下调用裸 `ptsname`，因为它不承诺线程安全。
 - **Seatbelt 的 tty 规则**：把取得的具体 slave 设备路径渲染进本会话的 SBPL，**只**放行这个 slave 的精确路径和 `/dev/tty` 的 `file-read*`、`file-write*`、`file-ioctl`。**禁止**用正则放行 `/dev/ttys*`：同 UID 下，宿主其他终端的 tty 对用户可读写，这样放行会让 Box 能读取或注入宿主终端（RC-2）。
+- **Seatbelt 的信号规则**（E-35，r5）：把 `macos_seatbelt.rs:136` 现行的 `(allow signal (target self))` 改为 `(allow signal (target same-sandbox))`。E3 ① 实证：`target self` 下，shell 向自己的后台子作业发 `SIGTERM` 返回 `EPERM=1`，作业控制不可用；改为 `same-sandbox` 后同一操作返回 0；对照中两个独立 sandbox 之间的同类信号仍然返回 `EPERM=1`。因此这项放宽只覆盖同一 Box 内部，不跨会话。daemon 和宿主进程不在任何 Box 的 sandbox 内，按规则语义同样不在放行范围内（**推断**，由 RC-2 的信号边界断言实测）。PR 1.1c 修改模板时，同时更新 `sbpl_template_digest`，使探针缓存失效并重跑（C.4）；RC-2 新增信号边界断言。这项规则对管道 stdio 的 `runs.start` 同样生效，因为两者共用同一份模板。
 - **子进程初始化**：在 `pre_exec` 中只调用 async-signal-safe 的函数（`setsid`、`ioctl(TIOCSCTTY)`、仅对 fd `0/1/2` 执行 `dup2`，从而只清除这三个标准流 fd 的 `FD_CLOEXEC`），然后 exec `sandbox-exec`。进程组 ID 等于子进程 PID。
 - **与进程组 helper 解耦**（E-28）：PTY 路径**不得**调用 `Command::process_group(0)`，因为它会先执行 `setpgid`，使子进程成为进程组组长，之后 `pre_exec` 里的 `setsid()` 就会返回 `EPERM`。做法：在 `RuntimeBackend` 中新增一个独立的 PTY 命令准备函数（stdio 指向 slave，会话和进程组由 `setsid` 建立），现有管道 stdio 加 `process_group(0)` 的路径保持不变。
 - **读写调度**：PTY fd 的读写调度要有界。慢速 attach 客户端只能导致环形缓冲区淘汰旧数据，不能阻塞 PTY 读取。attach 带代次号：takeover 之后，旧代次的 `sessions.input` 和 `sessions.resize` 一律返回 `-32002`。
@@ -575,14 +598,22 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
 - 每个会话的 SBPL 都由同一个模板渲染而来，因此探针缓存针对的是“模板加系统版本”的组合有效性，不针对具体某个会话的路径。r3 曾认为「`sandbox-exec` 装载失败会让 spawn 失败」，但这不成立：同步 `spawn()` 只能确认 `sandbox-exec` 这个包装程序启动了，策略装载失败可能稍后才以子进程退出的形式出现（Codex 核对）。所以**本次渲染**出的策略还要在副作用发生之前，单独做一次可装载性预检（RA-1，E-16）。
 - **启动顺序**（E-16、E-17）：
   1. 取得单实例双锁。
-  2. `DaemonState::open` 与崩溃恢复。
+  2. `DaemonState::open` 与崩溃恢复；1.1b 起，在这一步之后重建 `<runs_dir>/shim/`（B.7，E-34）。第 1 步之前不得写入 DB、runs 目录、shim 目录或 socket 路径中的任何内容。
   3. 绑定并发布控制 socket。
-  4. 运行包含 live `control_socket_connect_denied` 的全量探针。
+  4. 运行包含 live `control_socket_connect_denied` 的全量探针。对配置路径和规范化路径分别探测（E-31，见 RA-2⑤）。
   5. 开始处理 `runs.start` / `sessions.start`。
 
-  第 4 步进行期间，只读方法可以正常响应。
+  第 4 步进行期间，只读方法可以正常响应。启动请求仍按 RA-1 的顺序先快拒熔断锁存（E-30）；未锁存时才等待本轮探针结束。
 - **部分重跑**：`privacy.probe` 只重跑部分探针时，只刷新那几项的证据，不刷新整份缓存的新鲜度（RA-6）。
 - 各 PR 新增的探针：1.1b 新增 `own_portal_connect_allowed`（正向）、`foreign_portal_connect_denied`、`portal_symlink_bypass_denied`；1.1c 新增 `pty_alloc_allowed`（正向）、`foreign_tty_denied`。
+
+#### C.5 跨 PR 锁序（E-36，r5）
+
+- **固定锁序**：`spawn_gate`（1.1a，E-18）→ `opener_gate`（1.1b，E-22）→ `spawn_fd_lock`（1.1c 兜底，C.3）。任何代码路径如果需要同时持有其中多把锁，必须按这个顺序获取；**禁止**持有后面的锁去获取前面的锁。
+- **`daemon.panic` 不嵌套持锁**：在 `spawn_gate` 内设置内存锁存并取出待启动和活动运行的快照，然后**释放** `spawn_gate`，再获取 `opener_gate` 使门户授权失效（线性化规则见 B.1 第 6 步、E-33）。
+- **`spawn_fd_lock` 只是兜底**：E3 ⓪ 已实测 Darwin 接受原子 `O_CLOEXEC`，并且 `ptsname_r` 可用，所以 Darwin 上的首选路径不需要 `spawn_fd_lock`。只有在某个平台回退到非原子 PTY 分配时才启用它；启用后，所有子进程 spawn（Box、探针、E-16 预检夹具、opener）都在它的读锁内进行，并且遵守上面的锁序：在 `spawn_gate` 或 `opener_gate` 内 spawn 时，最后才获取它。
+- **不持锁等待**：上述三把锁内都不得执行 `await` 长时间等待，包括 `before_spawn_hook`、120 秒 Ask、opener 的 10 秒执行、2 秒 TERM 宽限和日志排空。
+- 1.1a 只引入 `spawn_gate`，但实现时应当按上面的顺序预留位置，并添加注释说明，避免 1.1b 和 1.1c 加锁时形成环。
 
 ---
 
@@ -606,7 +637,7 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
 | --- | --- | --- | --- |
 | E-1 | 三个 PR 严格串行：1.1a → 1.1b → 1.1c。E3 实验可以与 1.1a 并行 | 1.1b 依赖 1.1a 的 SBPL 门户规则、探针框架和熔断；1.1b 与 1.1c 都要改 `session_engine.rs` 的回收顺序，并行写入的冲突代价高 | 让 1.1b 和 1.1c 并行开发 |
 | E-2 | P1.1 中 session 与 run 一一对应。`runs.start` 也分配 `session_id` 并获得门户；事件信封仍然以 `run_id` 为主键，`session_id` 是可选字段 | 1.1b 不需要等 PTY 就能端到端验证门户；保留 v1.2 的事件游标和 E2E 不变 | 单独建一套 session 生命周期 |
-| E-3 | portal socket 布局改为 `<runs_dir>/p/<12 位随机十六进制>.s`，超限时 fail-closed 返回 `-32003` | 已计算出原文的布局为 114 字节（且 `<runs_dir>/ps/<16hex>.sock` 在 32 字符 macOS 用户名下为 105 字节），均超出 `SUN_LEN`（103 字节）；改用 `p/<12hex>.s` 在 32 字符用户名下仅 96 字节。Seatbelt 按精确路径授权，socket 放在哪个目录不影响隔离。实现 PR 需要同步修改 architecture §5.1 和 protocol-v2 §2.4 中的路径描述 | 把 socket 放在 `/tmp` 短目录下（共享目录存在抢占和符号链接风险）；在 `bindat` 或 `chdir` 后用相对路径（daemon 是多线程的，不安全） |
+| E-3 | portal socket 布局改为 `<runs_dir>/p/<12 位随机十六进制>.s`，超限时 fail-closed 返回 `-32003` | 已计算出原文的布局为 114 字节（且 `<runs_dir>/ps/<16hex>.sock` 在 32 字符 macOS 用户名下为 105 字节），均超出 `SUN_LEN`（103 字节）；改用 `p/<12hex>.s` 后，E4 实测 32 字符用户名下为 97 字节、8 字符用户名下为 73 字节（r5 按 E4 由 96/72 修正）。Seatbelt 按精确路径授权，socket 放在哪个目录不影响隔离。实现 PR 需要同步修改 architecture §5.1 和 protocol-v2 §2.4 中的路径描述 | 把 socket 放在 `/tmp` 短目录下（共享目录存在抢占和符号链接风险）；在 `bindat` 或 `chdir` 后用相对路径（daemon 是多线程的，不安全） |
 | E-4 | 探针在启动时全量运行并按键缓存，缓存失效时在会话启动前同步重跑 | 每个会话都重跑 7 项以上探针要启动 7 次以上 `sandbox-exec`，延迟明显；缓存键覆盖了系统版本和策略模板的变化，装载失败本身也是 fail-closed | 每个会话都全量重跑 |
 | E-5 | `GrantScope` 使用带类型的 tagged enum，而不是 `serde_json::Value` | 直接获得 schema 校验和 TS 类型，避免任意 JSON 绕过参数范围约束（架构 §5.2 第 3 条） | 使用草案中的 `Value` |
 | E-6 | 门户请求使用 `deny_unknown_fields`。伪造 `session_id` 或 `box_id` 时直接返回 `-32602`，并记一条 `PolicyDenied` | 比“忽略伪造字段”更严格，而且能留下可检测的痕迹；两种做法都满足“绝不采信” | 忽略伪造字段后继续处理 |
@@ -627,7 +658,7 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
 | E-16 | **RA-1 预检前移**：在租约、run 目录和 `RunRecord` 之前，完成「必选探针缓存校验（必要时同步重跑）」与「本次渲染策略的可装载性预检」。预检的做法是：`run_id` 先只在内存中分配；渲染出含目标路径的 SBPL；在 daemon 私有临时夹具中执行 `sandbox-exec -p <policy> /usr/bin/true`。探针失败和策略失败分别用独立的测试注入点验证。预检之后、正式 spawn 时才出现的失败，仍然走回滚 | 同步 `spawn()` 只能证明包装程序启动了，策略装载失败可能稍后才出现。不前移就无法满足 RA-1 的零副作用。每次运行多一次约几十毫秒的 `sandbox-exec`（推断，E1 中顺带计时），代价可以接受。SBPL 中只有路径，不含凭据，所以经 argv 传入不违反红线 | 事后回滚（会改变 RA-1 的语义，需要交 Owner 决定）；只靠模板缓存 |
 | E-17 | **离线 doctor 与 live 探针分离**：离线 `atomium-cli doctor` 只用自己的金丝雀 listener，证据标 `canary`。`atomiumd` 在绑定并发布真实控制 socket 之后、处理 `runs.start` / `sessions.start` 之前，对真实路径（规范化路径与 `/var` 形式）执行 `control_socket_connect_denied`，证据标 `control_socket`。live 探针进行期间，启动请求等待本轮结束 | 离线进程不知道真实 daemon 的 socket 在哪里。live 探针让 RA-2⑤ 和 RB-1 的证据指向真实目标。让启动请求等待、而不是新增错误码，可以避免改动 E2E 的就绪判断 | 用 doctor 的金丝雀结果代替真实证据；在 accept 之前完成探针（启动期间 ping 会挂起） |
 | E-18 | **熔断串行化**：daemon 设一个 `spawn_gate` 互斥锁。`panic_latched` 检查加上待启动登记（每个待启动运行带一个取消令牌）在这把锁内完成；`before_spawn_hook` 在锁外执行，但运行已经登记，熔断看得到它；最终的 spawn 许可（再次检查锁存和令牌，然后 spawn，再移入 `active_runs`）也在**同一把锁内**完成。`daemon.panic` 在取得这把锁后才设置锁存，并取出待启动和活动运行的快照，之后取消令牌、执行收尾 | 锁存检查、登记和最终许可共用同一个串行化临界区，所以不存在「锁存之后仍然 spawn」的执行序列。钩子窗口中的待启动运行可以即时撤销。钩子不持锁，熔断就不会被它阻塞 | 整个启动过程都持锁（熔断会被钩子和探针阻塞）；只用原子标志、不加锁（存在 TOCTOU） |
-| E-19 | **熔断的 5 秒口径与幂等**：5 秒从收到请求算到返回响应，按端到端计时，各段预算如下（推断，实现时实测）：① 内存锁存立即生效；② 锁存持久化在短事务中完成，熔断路径专用的 `busy_timeout` ≤ 500 ms，失败时 `latch_persisted = false`，收尾照常进行；③ 撤销出网与关闭门户等待完成信号（网关 `revoke()` 和门户 listener 都要提供可等待的完成句柄），上限 1 秒；④ 对进程组发 `SIGTERM`，2 秒后发 `SIGKILL`，并确认回调，≤ 500 ms；⑤ 清理目录和释放租约同样受限于 ≤ 500 ms 的 `busy_timeout`。多个运行之间并发处理，每个运行内部按顺序处理。超出预算或写库失败的运行列入 `cleanup_unverified`，状态标为 `CleanupUnverified`（写库失败时先记在内存中，之后由后台重试或崩溃恢复补写）。熔断调用之间互斥：后到的调用等待正在进行的那次完成，只报告自己实际处理的运行。幂等性比较 `latched`、最终状态和事件副作用，不比较 `elapsed_ms` 或计数 | 现有 SQLite 的 5 秒 `busy_timeout` 加上两路日志各 2 秒的等待，在最坏情况下必然超过 5 秒；网关只发通知也不能证明真的切断了。必须给出完成信号，并给每段设置上限，5 秒的承诺才可验证 | 只计算到「发出信号」为止；比较整个响应体来判断幂等 |
+| E-19 | **熔断的 5 秒口径与幂等**：5 秒从收到请求算到返回响应，按端到端计时，各段预算如下（推断，实现时实测）：① 内存锁存立即生效；② 锁存持久化在短事务中完成，熔断路径专用的 `busy_timeout` ≤ 500 ms，失败时 `latch_persisted = false`，收尾照常进行；③ 撤销出网与关闭门户等待完成信号（网关 `revoke()` 和门户 listener 都要提供可等待的完成句柄），上限 1 秒；④ 对进程组发 `SIGTERM`，2 秒后发 `SIGKILL`，并确认回调，≤ 500 ms；⑤′ stdout/stderr 读取任务在 `SIGKILL` 核验之后限时排空，两路**共享**一个 ≤ 250 ms 的限额，超时就中止读取任务并丢弃未读部分，不再按现有每路 2 秒串行等待（r5 按 E-30 补充；孙进程继承管道写端时管道可能永不 EOF）；⑤ 清理目录和释放租约同样受限于 ≤ 500 ms 的 `busy_timeout`。⑤′ 的限额计入 5 秒总预算，因中止而丢弃的日志不影响运行状态，只在审计中记一条截断说明。多个运行之间并发处理，每个运行内部按顺序处理。超出预算或写库失败的运行列入 `cleanup_unverified`，状态标为 `CleanupUnverified`（写库失败时先记在内存中，之后由后台重试或崩溃恢复补写）。熔断调用之间互斥：后到的调用等待正在进行的那次完成，只报告自己实际处理的运行。幂等性比较 `latched`、最终状态和事件副作用，不比较 `elapsed_ms` 或计数 | 现有 SQLite 的 5 秒 `busy_timeout` 加上两路日志各 2 秒的等待，在最坏情况下必然超过 5 秒；网关只发通知也不能证明真的切断了。必须给出完成信号，并给每段设置上限，5 秒的承诺才可验证 | 只计算到「发出信号」为止；比较整个响应体来判断幂等 |
 | E-20 | **单实例双锁**：DB 目录锁（`<db_dir>/atomiumd.lock`）加控制面 socket 锁（由规范化 socket 路径推导出的 `.<sock>.lock`），都在 `DaemonState::open` 和崩溃恢复之前取得，持有整个进程生命周期 | DB 路径不同的两个实例可能指向同一个 socket（终端默认路径和 LaunchAgent 都使用 `$TMPDIR/atomiumd.sock`），只锁 DB 目录不能防止 socket 被 rename 覆盖。在打开状态之后才加锁，第二个实例已经可能执行了恢复 | 只用 DB 锁；用「先 `connect` 探测 socket 是否存活」代替锁（有竞态） |
 | E-21 | **E5 去混杂**：对照组和实验组都由 daemon 进程自身执行 `workspaces.import(~/Documents/atomium-tcc-canary)`，读取条件等价，都不经过 Seatbelt，并且**不使用**开发模式。判定依据是 TCC 日志或授权窗口中的请求主体身份；证据绑定 `os_build` 和 `atomiumd` 的 cdhash；`url.open` 的步骤拆成 E5-b，在 1.1b 之后补跑 | r3 中对照组用开发模式，实验组用 Seatbelt，Seatbelt 本身就可能拒绝这条路径，结论无法归因到 TCC。新判据没有扩大 O-4 的范围，反而去掉了 A3 实测中的开发模式；它还把原来的 ③ 和 ⑤ 合并成同一个可观察事实 | 保留开发模式的对照；只看导入是否成功 |
 | E-22 | **门户授权线性化**：「短 SQLite 写事务 + daemon 全局 `opener_gate`」。闸门内只做校验、扣减或消费一次性许可、提交事务和 spawn opener。120 秒 Ask 等待和 10 秒 opener 执行都在事务和闸门之外。`grants.revoke`、`sessions.stop`、`runs.cancel` 和 `daemon.panic` 都先取得闸门再使授权失效，谁先取得闸门谁赢。规则优先级为有效 `Deny` > 有效 `Allow` > 显式撤销 > `Ask`。Ask 一次允许不需要预先存在 Grant，只由控制面人工批准，生成一次性内存许可 | 单个事务管不到「事务提交」到「opener 启动」之间的撤销；让事务一直挂着等待，又会与租约和事件写入争用同一个库。闸门把线性化点放在可以测试的位置。opener spawn 的耗时很短，所以全局闸门的争用可以忽略（推断） | 长事务；每个会话一把闸门（熔断需要逐把获取，顺序复杂） |
@@ -639,11 +670,23 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
 | E-28 | **PTY 与回收**：PTY 命令准备与 `process_group(0)` 解耦；E3 实测 Darwin `O_CLOEXEC`，失败时回退到 `spawn_fd_lock` 下立即执行 `fcntl(FD_CLOEXEC)`；使用 `ptsname_r`、`TIOCPTYGNAME` 或互斥锁保护的 `ptsname`。RC-1 的进程核验独立于 `cleanup_verified`，用 `(pid, 开始时间)` 防止 PID 复用误判。RC-4 的门槛按该会话新增事件行的序列化字节数计算，DB/WAL 物理增量只单独报告 | `setsid` 不能由进程组组长调用，否则返回 `EPERM`；Darwin 手册没有承诺 `O_CLOEXEC` 和 `ptsname` 的线程安全；只核验目录，不能证明进程都已回收；WAL 的物理增长受检查点影响，不适合作为门槛 | 保留 `process_group(0)`；裸调用 `ptsname`；用物理文件增量做门槛 |
 | E-29 | **F-p 的 `serde(default)` 范围**：只适用于**既有结构体上新增的可选字段**；新增 DTO 中的安全必填字段缺失时，仍然返回 `-32602`。补充说明：O-1 的客户端前向容忍，**不能**证明写入新事件之后还可以降级回 v1.2 的 daemon（SQLite 回放是严格反序列化的）。P1.1 不承诺 daemon 可以降级 | 防止有人以「新字段都要带 default」为由，弱化必填的安全参数 | — |
 
+**r5 新增裁决**（2026-11-27，Claude 按 A1 裁决 Gemini r4 复核与 Codex r4 复核（`40bd539`）中待确认的事项，依据 E1–E4 原生夹具证据。都在已批准的目标和授权范围之内，没有放宽任何已接受的拒绝验收；O-6 涉及的剩余限制已由 Owner 按 A2 批准，见附录 F）：
+
+| # | 取舍 | 理由 | 被放弃的方案 |
+| --- | --- | --- | --- |
+| E-30 | **1.1a 工程口径**：① RA-5 / C.2 先按 7 个键做逐字节精确白名单判定（含 `ATOMIUM_USE_MACOS_KEYCHAIN`），其余一律拒绝，凭据样式只用来给出拒绝原因；② 启动入口在 E-16 预检之前先快拒 `panic_latched`（`-32002`），在 `spawn_gate` 内二次复核，锁存优先于 `-32003`，预检夹具 spawn 与熔断的竞态纳入 RA-3；③ 双锁文件退出时不 unlink，保持同一 inode；④ `daemon.panic` 中 stdout/stderr 的排空或中止共享 ≤ 250 ms 限额，计入 E-19 的 5 秒总预算 | ① 「白名单 + 模式黑名单」两条规则对 `ATOMIUM_USE_MACOS_KEYCHAIN` 相互矛盾，定为白名单优先后结论唯一，且白名单之外全拒，比模式黑名单更严；② 锁存期间不应再 spawn 任何夹具，`-32003` 也不能掩盖熔断（Gemini r4 ①）；③ unlink 后新旧实例可能分别锁住不同 inode（Gemini r4 ①）；④ 孙进程继承管道写端时管道不会 EOF，现有两路各 2 秒的等待会耗尽预算（Gemini r4 ①） | 模式黑名单优先（会误拒合法键）；单独为 `KEYCHAIN` 开例外；锁存只在 `spawn_gate` 内检查；退出时清理锁文件；日志读取不设上限 |
+| E-31 | **live 控制面探针的路径覆盖**：配置路径与规范化路径不同时分别探测并分别留证；相同但位于 `/private/*` 下时补测 `/var` 或 `/tmp` 别名。RA-4 的别名用例同样覆盖 `/tmp` → `/private/tmp` | Seatbelt 按路径规则匹配，配置路径（`ATOMIUM_SOCKET` 可能写成 `/tmp/...`）与规范化路径都是 Box 可能使用的连接形式；E1 的别名证据来自仓库内的 listener，真实 `/var/folders` 控制面留待 1.1a | 只测规范化路径 |
+| E-32 | **撤销墓碑只针对 `Allow`**：B.2 第 3 项的 `-32015 grant_revoked` 只匹配被显式撤销的 `Allow` Grant；撤销 `Deny` 或 `Ask` Grant 后，这条 Grant 直接退出匹配，请求按其余有效规则或 Ask 处理 | 撤销的本意是收回授权。如果撤销 `Deny` 之后也留墓碑，该目标会被永久以 `-32015` 拒绝，与用户意图相反（Gemini r4 ②、Codex r4 ②） | 所有模式都留墓碑；撤销后一律回到 Ask |
+| E-33 | **panic 与 opener 的唯一线性化点**：opener 持有 `opener_gate`、事务提交之后、spawn 之前对内存锁存做最后一次 `SeqCst` 读取，这是两者之间唯一的判定点。读到已锁存就不 spawn（`decided_by: panic`），读到未锁存就计为已打开。`revoke`、`stop`、`cancel` 仍以取得闸门的先后为准。RB-5 增加两种 panic 交错 | r4 的 B.1 第 6 步说「谁先取得闸门谁赢」，又说「熔断锁存在取闸门之前就已生效」；当 opener 已经持有闸门、panic 才设置锁存时，两句话给出不同结论（Codex r4 ①）。把判定点定在 spawn 之前的最后一次读取，结果唯一，也可以用屏障测试；它只会比 r4 更早阻止 opener，不会放宽 | 以取闸门先后为准（锁存提前生效时没有意义）；panic 在锁存前先取 `opener_gate`（会被正在进行的 opener spawn 阻塞，拖慢熔断） |
+| E-34 | **O-8 工程约束与 shim 时序**：守卫单独维护 ≥ 8 字节的已知凭据片段集合，不受 `SecretRedactor::add_secret_bytes` 16 字节阈值影响；每次守卫前先对会话 `RunLogRedactor` 调用 `refresh` 读取最新的受限 `IsolatedFile` 投影；`refresh` 失败或会话处于 `digest_only` 时 fail-closed（`-32014`，`policy_denied`）；`<runs_dir>/shim/` 重建放在取得 E-20 双锁之后 | O-8 已批准的比对下限是 8 字节，现有脱敏器从 16 字节起登记（`redact.rs:87–101`，r5 核对）；静默或 PTY 会话中 CLI 回写的新 token，只有 `refresh` 之后才会进入比对集合（`redact.rs:225–252`）；无法确认集合完整时，按红线优先拒绝；shim 在锁之前重建，会让第二个实例改写第一个实例的 shim（Gemini r4 ③、Codex r4 ③） | 把全局脱敏阈值降到 8 字节（影响所有日志的脱敏行为）；只依赖已登记片段；`refresh` 失败时放行 |
+| E-35 | **SBPL 信号规则改为 `(allow signal (target same-sandbox))`** | E3 ① 实证：`target self` 下 shell 向后台子作业发 `TERM` 为 `EPERM=1`，交互式作业控制不可用；`same-sandbox` 下返回 0；两个独立 sandbox 之间的同类信号在对照中仍为 `EPERM=1`。放宽范围只限于同一个 Box 内部，跨会话隔离不变 | 保留 `target self`（交互式 shell 不可用）；`(allow signal)` 不加目标限制（可向其他会话和宿主进程发信号） |
+| E-36 | **跨 1.1a–1.1c 固定锁序** `spawn_gate → opener_gate → spawn_fd_lock`；`daemon.panic` 释放 `spawn_gate` 之后才取 `opener_gate`；锁内不做长等待。E3 ⓪ 已实测 Darwin 原子 `O_CLOEXEC` 生效且 `ptsname_r` 可用，所以 Darwin 采用原子首选路径，`spawn_fd_lock` 只作为跨平台或降级兜底 | 三把锁分属三个 PR，事先固定顺序可以避免后续 PR 形成锁环（Gemini r4 ①）；E3 ⓪ 的结果让 C.3 原来的「待实测」分支有了结论 | 每个 PR 各自决定锁序；Darwin 也默认启用 `spawn_fd_lock` |
+
 ---
 
 ### 附录 F：Owner 拍板记录（A2 / A3）
 
-> O-1～O-4 与 O-8 已由 Owner 于 **2026-11-27** 确认批准（O-1～O-4 含并入的独立核查 4 项加固意见；O-8 的批准由协调线程转达给 Claude 落盘）；O-5～O-7 仅在对应实验失败时才触发决策。
+> O-1～O-4、O-6 与 O-8 已由 Owner 于 **2026-11-27** 确认批准（O-1～O-4 含并入的独立核查 4 项加固意见；O-6 与 O-8 的批准由协调线程转达给 Claude 落盘）。O-5 经 E2 未触发；O-7 仅在 E5 ③ 导入被拒时才触发决策。
 
 | # | 等级 | 事项 | 已批准方案 / 触发条件 | 拍板状态 |
 | --- | --- | --- | --- | --- |
@@ -651,8 +694,8 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
 | **O-2** | A2 | `url.open` 首期默认白名单形态 | 批准**方案 A**：1.1b 完整交付模板与 `client_id` 固定（及 `redirect_uri`/`scope` 收紧）机制，但 `codex` 与 `agy` 模板在 P1.2 实测登记确切首跳与 `client_id` 前保持空置禁用（期间全部走 Ask，`claude-code` 不签发） | **已批准方案 A（2026-11-27）** |
 | **O-3** | A2 | OAuth 本地回调边界 | 批准：P1.1b 不包含回环回调、端口监听和回调中继；P1.2 中 Codex 与 `agy` 个人 OAuth 以「宿主登录 + `subscriptions.capture` + `IsolatedFile`」为基线；设备码与授权码粘贴在 P1.2 实测；回环回调另开任务 | **已批准（2026-11-27）** |
 | **O-4** | **A3** | E5 真机实测配合（`launchctl bootstrap/bootout`、临时给终端授予“完全磁盘访问”做 TCC 对照后收回、`example.com` 测拉起浏览器、测从 `~/Documents` 导入） | 由 Owner 本人执行；实现方仅提供脚本与命令清单 | **已确认由 Owner 执行（2026-11-27）** |
-| O-5 | A2（条件） | E2 失败：IOKit 属性无法拦截，或拦截后导致 CLI 崩溃 | 推荐：如实把 `privacy.matrix` 中的 `serial_uuid_iokit` 标为 `HostVisible`，并修订 product-spec §6 口径，不阻断 1.1a | 待实验（仅 E2 失败时决策） |
-| O-6 | A2（条件） | E3 ⑥ 失败：调用 `setsid` 的孙进程无法可靠回收 | 推荐：接受为剩余限制，在 `cleanup_verified = false` 时标为 `CleanupUnverified`，Phase 2 由 L3 VM 彻底解决 | 待实验（仅 E3 ⑥ 失败时决策） |
+| O-5 | A2（条件） | E2 失败：IOKit 属性无法拦截，或拦截后导致 CLI 崩溃 | 推荐：如实把 `privacy.matrix` 中的 `serial_uuid_iokit` 标为 `HostVisible`，并修订 product-spec §6 口径，不阻断 1.1a | **未触发**（E2 ①–③ 夹具通过，CLI 无崩溃，见 §4） |
+| **O-6** | A2 | E3 ⑥ 已失败（触发）：双重 fork 后调用 `setsid`、并重挂到 PID 1 的孤儿孙进程无法可靠回收（冻结首领后用 `proc_listchildpids` 递归追踪仍会漏掉，见 §4） | 批准推荐方案：接受为 P1.1 既定剩余限制。对前台/后台进程组及可追踪后代，仍按 `(pid, 开始时间)` 独立核验 `processes_verified`；该项未通过或目录 `cleanup_verified = false` 时标为 `CleanupUnverified`；Phase 2 由 L3 VM 彻底解决。落点：RC-1、§5、附录 G（随 1.1c 同步文档） | **已批准（2026-11-27）** |
 | O-7 | A2 / A3（条件） | E5 ③ 的实验组导入被拒（r4 按 E-21 把原 ③ 与 ⑤ 合并为同一个观察）：LaunchAgent 模式下无法从 TCC 受保护目录（`~/Documents` 等）导入 | 推荐：由 Owner 给 `atomiumd` 单独授予“文件与文件夹”权限（A3）并写入文档 | 待实验（仅 E5 ③ 导入被拒时决策） |
 | **O-8** | A2 | `url.open` 的 argv 凭据红线守卫：B.1 把完整的规范 URL 作为宿主进程 `/usr/bin/open` 的 argv，而 RB-9 只扫描 Atomium 自己的审计，无法证明命令行中没有凭据（Codex 偏差申请「规范同步与凭据边界」） | 批准：在唤起 `/usr/bin/open -u` 之前的硬性守卫阶段（B.1 第 3 步），检查原始输入和规范 URL（含百分号解码一次后的形式）是否命中 daemon 已知的凭据片段（`SecretRedactor` 中精确登记的值，以及当前会话的 Vault 凭据材料）。**一旦命中，立即拒绝打开，返回 `-32014`（`data.kind = "credential_in_url"`）**，从源头保证已知明文凭据不进入宿主进程的命令行参数（product-spec §2）。验收见 RB-6b；无法识别的未知秘密作为剩余风险记录在 §5 | **已批准（2026-11-27）** |
 
@@ -669,6 +712,8 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
 | `docs/protocol-v2.md` §4.3 | 新增「v1.2 → v1.3 增量变更日志」，按 PR 逐段追加：1.1a 的方法与 `data.kind`；1.1b 的 Grant、门户、`preq-` 前缀、`-32014` 和 `-32015` 新增的 `kind`；1.1c 的 `sessions.*` 与 attach 流通知（O-1） | 1.1a / 1.1b / 1.1c |
 | `docs/protocol-v2.md` §8 | Grant 失效与连接关闭的语义改为 E-23 的写法 | 1.1b |
 | `docs/protocol-v2.md` §1 | 在「唯一推送是 `events.push`」后注明 attach 专用连接上的 `sessions.*` 流通知例外（O-1(b)） | 1.1c |
+| `docs/architecture-design.md` §3.4 与 §7（P1.1 行）、`docs/protocol-v2.md` §8（`CleanupUnverified` 语义） | **O-6 既定剩余限制**（r5）：macOS L1 无法可靠捕获重挂到 PID 1 的 `setsid` 孤儿孙进程；对前台/后台进程组及可追踪后代，仍按 `(pid, 开始时间)` 独立核验 `processes_verified`，该项未通过或目录清理未通过时标 `CleanupUnverified`；由 Phase 2 L3 VM 彻底解决。§7 P1.1 行中「会话停止后子进程组收尾干净」相应限定为「可追踪的进程组与后代」 | 1.1c |
+| `docs/architecture-design.md` §3.2 或 §3.4 | SBPL 信号规则由 `(target self)` 改为 `(target same-sandbox)`（E-35），注明 E3 ① 的实证，以及「同一 Box 内放行、跨会话仍拒绝」的边界 | 1.1c |
 
 ---
 
@@ -741,8 +786,10 @@ struct SessionStartRequest {               // 线格式完全扁平；Serde 不�
 | Claude（技术负责人 A1 裁决） | `db82f2d` 上的 r4 修订（未提交） | 读章程、角色提示词和本卡全文（含 Codex 的可行性确认与偏差申请）；只读核对 `crates/atomium-cli/Cargo.toml`（尚无 `default-run`，也没有第二个 bin）、`session_engine.rs::caller_env_key_allowed`（`BROWSER` 目前不在保留键中）、`RunStartRequest`（没有 `deny_unknown_fields`）、`Cargo.lock`（`url` 2.5.9）、`redact.rs::SecretRedactor`、`docs/protocol-v2.md` §7 与 §8；用 `git ls-remote` 和 `gh pr view 7` 核对基线。没有运行代码、门禁或 E1–E5 | r4 可执行定稿：Codex 的 7 项偏差全部裁决，16 个子项见「r4 裁决汇总」；O-8 已按 Owner 的 A2 批准落盘 | 新增 E-16～E-29、RB-6b、附录 G。**1.1a 和 E1–E4 的开工条件**：E1–E4 立即可开工；1.1a 的设计不再受阻，但实现提交必须等 PR #7 合入后 rebase，并刷新 §3 的基线 SHA。r4 由 Claude 撰写，需要 Gemini 对 E-16～E-29 与 O-8 做 R2 关键假设核查，Codex 复核是否可以实现 |
 | Gemini（R2 关键假设核查，r4 复核） | r4 修订稿（刷新基线至 `main` `b8b8606`） | 通读 r4 全文（E-16～E-29、O-8、RB-6b、E5、附录 G），并实读 `crates/atomiumd/src/redact.rs`、`crates/atomium-runtime/src/macos_seatbelt.rs` 及 `git diff 5aa78a3..main`；未运行代码或 E1–E5 | 通过（无阻断项；附 4 项实现与实验留意点，macOS 原生行为待 E1–E5 实测） | ① **1.1a 并发与预算**：`runs.start`/`sessions.start` 须在 E-16 探针/策略预检之前先快拒 `panic_latched`（`-32002`）并在 `spawn_gate` 内二次复核，避免锁存期间仍 spawn 探针夹具或被 `-32003` 掩盖；跨 1.1a–1.1c 固定锁序 `spawn_gate → opener_gate → spawn_fd_lock`（`daemon.panic` 设锁存并快照后即释放 `spawn_gate`，再取 `opener_gate`）；`flock` 锁文件退出时不得 unlink（防 inode 分裂竞态）；`daemon.panic` 中 stdout/stderr 读取任务在 `SIGKILL` 核验后须限时排空/中止，避免 2 秒串行等管耗尽 5 秒预算；live 控制面探针在配置路径与规范路径不同时同时测别名（覆盖 `/tmp` → `/private/tmp` 与 `/var`）。② **1.1b 撤销语义澄清**：B.2 优先级第 3 项（`-32015 grant_revoked`）应仅匹配被显式 `revoke` 的 **`Allow` Grant**，避免撤销 `Deny`/`Ask` 规则后反而永久以 `-32015` 拒绝（建议 1.1b 落地时确认）。③ **1.1b O-8 与 `redact.rs` 衔接**：现有 `SecretRedactor::add_secret_bytes` 过滤阈值为 `>= 16` 字节，低于 O-8 规定的 `>= 8` 字节（短上游代理口令需单独纳入）；且 `url.open` 执行 O-8 前须先对会话 `RunLogRedactor` 触发 `refresh` 读取 `IsolatedFile` 最新投影，防静默/PTY 会话刷新后的新 token 绕过；`<runs_dir>/shim/` 重建必须在 E-20 双锁之后执行。④ **1.1c / E3 观察点**：`macos_seatbelt.rs:136` 当前为 `(allow signal (target self))`，E3 ① 需实测交互式 shell Ctrl-C 与子作业信号是否可用，或需评估 `(target same-sandbox)`。 |
 | Codex（r4 复核与 E1–E4 最小实验） | `40bd539` | macOS 26.7.3 `25G342` arm64，原生 `sandbox-exec` 前置自检退出 0。核对 P1.0 基线及 E-16～E-29、O-8、附录 G、Gemini 四项提醒。运行 §4 所列 `out/p1-1-exp/` 夹具及证据断言 | 可启动 1.1a 已明确范围。E-16 用未创建的目标路径可装载，E-17 live 与离线证据分别接入，E-18～E-20 的闸门、预算、双锁有明确落点，E-21 等 Owner 的 E5。E-22～E-26、O-8 可在独立门户分发、授权事务及凭据读取处落地，E-27～E-29 的扁平 DTO、独立 PTY 准备与审计口径可实现。附录 G 的文档同步位置与当前源码和文档相符。E1/E4 夹具通过，E2 属性拒绝和 CLI 存活通过，E3 ① 子作业信号与 ⑥ 回收失败，O-5 未触发，O-6 已触发 | Gemini ①：锁存先快拒，spawn 前在闸门复核，锁序 `spawn_gate → opener_gate → spawn_fd_lock`，锁文件保持同一 inode，日志收尾共享总预算，真实配置路径及规范路径分别建证。需 Claude 确认 RA-5/C.2 显式允许 `ATOMIUM_USE_MACOS_KEYCHAIN` 与 `*KEY*` 模式拒绝的优先级；并将运行预检 spawn 与锁存竞态纳入 1.1a 测试。②：建议将撤销墓碑限定 `Allow`，需 Claude 确认；RB-5/E-22 还需统一 opener 先持闸门但 panic 已提前锁存时的胜负。③：O-8 需单独涵盖 8–15 字节已知凭据，对静默/PTY 会话在守卫前读取最新受限投影，shim 在双锁后重建。④：`same-sandbox` 对照修复同会话子作业信号，1.1c 策略待 A1，后代回收 O-6 待 Owner。E4 只需按证据更新字节预算，真实控制面 live、CI 门禁和 E5 未验证 |
+| Claude（技术负责人 r5 修订） | `1ab8620` 上的 r5 修订（未提交） | 读章程与本卡全文（含 §4 的 E1–E4 证据、Gemini r4 复核与 Codex r4 复核）；只读核对 `crates/atomium-runtime/src/macos_seatbelt.rs:136`（现为 `(allow signal (target self))`）、`crates/atomiumd/src/redact.rs:87–101`（`add_secret_bytes` 的 16 字节阈值）与 `:225–252`（`RunLogRedactor::refresh`）、`crates/atomiumd/src/state.rs:359`（`ATOMIUM_USE_MACOS_KEYCHAIN` 读取）、`docs/architecture-design.md` §3.4 与 §7。没有运行代码、门禁或实验，没有修改其他文件，也没有勾选任何验收项 | **r5 定稿；PR 1.1a 的开工条件已全部满足**：基线已在 `main` `b8b8606`；E1–E4 的原生夹具证据已登记；Gemini r4 与 Codex r4 提出的全部待确认项都已裁决；所有触发的 Owner 决策（O-6）已批准；1.1a 不再有未决的规格歧义。剩余的 E5（A3）按设计在 1.1a 完成生成器和状态报告之后执行，不阻塞开工 | **修改范围**：头部状态与修订记录；RA-1、RA-2⑤、RA-3、RA-4、RA-5、RB-5、RB-6b、RC-1、RC-2；§5；B.1 第 3 步与第 6 步、B.2、B.7；C.1、C.2、C.3、C.4，新增 C.5；E-3；新增 E-30～E-36；附录 F（O-5 未触发、O-6 已批准）；附录 G（O-6 与信号规则）。**裁决摘要**：① O-6 按 Owner 批准落为既定剩余限制（`processes_verified` 只表示「可追踪身份已消失」）；② 1.1a：C.2 的 7 键精确白名单优先于 `*KEY*` 等凭据样式（E-30）；启动时在 E-16 之前快拒 `panic_latched`，在 `spawn_gate` 内复核，锁存优先于 `-32003`，预检夹具竞态纳入 RA-3；锁文件不 unlink；日志排空共享 ≤ 250 ms 并计入 5 秒；live 探针对配置路径与规范化路径分测（E-31）；③ 1.1b：撤销墓碑只针对 `Allow`（E-32）；panic 与 opener 以 spawn 前对锁存的最后一次 `SeqCst` 读取为唯一线性化点（E-33）；O-8 覆盖 8–15 字节，守卫前 `refresh`，`refresh` 失败 fail-closed，shim 在双锁后重建（E-34）；路径预算修正为 73/97 字节；④ 1.1c：信号规则改为 `(target same-sandbox)`（E-35）；锁序 `spawn_gate → opener_gate → spawn_fd_lock`，Darwin 用原子 `O_CLOEXEC` 与 `ptsname_r`，`spawn_fd_lock` 只作兜底（E-36）。**需要复核**：r5 由 Claude 撰写，E-30～E-36 需要 Gemini 做关键假设核查（重点是 E-33 的线性化点、E-34 的 fail-closed 分支、E-35 的信号边界），Codex 在 1.1a 实现时复核 E-30、E-31 能否实现。E-30 ④ 的 250 ms 与 E-19 的其他分段预算一样是**推断**，以实测为准 |
+| Gemini（R2 关键假设核查，r5 复核） | r5 修订稿（基于 `1ab8620`） | 逐行核对 Claude r5 diff（E-30～E-36、O-6、RC-1/RC-2、B.1/B.2/B.7、C.1–C.5、§5、附录 F/G），并对照 `crates/atomiumd/src/redact.rs:225–250` 与 E1–E4 原始证据 `out/p1-1-exp/e{2,3}/results.json`；未改动代码或跑门禁 | **通过（无阻断项；批准进入 PR 1.1a 编码）** | ① **E-30/E-31（1.1a）**：7 键精确白名单优先于 `*KEY*` 模式、锁存先快拒再进 `spawn_gate` 且优先于 `-32003`、锁文件不 unlink、日志排空 ≤ 250 ms（总预算最坏 4.75s ≤ 5s，待实测）、live 探针分测配置与规范路径均严密无漏洞。② **E-32/E-33（1.1b）**：撤销墓碑仅限 `Allow` 无反例；以 `opener_gate` 内事务提交后、spawn 前最后一次 `SeqCst` 读取锁存作为 panic/opener 唯一线性化点，四种交错均确定无死锁；因 panic 随后立即撤销会话全部 Grant，不回滚已扣减配额无复用风险。③ **E-34（1.1b）**：`refresh` 失败或 `digest_only` 时 fail-closed 可防被攻陷 Box 借删除/破坏投影文件绕过 O-8；**唯一实现提醒**：无 `IsolatedFile` 投影的会话（`relative_path = None`，如 API Key）须按 `redact.rs:227` 返回 `Ok(())`，不得误判为 `refresh` 失败。④ **E-35/E-36（1.1c）**：`(target same-sandbox)` 有 E3 ① 同会话成功与跨会话 `EPERM=1` 实证，且仅在 1.1c 随 RC-2 边界测试一并落地并刷新 `sbpl_template_digest`；跨 PR 锁序无环。⑤ **O-6**：已准确按 Owner 2026-11-27 批准口径落入 RC-1、§5、附录 F 与附录 G。 |
 
-> 本任务卡由 Claude 撰写，依照章程 §1，它不能由 Claude 自己验收。r2 的设计假设由 Gemini 独立核查；r4 新增的裁决（E-16～E-29、O-8 落盘）同样需要 Gemini 核查关键假设，并由 Codex 复核能否实现。
+> 本任务卡由 Claude 撰写，依照章程 §1，它不能由 Claude 自己验收。r2 的设计假设由 Gemini 独立核查；r4 新增的裁决（E-16～E-29、O-8 落盘）同样需要 Gemini 核查关键假设，并由 Codex 复核能否实现。r5 新增的裁决（E-30～E-36、O-6 落盘）沿用同一规则。
 
 ### 交付状态
 
